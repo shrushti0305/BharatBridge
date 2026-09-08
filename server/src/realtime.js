@@ -104,6 +104,16 @@ export function registerRealtime(io) {
 
         ack?.({ ok: true, segmentId });
 
+        // Always emit caption to speaker's own language room as well (for listeners listening in speaker language)
+        io.to(roomForLanguage(sessionId, session.speaker_language)).emit("caption", {
+          segmentId,
+          seq,
+          language: session.speaker_language,
+          text: text_,
+          sourceText: text_,
+          isFinal,
+        });
+
         if (targets.length > 0) {
           let translated;
           try {

@@ -113,23 +113,69 @@ export function createAzureSpeaker({ getToken, voiceName, speechRate = "0.95" })
               }
             });
           } else {
+            console.warn("Azure speech synthesis canceled/failed, using Web Speech API fallback:", result?.errorDetails);
             cachedConfig = null;
-            speaking = false;
-            pump();
+            if (typeof window !== "undefined" && window.speechSynthesis) {
+              const u = new SpeechSynthesisUtterance(text);
+              const langCode = currentVoice.split("-").slice(0, 2).join("-");
+              u.lang = langCode || "en-IN";
+              u.onend = () => {
+                speaking = false;
+                pump();
+              };
+              u.onerror = () => {
+                speaking = false;
+                pump();
+              };
+              window.speechSynthesis.speak(u);
+            } else {
+              speaking = false;
+              pump();
+            }
           }
         },
         (err) => {
           synthesizer.close();
           cachedConfig = null;
-          console.error("Azure speech synthesis failed:", err);
-          speaking = false;
-          pump();
+          console.error("Azure speech synthesis failed, using Web Speech API fallback:", err);
+          if (typeof window !== "undefined" && window.speechSynthesis) {
+            const u = new SpeechSynthesisUtterance(text);
+            const langCode = currentVoice.split("-").slice(0, 2).join("-");
+            u.lang = langCode || "en-IN";
+            u.onend = () => {
+              speaking = false;
+              pump();
+            };
+            u.onerror = () => {
+              speaking = false;
+              pump();
+            };
+            window.speechSynthesis.speak(u);
+          } else {
+            speaking = false;
+            pump();
+          }
         }
       );
     } catch (err) {
-      console.error("Azure speech synthesis setup failed:", err);
-      speaking = false;
-      pump();
+      console.error("Azure speech synthesis setup failed, using Web Speech API fallback:", err);
+      if (typeof window !== "undefined" && window.speechSynthesis) {
+        const u = new SpeechSynthesisUtterance(text);
+        const langCode = currentVoice.split("-").slice(0, 2).join("-");
+        u.lang = langCode || "en-IN";
+        u.onend = () => {
+          speaking = false;
+          pump();
+        };
+        u.onerror = () => {
+          speaking = false;
+          pump();
+        };
+        window.speechSynthesis.speak(u);
+      } else {
+        speaking = false;
+        pump();
+      }
     }
   }
 

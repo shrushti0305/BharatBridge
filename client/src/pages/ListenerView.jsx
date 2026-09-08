@@ -137,29 +137,56 @@ export default function ListenerView() {
       setInterim(text);
     });
 
-    const handleCaption = (c) => {
+    const handleCaption = (c, isLanguageSpecific = false) => {
       setInterim("");
+      const targetText = c.text || c.sourceText;
+
       setLines((prev) => {
         const existingIdx = prev.findIndex((l) => l.id === c.segmentId);
         if (existingIdx !== -1) {
           // If we previously received untranslated sourceText and now receive translated text, update the line!
-          if (c.text && prev[existingIdx].text !== c.text) {
+          const existing = prev[existingIdx];
+          if (c.text && existing.text !== c.text) {
             const copy = [...prev];
-            copy[existingIdx] = { ...copy[existingIdx], text: c.text, sourceText: c.sourceText || copy[existingIdx].sourceText };
+            copy[existingIdx] = {
+              ...existing,
+              text: c.text,
+              sourceText: c.sourceText || existing.sourceText,
+            };
             return copy;
           }
           return prev;
         }
-        return [...prev, { id: c.segmentId, text: c.text || c.sourceText, sourceText: c.sourceText }];
+        return [
+          ...prev,
+          {
+            id: c.segmentId,
+            text: targetText,
+            sourceText: c.sourceText || targetText,
+          },
+        ];
       });
+
       if (c.segmentId && !spokenSegmentsRef.current.has(c.segmentId)) {
-        spokenSegmentsRef.current.add(c.segmentId);
-        speakerTtsRef.current?.say(c.text || c.sourceText);
+        if (c.text || isLanguageSpecific) {
+          spokenSegmentsRef.current.add(c.segmentId);
+          speakerTtsRef.current?.say(c.text || c.sourceText);
+        } else {
+          // Fallback: If only broadcast arrived without translated text, wait 4s for translation
+          const segId = c.segmentId;
+          const fallbackText = c.sourceText;
+          setTimeout(() => {
+            if (!spokenSegmentsRef.current.has(segId)) {
+              spokenSegmentsRef.current.add(segId);
+              speakerTtsRef.current?.say(fallbackText);
+            }
+          }, 4000);
+        }
       }
     };
 
-    socket.on("caption", handleCaption);
-    socket.on("caption:broadcast", handleCaption);
+    socket.on("caption", (c) => handleCaption(c, true));
+    socket.on("caption:broadcast", (c) => handleCaption(c, false));
 
     socket.on("roster:update", ({ languages: roster }) => {
       const mine = roster.find((r) => r.language === socketRef.current?.currentLanguage);
@@ -250,6 +277,7 @@ export default function ListenerView() {
 
   function onChangeLanguage(newLang) {
     setLines([]);
+    spokenSegmentsRef.current.clear();
     setLanguage(newLang);
     if (socketRef.current?.connected) {
       socketRef.current.emit("listener:change-language", { language: newLang });
@@ -260,7 +288,7 @@ export default function ListenerView() {
         setLines(
           transcript
             .filter((t) => t.translatedText || t.sourceText)
-            .map((t) => ({ id: t.id, text: t.translatedText || t.sourceText }))
+            .map((t) => ({ id: t.id, text: t.translatedText || t.sourceText, sourceText: t.sourceText }))
         );
       })
       .catch((err) => console.warn("Failed to refetch translated transcript:", err));
