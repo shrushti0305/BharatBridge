@@ -13,7 +13,7 @@ export default function ListenerView() {
 
   const [session, setSession] = useState(null);
   const [languages, setLanguages] = useState([]);
-  const [language, setLanguage] = useState(null);
+  const [language, setLanguage] = useState("en");
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState("");
   const [lines, setLines] = useState([]);
@@ -235,7 +235,7 @@ export default function ListenerView() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId, token, languages.length, consented]);
 
-  // Join / switch language on the server once we know which language to use.
+  // Join / switch language on the server once consent is granted and language is known
   useEffect(() => {
     if (!consented || !language || !socketRef.current || languages.length === 0) return;
     const langObj = languages.find((l) => l.code === language);
@@ -251,27 +251,32 @@ export default function ListenerView() {
       speakerTtsRef.current.setVoiceName(azureVoice);
       speakerTtsRef.current.setRate(speechPace);
     }
-    speakerTtsRef.current?.setEnabled(audioOn);
+    speakerTtsRef.current.setEnabled(audioOn);
 
     const socket = socketRef.current;
     socket.currentLanguage = language;
 
-    const alreadyConnected = socket.connected;
     const doJoin = () => {
+      if (!socket || !socket.connected) return;
       socket.emit("listener:join", { sessionId, language }, (res) => {
         if (res?.error) {
           if (res.ended) setEnded(true);
           else setError(res.error);
           return;
         }
-        setSession(res.session);
+        if (res?.session) setSession(res.session);
       });
     };
 
-    if (alreadyConnected) doJoin();
-    else socket.once("connect", doJoin);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [language, voiceGender, speechPace, languages.length]);
+    if (socket.connected) {
+      doJoin();
+    }
+    socket.on("connect", doJoin);
+
+    return () => {
+      socket.off("connect", doJoin);
+    };
+  }, [consented, language, voiceGender, speechPace, languages.length, sessionId, token, audioOn]);
 
   useEffect(() => {
     speakerTtsRef.current?.setEnabled(audioOn);
