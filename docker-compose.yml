@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  bharatbridge:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8787:8787"
+    environment:
+      - PORT=8787
+      - NODE_ENV=production
+      - JWT_SECRET=change-this-to-a-64-character-random-secret-key
+      - DB_ENCRYPTION_KEY=YourProductionAES256SecretKey
+      - CLIENT_ORIGIN=http://localhost:5173,http://localhost:8787
+      - AZURE_TRANSLATOR_KEY=${AZURE_TRANSLATOR_KEY}
+      - AZURE_TRANSLATOR_REGION=centralindia
+      - AZURE_SPEECH_KEY=${AZURE_SPEECH_KEY}
+      - AZURE_SPEECH_REGION=centralindia
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+    volumes:
+      - ./server/data:/app/server/data
+    restart: unless-stopped

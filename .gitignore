@@ -1,0 +1,34 @@
+# Dependencies
+node_modules/
+client/node_modules/
+server/node_modules/
+
+# Environment Variables & Secrets
+.env
+*.env
+server/.env
+client/.env
+
+# Database & Uploaded Media Files
+data/
+server/data/
+*.db
+*.db-wal
+*.db-shm
+*.webm
+
+# Production Build Output
+dist/
+client/dist/
+
+# Logs & Temporary Files
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# System & IDE Files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

@@ -1,0 +1,31 @@
+services:
+  - type: web
+    name: bharatbridge-app
+    env: node
+    region: singapore
+    plan: starter
+    buildCommand: npm run install:all && npm run build
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 8787
+      - key: JWT_SECRET
+        generateValue: true
+      - key: DB_ENCRYPTION_KEY
+        generateValue: true
+      - key: AZURE_TRANSLATOR_KEY
+        sync: false
+      - key: AZURE_TRANSLATOR_REGION
+        value: centralindia
+      - key: AZURE_SPEECH_KEY
+        sync: false
+      - key: AZURE_SPEECH_REGION
+        value: centralindia
+      - key: ANTHROPIC_API_KEY
+        sync: false
+    disk:
+      name: bharatbridge-data
+      mountPath: /app/server/data
+      sizeGB: 10
