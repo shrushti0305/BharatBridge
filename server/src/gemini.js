@@ -41,16 +41,31 @@ Format output in Markdown with these exact sections:
 }
 
 /**
- * Optional Gemini Text Translation fallback for text segments.
+ * Context-Aware Live Translation using Gemini 2.0 Flash.
+ * Translates based on full conversational context, session topic, and recent history rather than literal word-for-word translation.
  */
-export async function translateWithGemini({ text, sourceLangCode, targetLangCodes }) {
+export async function translateWithGemini({ text, sourceLangCode, targetLangCodes, sessionTitle, recentHistory = [] }) {
   if (!ai) return null;
 
-  const prompt = `Translate the following text spoken in ${sourceLangCode} into these target languages: ${targetLangCodes.join(", ")}.
-Return ONLY a valid JSON object mapping each language code to its translated text string. Example: {"hi": "...", "mr": "..."}.
+  const sourceLabel = LANGUAGE_BY_CODE[sourceLangCode]?.label || sourceLangCode;
+  const historyContext = recentHistory.length > 0
+    ? `Recent Spoken Context:\n${recentHistory.map((s, i) => `${i + 1}. "${s}"`).join("\n")}\n\n`
+    : "";
 
-Text to translate:
-"${text}"`;
+  const prompt = `You are a world-class live presentation interpreter.
+Session Topic / Title: "${sessionTitle || 'Live Event'}"
+Spoken Source Language: ${sourceLabel}
+
+${historyContext}Current Spoken Sentence to Translate:
+"${text}"
+
+Translate the current sentence into these target languages: ${targetLangCodes.join(", ")}.
+
+CRITICAL CONTEXT-AWARE TRANSLATION RULES:
+1. Do NOT perform literal or word-for-word translation.
+2. Translate based on FULL CONTEXT, natural phrasing, cultural nuances, and fluent conversational speech in the target language.
+3. Preserve technical terms, names, and core intent accurately while making the sentence sound completely natural to a native listener.
+4. Return ONLY a valid JSON object mapping each language code to its translated text string. Example: {"hi": "...", "mr": "..."}.`;
 
   try {
     const response = await ai.models.generateContent({

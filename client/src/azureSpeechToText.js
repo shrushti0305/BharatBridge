@@ -5,7 +5,7 @@ import * as SpeechSDK from "microsoft-cognitiveservices-speech-sdk";
 // refreshes the token proactively every 9 minutes without interrupting an in-progress session —
 // Azure's SDK supports swapping `recognizer.authorizationToken` on a live recognizer for
 // exactly this reason.
-export function createAzureRecognizer({ getToken, lang, onInterim, onFinal, onError }) {
+export function createAzureRecognizer({ getToken, lang, sessionTitle, onInterim, onFinal, onError }) {
   let recognizer = null;
   let refreshTimer = null;
   let stopped = true;
@@ -66,6 +66,20 @@ export function createAzureRecognizer({ getToken, lang, onInterim, onFinal, onEr
     } else {
       speechConfig.speechRecognitionLanguage = lang;
       r = new SpeechSDK.SpeechRecognizer(speechConfig, audioConfig);
+    }
+
+    try {
+      const phraseList = SpeechSDK.PhraseListGrammar.fromRecognizer(r);
+      if (sessionTitle) {
+        phraseList.addPhrase(sessionTitle);
+        sessionTitle.split(/\s+/).forEach((w) => {
+          if (w.length > 2) phraseList.addPhrase(w);
+        });
+      }
+      phraseList.addPhrase("BharatBridge");
+      phraseList.addPhrase("TryLang");
+    } catch (phraseErr) {
+      console.warn("PhraseListGrammar setup warning:", phraseErr);
     }
 
     r.recognizing = (_s, e) => {

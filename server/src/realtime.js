@@ -117,11 +117,17 @@ export function registerRealtime(io) {
         if (targets.length > 0) {
           let translated;
           try {
+            const recentRows = db
+              .prepare("SELECT source_text FROM transcript_segments WHERE session_id = ? AND id != ? ORDER BY seq DESC LIMIT 3")
+              .all(sessionId, segmentId);
+            const recentHistory = recentRows.map((r) => r.source_text).reverse();
+
             translated = await translateSegment({
               sourceText: text_,
               sourceLangCode: session.speaker_language,
               targetLangCodes: targets,
               sessionTitle: session.title,
+              recentHistory,
             });
           } catch (err) {
             console.error("translateSegment failed, falling back to source text", err.message);

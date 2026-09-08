@@ -247,6 +247,7 @@ export default function SpeakerView() {
     const recognizer = createAzureRecognizer({
       getToken: () => api.speechToken(token),
       lang: langConfig,
+      sessionTitle: session?.title,
       onInterim: (text) => {
         setInterim(text);
         socketRef.current?.emit("speaker:interim", { sessionId, text });
