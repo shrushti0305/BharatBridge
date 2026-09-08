@@ -53,7 +53,7 @@ export function createAzureSpeaker({ getToken, voiceName, speechRate = "0.95" })
       const { token, region } = await getToken();
       cachedConfig = SpeechSDK.SpeechConfig.fromAuthorizationToken(token, region);
       cachedConfig.speechSynthesisOutputFormat =
-        SpeechSDK.SpeechSynthesisOutputFormat.Audio24Khz160KBitRateMonoMp3;
+        SpeechSDK.SpeechSynthesisOutputFormat.Audio24Khz48KBitRateMonoMp3;
       cachedAt = Date.now();
     }
     cachedConfig.speechSynthesisVoiceName = currentVoice;

@@ -48,10 +48,10 @@ export function createAzureRecognizer({ getToken, lang, onInterim, onFinal, onEr
       SpeechSDK.PropertyId.SpeechServiceResponse_RequestTrueTextOption,
       "True"
     );
-    // Ultra-Fast Instant Line Mode: 100ms silence timeout segments speech into complete sentences in 0.1 seconds!
+    // Natural Clause Mode: 400ms silence timeout segments speech at natural clause boundaries
     speechConfig.setProperty(
       SpeechSDK.PropertyId.Speech_SegmentationSilenceTimeoutMs,
-      "100"
+      "400"
     );
     const audioConfig = SpeechSDK.AudioConfig.fromDefaultMicrophoneInput();
     let r;

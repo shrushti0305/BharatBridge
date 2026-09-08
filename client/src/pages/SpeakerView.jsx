@@ -216,10 +216,10 @@ export default function SpeakerView() {
 
     socketRef.current?.emit("speaker:segment", { sessionId, text, isFinal: true });
 
-    setTimeout(() => {
-      processingRef.current = false;
+    processingRef.current = false;
+    if (queueRef.current.length > 0) {
       processQueue();
-    }, 150);
+    }
   }
 
   function sendFinal(text) {
