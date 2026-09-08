@@ -1,6 +1,6 @@
 // Central registry of languages and speaker modes supported by the app.
 export const SPEAKER_LANGUAGES = [
-  { code: "auto", label: "✨ Auto Detect (Hindi / Marathi / English)", native: "Auto Detect", bcp47: ["hi-IN", "mr-IN", "en-IN"] },
+  { code: "auto", label: "✨ Auto Detect All Languages (Hindi, English, Marathi, Bengali, Tamil, etc.)", native: "Auto Detect All", bcp47: ["hi-IN", "en-IN", "mr-IN", "bn-IN", "ta-IN", "te-IN", "kn-IN", "gu-IN", "ml-IN", "pa-IN", "or-IN"] },
   { code: "hi", label: "Hindi", native: "हिन्दी", bcp47: "hi-IN", azureVoice: "hi-IN-SwaraNeural" },
   { code: "mr", label: "Marathi", native: "मराठी", bcp47: "mr-IN", azureVoice: "mr-IN-AarohiNeural" },
   { code: "en", label: "English", native: "English", bcp47: "en-IN", azureVoice: "en-IN-NeerjaNeural" },

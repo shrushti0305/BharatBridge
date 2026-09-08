@@ -206,7 +206,9 @@ export default function SpeakerView() {
   function processQueue() {
     if (processingRef.current || queueRef.current.length === 0) return;
     processingRef.current = true;
-    const text = queueRef.current.shift();
+    const item = queueRef.current.shift();
+    const text = typeof item === "string" ? item : item.text;
+    const detectedLang = typeof item === "object" ? item.detectedLang : null;
 
     setInterim("");
     setLines((prev) => {
@@ -214,7 +216,7 @@ export default function SpeakerView() {
       return [...prev, { id: `${Date.now()}-${Math.random()}`, text }];
     });
 
-    socketRef.current?.emit("speaker:segment", { sessionId, text, isFinal: true });
+    socketRef.current?.emit("speaker:segment", { sessionId, text, detectedLang, isFinal: true });
 
     processingRef.current = false;
     if (queueRef.current.length > 0) {
@@ -222,10 +224,10 @@ export default function SpeakerView() {
     }
   }
 
-  function sendFinal(text) {
+  function sendFinal(text, detectedLang) {
     if (!text?.trim()) return;
     const clean = text.trim();
-    queueRef.current.push(clean);
+    queueRef.current.push({ text: clean, detectedLang });
     processQueue();
   }
 
@@ -252,7 +254,7 @@ export default function SpeakerView() {
         setInterim(text);
         socketRef.current?.emit("speaker:interim", { sessionId, text });
       },
-      onFinal: (text) => sendFinal(text),
+      onFinal: (text, detectedLang) => sendFinal(text, detectedLang),
       onError: (err) => {
         setError(`Microphone error: ${err}`);
         setMicOn(false);

@@ -68,7 +68,7 @@ export function registerRealtime(io) {
 
     // A finalized chunk of speech from the speaker. Persist it, translate to every language
     // currently being listened to, persist those translations, then push to each language room.
-    socket.on("speaker:segment", async ({ sessionId, text, isFinal = true }, ack) => {
+    socket.on("speaker:segment", async ({ sessionId, text, detectedLang, isFinal = true }, ack) => {
       try {
         if (socket.data.role !== "speaker" || socket.data.sessionId !== sessionId) {
           return ack?.({ error: "Not authorized to send segments for this session" });
@@ -78,6 +78,8 @@ export function registerRealtime(io) {
 
         const session = db.prepare("SELECT * FROM sessions WHERE id = ?").get(sessionId);
         if (!session || session.status !== "live") return ack?.({ error: "Session is not live" });
+
+        const sourceLang = detectedLang || session.speaker_language || "en";
 
         const segmentId = nanoid();
         const seq = nextSeq(sessionId);
@@ -100,15 +102,15 @@ export function registerRealtime(io) {
           .map((r) => r.language);
         const allActiveLangs = Array.from(new Set([...activeLangsFromMap, ...dbLangs, "en"]));
 
-        const targets = allActiveLangs.filter((l) => l && l !== session.speaker_language);
+        const targets = allActiveLangs.filter((l) => l && l !== sourceLang);
 
         ack?.({ ok: true, segmentId });
 
-        // Always emit caption to speaker's own language room as well (for listeners listening in speaker language)
-        io.to(roomForLanguage(sessionId, session.speaker_language)).emit("caption", {
+        // Always emit caption to speaker's detected language room as well
+        io.to(roomForLanguage(sessionId, sourceLang)).emit("caption", {
           segmentId,
           seq,
-          language: session.speaker_language,
+          language: sourceLang,
           text: text_,
           sourceText: text_,
           isFinal,
@@ -124,7 +126,7 @@ export function registerRealtime(io) {
 
             translated = await translateSegment({
               sourceText: text_,
-              sourceLangCode: session.speaker_language,
+              sourceLangCode: sourceLang,
               targetLangCodes: targets,
               sessionTitle: session.title,
               recentHistory,

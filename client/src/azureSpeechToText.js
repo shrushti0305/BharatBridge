@@ -92,7 +92,16 @@ export function createAzureRecognizer({ getToken, lang, sessionTitle, onInterim,
     r.recognized = (_s, e) => {
       const text = e.result?.text;
       if (text && text.trim()) {
-        onFinal?.(text.trim());
+        let detectedLang = null;
+        try {
+          const autoDetectRes = SpeechSDK.AutoDetectSourceLanguageResult.fromResult(e.result);
+          if (autoDetectRes?.language) {
+            detectedLang = autoDetectRes.language.split("-")[0];
+          }
+        } catch (autoErr) {
+          // ignore
+        }
+        onFinal?.(text.trim(), detectedLang);
       }
     };
     r.canceled = (_s, e) => {
