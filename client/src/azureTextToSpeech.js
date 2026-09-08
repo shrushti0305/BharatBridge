@@ -175,14 +175,10 @@ export function createAzureSpeaker({ getToken, voiceName, speechRate = "0.95" })
     }
   }
 
-  let lastSpokenText = "";
-
   return {
     say(text) {
       if (!text?.trim()) return;
       const clean = text.trim();
-      if (clean === lastSpokenText) return;
-      lastSpokenText = clean;
 
       // Cap queue length to prevent backlog during rapid continuous speech
       if (queue.length > 2) queue = queue.slice(-2);

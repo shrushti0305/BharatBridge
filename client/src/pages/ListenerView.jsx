@@ -169,16 +169,18 @@ export default function ListenerView() {
 
       if (c.segmentId && !spokenSegmentsRef.current.has(c.segmentId)) {
         if (c.text || isLanguageSpecific) {
-          spokenSegmentsRef.current.add(c.segmentId);
-          speakerTtsRef.current?.say(c.text || c.sourceText);
+          if (speakerTtsRef.current) {
+            spokenSegmentsRef.current.add(c.segmentId);
+            speakerTtsRef.current.say(c.text || c.sourceText);
+          }
         } else {
           // Fallback: If only broadcast arrived without translated text, wait 4s for translation
           const segId = c.segmentId;
           const fallbackText = c.sourceText;
           setTimeout(() => {
-            if (!spokenSegmentsRef.current.has(segId)) {
+            if (!spokenSegmentsRef.current.has(segId) && speakerTtsRef.current) {
               spokenSegmentsRef.current.add(segId);
-              speakerTtsRef.current?.say(fallbackText);
+              speakerTtsRef.current.say(fallbackText);
             }
           }, 4000);
         }
@@ -392,13 +394,37 @@ export default function ListenerView() {
                   role="switch"
                   aria-checked={audioOn}
                   tabIndex={0}
-                  onClick={() => setAudioOn((v) => !v)}
+                  onClick={() => {
+                    unlockAudioEngine();
+                    setAudioOn((v) => !v);
+                  }}
                   onKeyDown={(e) => (e.key === "Enter" || e.key === " ") && setAudioOn((v) => !v)}
                 />
               </div>
 
+              <button
+                type="button"
+                className="btn btn-block"
+                style={{
+                  marginTop: 12,
+                  fontSize: 12,
+                  fontWeight: 600,
+                  background: "rgba(245, 158, 11, 0.15)",
+                  color: "var(--amber)",
+                  border: "1px solid rgba(245, 158, 11, 0.3)",
+                }}
+                onClick={() => {
+                  unlockAudioEngine();
+                  if (speakerTtsRef.current) {
+                    speakerTtsRef.current.say("Live voice translation is ready and active on your device.");
+                  }
+                }}
+              >
+                🔊 Test Spoken Audio Voice
+              </button>
+
               {audioOn && (
-                <div style={{ marginTop: 16, paddingTop: 12, borderTop: "1px solid var(--border)" }}>
+                <div style={{ marginTop: 12, paddingTop: 12, borderTop: "1px solid var(--border)" }}>
                   <div className="field" style={{ marginBottom: 12 }}>
                     <label style={{ fontSize: 12 }}>Voice Gender & Style</label>
                     <select value={voiceGender} onChange={(e) => setVoiceGender(e.target.value)}>
