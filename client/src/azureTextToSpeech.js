@@ -1,19 +1,26 @@
 import * as SpeechSDK from "microsoft-cognitiveservices-speech-sdk";
 
-// Speaks translated captions aloud using Azure's neural voices instead of whatever (if any)
-// voice happens to be installed on the listener's device — this is what actually fixes the
-// "no voice installed for this language" problem, since Azure always has a voice for every
-// supported language regardless of the listener's OS.
-//
-// Utterances are queued so fast-arriving captions speak in order rather than overlapping.
-// Tokens expire after ~10 minutes; since Azure's SpeechSynthesizer doesn't support swapping
-// tokens on a live instance the way the recognizer does, this simply rebuilds the synthesizer
-// with a fresh token periodically — cheap to do, and never happens mid-utterance.
+// Web Audio API Context for zero-latency, mobile browser autoplay-compliant audio output.
+let audioCtx = null;
 let sharedAudio = null;
 
 export function unlockAudioEngine() {
   if (typeof window === "undefined") return;
   try {
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    if (AudioCtx) {
+      if (!audioCtx) audioCtx = new AudioCtx();
+      if (audioCtx.state === "suspended") {
+        audioCtx.resume().catch(() => {});
+      }
+      // Play a tiny silent buffer to warm up AudioContext on iOS Safari & Android Chrome
+      const buffer = audioCtx.createBuffer(1, 1, 22050);
+      const source = audioCtx.createBufferSource();
+      source.buffer = buffer;
+      source.connect(audioCtx.destination);
+      source.start(0);
+    }
+
     if (!sharedAudio) {
       sharedAudio = new Audio();
       sharedAudio.setAttribute("playsinline", "true");
@@ -21,12 +28,13 @@ export function unlockAudioEngine() {
     }
     sharedAudio.src = "data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA";
     sharedAudio.play().catch(() => {});
+
     if (window.speechSynthesis) {
       const dummy = new SpeechSynthesisUtterance("");
       window.speechSynthesis.speak(dummy);
     }
   } catch (e) {
-    // ignore
+    console.warn("unlockAudioEngine warning:", e);
   }
 }
 
@@ -59,6 +67,81 @@ export function createAzureSpeaker({ getToken, voiceName, speechRate = "0.95" })
     return `<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xmlns:mstts="https://www.w3.org/2001/mstts" xml:lang="${langCode}"><voice name="${voice}"><prosody rate="${rate}" pitch="0%">${escapeXml(text)}</prosody></voice></speak>`;
   }
 
+  function speakWebSpeechFallback(text, voice) {
+    if (typeof window !== "undefined" && window.speechSynthesis) {
+      const u = new SpeechSynthesisUtterance(text);
+      const langCode = voice.split("-").slice(0, 2).join("-");
+      u.lang = langCode || "en-IN";
+      u.onend = () => {
+        speaking = false;
+        pump();
+      };
+      u.onerror = () => {
+        speaking = false;
+        pump();
+      };
+      window.speechSynthesis.speak(u);
+    } else {
+      speaking = false;
+      pump();
+    }
+  }
+
+  async function playAudioBuffer(audioData, text, voice) {
+    // Method 1: Web Audio API (Primary: bypasses mobile browser HTML5 element autoplay restrictions)
+    const AudioCtx = typeof window !== "undefined" && (window.AudioContext || window.webkitAudioContext);
+    if (AudioCtx) {
+      try {
+        if (!audioCtx) audioCtx = new AudioCtx();
+        if (audioCtx.state === "suspended") {
+          await audioCtx.resume().catch(() => {});
+        }
+        const bufferCopy = audioData.slice(0);
+        const audioBuffer = await new Promise((resolve, reject) => {
+          audioCtx.decodeAudioData(bufferCopy, resolve, reject);
+        });
+
+        const source = audioCtx.createBufferSource();
+        source.buffer = audioBuffer;
+        source.connect(audioCtx.destination);
+        source.onended = () => {
+          speaking = false;
+          pump();
+        };
+        source.start(0);
+        return;
+      } catch (err) {
+        console.warn("Web Audio API decode/play error, attempting HTML5 audio fallback:", err);
+      }
+    }
+
+    // Method 2: HTML5 Audio Element Fallback
+    try {
+      const blob = new Blob([audioData], { type: "audio/mp3" });
+      const url = URL.createObjectURL(blob);
+      if (!sharedAudio) {
+        sharedAudio = new Audio();
+        sharedAudio.setAttribute("playsinline", "true");
+        sharedAudio.setAttribute("webkit-playsinline", "true");
+      }
+      sharedAudio.src = url;
+      sharedAudio.onended = () => {
+        URL.revokeObjectURL(url);
+        speaking = false;
+        pump();
+      };
+      sharedAudio.onerror = (e) => {
+        console.error("HTML5 Audio playback error:", e);
+        URL.revokeObjectURL(url);
+        speakWebSpeechFallback(text, voice);
+      };
+      await sharedAudio.play();
+    } catch (err) {
+      console.warn("HTML5 Audio play rejected by browser policy, using Web Speech API fallback:", err);
+      speakWebSpeechFallback(text, voice);
+    }
+  }
+
   async function pump() {
     if (speaking || queue.length === 0 || !enabled) return;
     const text = queue.shift();
@@ -69,113 +152,26 @@ export function createAzureSpeaker({ getToken, voiceName, speechRate = "0.95" })
       const ssml = buildSsml(text, currentVoice, currentRate);
       synthesizer.speakSsmlAsync(
         ssml,
-        (result) => {
+        async (result) => {
           synthesizer.close();
           if (result.reason === SpeechSDK.ResultReason.SynthesizingAudioCompleted && result.audioData) {
-            const blob = new Blob([result.audioData], { type: "audio/mp3" });
-            const url = URL.createObjectURL(blob);
-            if (!sharedAudio) {
-              sharedAudio = new Audio();
-              sharedAudio.setAttribute("playsinline", "true");
-              sharedAudio.setAttribute("webkit-playsinline", "true");
-            }
-            sharedAudio.src = url;
-            sharedAudio.onended = () => {
-              URL.revokeObjectURL(url);
-              speaking = false;
-              pump();
-            };
-            sharedAudio.onerror = (e) => {
-              console.error("Audio playback error:", e);
-              URL.revokeObjectURL(url);
-              speaking = false;
-              pump();
-            };
-            sharedAudio.play().catch((err) => {
-              console.warn("Autoplay deferred by browser policy, using Web Speech API fallback:", err);
-              URL.revokeObjectURL(url);
-              if (typeof window !== "undefined" && window.speechSynthesis) {
-                const u = new SpeechSynthesisUtterance(text);
-                const langCode = currentVoice.split("-").slice(0, 2).join("-");
-                u.lang = langCode || "en-IN";
-                u.onend = () => {
-                  speaking = false;
-                  pump();
-                };
-                u.onerror = () => {
-                  speaking = false;
-                  pump();
-                };
-                window.speechSynthesis.speak(u);
-              } else {
-                speaking = false;
-                pump();
-              }
-            });
+            await playAudioBuffer(result.audioData, text, currentVoice);
           } else {
-            console.warn("Azure speech synthesis canceled/failed, using Web Speech API fallback:", result?.errorDetails);
+            console.warn("Azure speech synthesis canceled/failed:", result?.errorDetails);
             cachedConfig = null;
-            if (typeof window !== "undefined" && window.speechSynthesis) {
-              const u = new SpeechSynthesisUtterance(text);
-              const langCode = currentVoice.split("-").slice(0, 2).join("-");
-              u.lang = langCode || "en-IN";
-              u.onend = () => {
-                speaking = false;
-                pump();
-              };
-              u.onerror = () => {
-                speaking = false;
-                pump();
-              };
-              window.speechSynthesis.speak(u);
-            } else {
-              speaking = false;
-              pump();
-            }
+            speakWebSpeechFallback(text, currentVoice);
           }
         },
         (err) => {
           synthesizer.close();
           cachedConfig = null;
-          console.error("Azure speech synthesis failed, using Web Speech API fallback:", err);
-          if (typeof window !== "undefined" && window.speechSynthesis) {
-            const u = new SpeechSynthesisUtterance(text);
-            const langCode = currentVoice.split("-").slice(0, 2).join("-");
-            u.lang = langCode || "en-IN";
-            u.onend = () => {
-              speaking = false;
-              pump();
-            };
-            u.onerror = () => {
-              speaking = false;
-              pump();
-            };
-            window.speechSynthesis.speak(u);
-          } else {
-            speaking = false;
-            pump();
-          }
+          console.error("Azure speech synthesis error:", err);
+          speakWebSpeechFallback(text, currentVoice);
         }
       );
     } catch (err) {
-      console.error("Azure speech synthesis setup failed, using Web Speech API fallback:", err);
-      if (typeof window !== "undefined" && window.speechSynthesis) {
-        const u = new SpeechSynthesisUtterance(text);
-        const langCode = currentVoice.split("-").slice(0, 2).join("-");
-        u.lang = langCode || "en-IN";
-        u.onend = () => {
-          speaking = false;
-          pump();
-        };
-        u.onerror = () => {
-          speaking = false;
-          pump();
-        };
-        window.speechSynthesis.speak(u);
-      } else {
-        speaking = false;
-        pump();
-      }
+      console.error("Azure speech synthesis setup failed:", err);
+      speakWebSpeechFallback(text, currentVoice);
     }
   }
 
