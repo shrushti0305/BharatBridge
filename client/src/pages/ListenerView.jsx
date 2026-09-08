@@ -26,6 +26,7 @@ export default function ListenerView() {
   const [listenerCount, setListenerCount] = useState(null);
   const [consented, setConsented] = useState(false);
   const [liveAudioUrl, setLiveAudioUrl] = useState(null);
+  const [qSubmitted, setQSubmitted] = useState(false);
 
   const socketRef = useRef(null);
   const speakerTtsRef = useRef(null);
@@ -411,8 +412,13 @@ export default function ListenerView() {
             <div className="sidebar-block">
               <h3 style={{ marginBottom: 4 }}>❓ Ask Speaker a Question</h3>
               <p style={{ margin: "0 0 8px 0", fontSize: 12, color: "var(--text-muted)" }}>
-                Submit questions for the speaker to answer live
+                Submit questions in your language — speaker receives instant translation
               </p>
+              {qSubmitted && (
+                <div style={{ padding: "6px 10px", borderRadius: 6, background: "rgba(16,185,129,0.15)", color: "#10b981", fontSize: 12, marginBottom: 8, fontWeight: 600, border: "1px solid rgba(16,185,129,0.3)" }}>
+                  ✅ Question sent to speaker!
+                </div>
+              )}
               <form
                 onSubmit={(e) => {
                   e.preventDefault();
@@ -420,6 +426,8 @@ export default function ListenerView() {
                   if (!input.value.trim()) return;
                   socketRef.current?.emit("question:submit", { sessionId, question: input.value.trim() }, () => {
                     input.value = "";
+                    setQSubmitted(true);
+                    setTimeout(() => setQSubmitted(false), 3000);
                   });
                 }}
               >
@@ -466,6 +474,14 @@ export default function ListenerView() {
                   style={{ fontSize: 12, textDecoration: "none", background: "rgba(255,255,255,0.08)", textAlign: "left" }}
                 >
                   🎬 Download Video Subtitles (.srt)
+                </a>
+                <a
+                  href={`${api.serverUrl}/api/sessions/${sessionId}/export?format=vtt&lang=${language || "en"}`}
+                  download={`subtitles-${sessionId}.vtt`}
+                  className="btn btn-block"
+                  style={{ fontSize: 12, textDecoration: "none", background: "rgba(255,255,255,0.08)", textAlign: "left" }}
+                >
+                  🌐 Download WebVTT Subtitles (.vtt)
                 </a>
                 {(liveAudioUrl || session?.audioUrl) && (
                   <a
