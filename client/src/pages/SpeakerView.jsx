@@ -399,7 +399,7 @@ export default function SpeakerView() {
                 <div style={{ textAlign: "center", background: "#ffffff", padding: "12px 8px", borderRadius: 10 }}>
                   <img
                     src={`https://api.qrserver.com/v1/create-qr-code/?size=180x180&data=${encodeURIComponent(
-                      `${window.location.protocol}//${window.location.hostname}:5173/listen/${session.id}`
+                      `${window.location.origin}/listen/${session.id}`
                     )}`}
                     alt="Scan to join session"
                     style={{ width: 150, height: 150, display: "block", margin: "0 auto" }}
