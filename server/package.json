@@ -9,6 +9,7 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.32.1",
+    "@azure/storage-blob": "^12.33.0",
     "@google/genai": "^2.19.0",
     "bcryptjs": "^2.4.3",
     "better-sqlite3-multiple-ciphers": "^13.0.3",
@@ -21,6 +22,7 @@
     "microsoft-cognitiveservices-speech-sdk": "^1.51.0",
     "nanoid": "^5.0.9",
     "nodemailer": "^9.0.6",
+    "pg": "^8.23.0",
     "socket.io": "^4.8.1",
     "socket.io-client": "^4.8.3"
   }

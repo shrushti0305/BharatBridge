@@ -22,7 +22,7 @@ export default function ListenerView() {
   const [summary, setSummary] = useState(null);
   const [audioOn, setAudioOn] = useState(true);
   const [voiceGender, setVoiceGender] = useState("female");
-  const [speechPace, setSpeechPace] = useState("0.94");
+  const [speechPace, setSpeechPace] = useState("1.0");
   const [listenerCount, setListenerCount] = useState(null);
   const [consented, setConsented] = useState(false);
   const [liveAudioUrl, setLiveAudioUrl] = useState(null);
@@ -438,11 +438,43 @@ export default function ListenerView() {
                     </select>
                   </div>
                   <div className="field" style={{ marginBottom: 0 }}>
-                    <label style={{ fontSize: 12 }}>Audio Cadence & Pace</label>
-                    <select value={speechPace} onChange={(e) => setSpeechPace(e.target.value)}>
-                      <option value="0.94">🎵 Natural Live Pace (0.94x)</option>
-                      <option value="1.0">⚡ Standard Pace (1.0x)</option>
-                    </select>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+                      <label style={{ fontSize: 12, margin: 0 }}>⚡ Live Playback Speed & Pitch</label>
+                      <span style={{ fontSize: 12, fontWeight: 700, background: "var(--amber)", color: "#000", padding: "2px 8px", borderRadius: 12 }}>
+                        {speechPace}x Speed
+                      </span>
+                    </div>
+                    <input
+                      type="range"
+                      min="1.0"
+                      max="2.5"
+                      step="0.1"
+                      value={speechPace}
+                      onChange={(e) => setSpeechPace(e.target.value)}
+                      style={{ width: "100%", cursor: "pointer", accentColor: "var(--amber)" }}
+                    />
+                    <div style={{ display: "flex", gap: 4, marginTop: 8 }}>
+                      {["1.0", "1.25", "1.5", "2.0", "2.5"].map((rate) => (
+                        <button
+                          key={rate}
+                          type="button"
+                          style={{
+                            flex: 1,
+                            padding: "4px 0",
+                            fontSize: 11,
+                            fontWeight: speechPace === rate ? 700 : 400,
+                            background: speechPace === rate ? "var(--amber)" : "rgba(255,255,255,0.08)",
+                            color: speechPace === rate ? "#000" : "inherit",
+                            border: "1px solid var(--border)",
+                            borderRadius: 4,
+                            cursor: "pointer",
+                          }}
+                          onClick={() => setSpeechPace(rate)}
+                        >
+                          {rate}x
+                        </button>
+                      ))}
+                    </div>
                   </div>
                 </div>
               )}

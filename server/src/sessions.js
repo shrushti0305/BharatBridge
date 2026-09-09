@@ -9,6 +9,7 @@ import { isValidLanguage, LANGUAGES, SPEAKER_LANGUAGES } from "./languages.js";
 import { isValidTitle, isValidJoinCode } from "./validation.js";
 import { summarizeSession } from "./ai.js";
 import { translateSegment } from "./azureTranslate.js";
+import { uploadAudioFile } from "./storageService.js";
 
 const makeJoinCode = customAlphabet("ABCDEFGHJKLMNPQRSTUVWXYZ23456789", 6);
 
@@ -357,7 +358,7 @@ sessionsRouter.get("/audio/:filename", (req, res) => {
 });
 
 // Upload live recorded audio for a session
-sessionsRouter.post("/:id/audio", requireAuth, express.raw({ type: "audio/*", limit: "100mb" }), (req, res) => {
+sessionsRouter.post("/:id/audio", requireAuth, express.raw({ type: "audio/*", limit: "100mb" }), async (req, res) => {
   const row = db.prepare("SELECT * FROM sessions WHERE id = ?").get(req.params.id);
   if (!row) return res.status(404).json({ error: "Session not found" });
   if (row.speaker_id !== req.user.id) {
@@ -372,7 +373,9 @@ sessionsRouter.post("/:id/audio", requireAuth, express.raw({ type: "audio/*", li
   const filePath = path.join(audioDir, filename);
   fs.writeFileSync(filePath, req.body);
 
-  const audioUrl = `/api/sessions/audio/${filename}`;
+  const cloudUrl = await uploadAudioFile({ filePath, fileName: filename, mimeType: "audio/webm" });
+  const audioUrl = cloudUrl || `/api/sessions/audio/${filename}`;
+
   db.prepare("UPDATE sessions SET audio_url = ? WHERE id = ?").run(audioUrl, row.id);
 
   res.json({ ok: true, audioUrl });

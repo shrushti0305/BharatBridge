@@ -64,7 +64,8 @@ export function createAzureSpeaker({ getToken, voiceName, speechRate = "0.95" })
     const escapeXml = (s) =>
       s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&apos;");
     const langCode = voice.split("-").slice(0, 2).join("-");
-    return `<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xmlns:mstts="https://www.w3.org/2001/mstts" xml:lang="${langCode}"><voice name="${voice}"><prosody rate="${rate}" pitch="0%">${escapeXml(text)}</prosody></voice></speak>`;
+    const formattedRate = `${Math.min(2.5, Math.max(0.5, parseFloat(rate) || 1.0))}`;
+    return `<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xmlns:mstts="https://www.w3.org/2001/mstts" xml:lang="${langCode}"><voice name="${voice}"><prosody rate="${formattedRate}" pitch="0%">${escapeXml(text)}</prosody></voice></speak>`;
   }
 
   function speakWebSpeechFallback(text, voice) {
@@ -72,6 +73,7 @@ export function createAzureSpeaker({ getToken, voiceName, speechRate = "0.95" })
       const u = new SpeechSynthesisUtterance(text);
       const langCode = voice.split("-").slice(0, 2).join("-");
       u.lang = langCode || "en-IN";
+      u.rate = Math.min(2.5, Math.max(0.5, parseFloat(currentRate) || 1.0));
       u.onend = () => {
         speaking = false;
         pump();
@@ -87,8 +89,37 @@ export function createAzureSpeaker({ getToken, voiceName, speechRate = "0.95" })
     }
   }
 
-  async function playAudioBuffer(audioData, text, voice) {
-    // Method 1: Web Audio API (Primary: bypasses mobile browser HTML5 element autoplay restrictions)
+  async function synthesize(text) {
+    try {
+      const config = await getConfig();
+      const synthesizer = new SpeechSDK.SpeechSynthesizer(config, null);
+      const ssml = buildSsml(text, currentVoice, currentRate);
+      return await new Promise((resolve, reject) => {
+        synthesizer.speakSsmlAsync(
+          ssml,
+          (result) => {
+            synthesizer.close();
+            if (result.reason === SpeechSDK.ResultReason.SynthesizingAudioCompleted && result.audioData) {
+              resolve(result.audioData);
+            } else {
+              cachedConfig = null;
+              reject(new Error(result?.errorDetails || "Synthesis failed"));
+            }
+          },
+          (err) => {
+            synthesizer.close();
+            cachedConfig = null;
+            reject(err);
+          }
+        );
+      });
+    } catch (err) {
+      cachedConfig = null;
+      throw err;
+    }
+  }
+
+  async function playAudioBuffer(audioData, text) {
     const AudioCtx = typeof window !== "undefined" && (window.AudioContext || window.webkitAudioContext);
     if (AudioCtx) {
       try {
@@ -103,6 +134,12 @@ export function createAzureSpeaker({ getToken, voiceName, speechRate = "0.95" })
 
         const source = audioCtx.createBufferSource();
         source.buffer = audioBuffer;
+
+        // User selected rate (1.0x to 2.5x) with catch-up multiplier if queue has items
+        const userRate = parseFloat(currentRate) || 1.0;
+        const catchupMultiplier = queue.length > 0 ? 1.08 : 1.0;
+        source.playbackRate.value = Math.min(2.5, userRate * catchupMultiplier);
+
         source.connect(audioCtx.destination);
         source.onended = () => {
           speaking = false;
@@ -111,78 +148,41 @@ export function createAzureSpeaker({ getToken, voiceName, speechRate = "0.95" })
         source.start(0);
         return;
       } catch (err) {
-        console.warn("Web Audio API decode/play error, attempting HTML5 audio fallback:", err);
+        console.warn("Web Audio API decode/play error, fallback to WebSpeech:", err);
       }
     }
 
-    // Method 2: HTML5 Audio Element Fallback
-    try {
-      const blob = new Blob([audioData], { type: "audio/mp3" });
-      const url = URL.createObjectURL(blob);
-      if (!sharedAudio) {
-        sharedAudio = new Audio();
-        sharedAudio.setAttribute("playsinline", "true");
-        sharedAudio.setAttribute("webkit-playsinline", "true");
-      }
-      sharedAudio.src = url;
-      sharedAudio.onended = () => {
-        URL.revokeObjectURL(url);
-        speaking = false;
-        pump();
-      };
-      sharedAudio.onerror = (e) => {
-        console.error("HTML5 Audio playback error:", e);
-        URL.revokeObjectURL(url);
-        speakWebSpeechFallback(text, voice);
-      };
-      await sharedAudio.play();
-    } catch (err) {
-      console.warn("HTML5 Audio play rejected by browser policy, using Web Speech API fallback:", err);
-      speakWebSpeechFallback(text, voice);
-    }
+    // Fallback if Web Audio API fails
+    speakWebSpeechFallback(text, currentVoice);
   }
 
   async function pump() {
     if (speaking || queue.length === 0 || !enabled) return;
-    const text = queue.shift();
+    const item = queue.shift();
     speaking = true;
+
     try {
-      const config = await getConfig();
-      const synthesizer = new SpeechSDK.SpeechSynthesizer(config, null);
-      const ssml = buildSsml(text, currentVoice, currentRate);
-      synthesizer.speakSsmlAsync(
-        ssml,
-        async (result) => {
-          synthesizer.close();
-          if (result.reason === SpeechSDK.ResultReason.SynthesizingAudioCompleted && result.audioData) {
-            await playAudioBuffer(result.audioData, text, currentVoice);
-          } else {
-            console.warn("Azure speech synthesis canceled/failed:", result?.errorDetails);
-            cachedConfig = null;
-            speakWebSpeechFallback(text, currentVoice);
-          }
-        },
-        (err) => {
-          synthesizer.close();
-          cachedConfig = null;
-          console.error("Azure speech synthesis error:", err);
-          speakWebSpeechFallback(text, currentVoice);
-        }
-      );
+      const audioData = await item.audioPromise;
+      await playAudioBuffer(audioData, item.text);
     } catch (err) {
-      console.error("Azure speech synthesis setup failed:", err);
-      speakWebSpeechFallback(text, currentVoice);
+      console.warn("TTS synthesis error, using fallback:", err.message);
+      speakWebSpeechFallback(item.text, currentVoice);
     }
   }
 
   return {
     say(text) {
-      if (!text?.trim()) return;
+      if (!text?.trim() || !enabled) return;
       const clean = text.trim();
 
-      // Cap queue length to prevent backlog during rapid continuous speech
-      if (queue.length > 2) queue = queue.slice(-2);
-      queue.push(clean);
+      // Keep maximum 2 queued items to prevent audio backlogs when speaking fast
+      if (queue.length >= 2) {
+        queue = queue.slice(-1);
+      }
+
+      // Start pre-synthesizing audio IMMEDIATELY in parallel
+      const audioPromise = synthesize(clean);
+      queue.push({ text: clean, audioPromise });
       pump();
     },
     setVoiceName(newVoiceName) {
@@ -197,6 +197,7 @@ export function createAzureSpeaker({ getToken, voiceName, speechRate = "0.95" })
     },
     stop() {
       queue = [];
+      speaking = false;
     },
   };
 }

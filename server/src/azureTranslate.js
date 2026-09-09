@@ -16,6 +16,9 @@ import { LANGUAGE_BY_CODE } from "./languages.js";
 const anthropicKey = process.env.ANTHROPIC_API_KEY;
 const anthropic = anthropicKey ? new Anthropic({ apiKey: anthropicKey }) : null;
 
+let anthropicDisabled = false;
+let geminiDisabled = false;
+
 /**
  * Translate one transcript segment into MULTIPLE target languages using LLM context-aware translation.
  * Prioritizes Gemini 2.0 Flash / Anthropic Claude 3.5 Sonnet (full context, non-literal), falling back to Azure Translator.
@@ -24,7 +27,7 @@ export async function translateSegment({ sourceText, sourceLangCode, targetLangC
   if (targetLangCodes.length === 0) return {};
 
   // 1. Try Context-Aware Gemini 2.0 Flash Translation
-  if (process.env.GEMINI_API_KEY) {
+  if (process.env.GEMINI_API_KEY && !geminiDisabled) {
     try {
       const geminiResult = await translateWithGemini({
         text: sourceText,
@@ -41,12 +44,13 @@ export async function translateSegment({ sourceText, sourceLangCode, targetLangC
         return out;
       }
     } catch (e) {
-      console.warn("[translate] Gemini context translation fallback to Claude/Azure:", e.message);
+      console.warn("[translate] Gemini context translation failed, disabling Gemini fallback:", e.message);
+      geminiDisabled = true;
     }
   }
 
   // 2. Try Context-Aware Anthropic Claude Translation
-  if (anthropic) {
+  if (anthropic && !anthropicDisabled) {
     try {
       const claudeResult = await translateWithClaude({
         text: sourceText,
@@ -63,7 +67,8 @@ export async function translateSegment({ sourceText, sourceLangCode, targetLangC
         return out;
       }
     } catch (e) {
-      console.warn("[translate] Claude context translation fallback to Azure:", e.message);
+      console.warn("[translate] Claude context translation failed (credit/rate limit), fast-switching to Azure Translator:", e.message);
+      anthropicDisabled = true;
     }
   }
 
