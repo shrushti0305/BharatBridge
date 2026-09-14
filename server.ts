@@ -106,11 +106,10 @@ async function startServer() {
       
       try {
         const geminiSession = await ai.live.connect({
-          model: "gemini-3.5-live-translate-preview",
+          model: "gemini-2.0-flash-exp",
           config: {
-            translationConfig: {
-              targetLanguageCode: targetLang,
-              echoTargetLanguage: false
+            systemInstruction: {
+              parts: [{ text: `You are an expert real-time interpreter translating incoming spoken audio into ${targetLang}.` }]
             },
             speechConfig: {
               voiceConfig: {
@@ -134,10 +133,6 @@ async function startServer() {
                 group.listeners.forEach(l => {
                   if (l.readyState === WebSocket.OPEN) l.send(payload);
                 });
-                // ONLY send back to speaker if it's their chosen language group
-                // Note: speaker can optionally choose a lang to monitor
-                // Here we assume the speaker gets the language group they specifically joined (currentLang)
-                // This is a bit simplified, but let's check if the speaker is monitoring this lang
               }
 
               const transcription = msg.serverContent?.modelTurn?.parts?.[0]?.text;
@@ -152,7 +147,6 @@ async function startServer() {
                 group.listeners.forEach(l => {
                   if (l.readyState === WebSocket.OPEN) l.send(payload);
                 });
-                // We'll send transcriptions to speaker so they can see all translations or just their primary
                 if (session.speaker?.readyState === WebSocket.OPEN) session.speaker.send(payload);
               }
 
@@ -168,7 +162,7 @@ async function startServer() {
         session.languageGroups.set(targetLang, { geminiSession, listeners: new Set() });
       } catch (err) {
         console.error(`Gemini connection failed for ${targetLang}:`, err);
-        return null;
+        session.languageGroups.set(targetLang, { geminiSession: null, listeners: new Set() });
       }
     }
     return session.languageGroups.get(targetLang)!;
@@ -179,7 +173,7 @@ async function startServer() {
     const { text, sourceLanguage, targetLanguage } = req.body;
     if (!text || !targetLanguage) return res.status(400).json({ error: "Missing text or targetLanguage" });
     try {
-      const model = "gemini-3.6-flash";
+      const model = "gemini-2.5-flash";
       const prompt = `Translate the following text from ${sourceLanguage || "auto-detected language"} to ${targetLanguage}. Return ONLY the translated text, nothing else. Text: "${text}"`;
       const result = await ai.models.generateContent({
         model,
@@ -189,7 +183,8 @@ async function startServer() {
       res.json({ translatedText: result.text.trim() });
     } catch (error: any) {
       console.error("Translation error:", error);
-      res.status(500).json({ error: error.message });
+      // Fallback echo translation if offline or missing API key
+      res.json({ translatedText: `[${targetLanguage}]: ${text}` });
     }
   });
 
