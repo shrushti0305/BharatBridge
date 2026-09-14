@@ -80,6 +80,82 @@ async function startServer() {
     }
   });
 
+  // Azure Cognitive Services Translator API Endpoint
+  app.post("/api/azure/translate", async (req, res) => {
+    const { text, sourceLanguageCode, targetLanguageCode } = req.body;
+    const key = process.env.AZURE_TRANSLATOR_KEY;
+    const region = process.env.AZURE_TRANSLATOR_REGION || "centralindia";
+
+    if (!key) {
+      return res.status(400).json({ error: "AZURE_TRANSLATOR_KEY not configured in .env" });
+    }
+
+    try {
+      const url = `https://api.cognitive.microsofttranslator.com/translate?api-version=3.0&to=${targetLanguageCode}${sourceLanguageCode ? `&from=${sourceLanguageCode}` : ''}`;
+      const response = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Ocp-Apim-Subscription-Key": key,
+          "Ocp-Apim-Subscription-Region": region,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify([{ text }])
+      });
+
+      if (!response.ok) {
+        const errText = await response.text();
+        throw new Error(`Azure Translator HTTP ${response.status}: ${errText}`);
+      }
+
+      const data = await response.json();
+      const translatedText = data[0]?.translations[0]?.text || text;
+      res.json({ translatedText });
+    } catch (error: any) {
+      console.error("Azure Translator API Error:", error);
+      res.status(500).json({ error: error.message || "Azure Translation Failed" });
+    }
+  });
+
+  // Azure Neural Text-to-Speech (TTS) API Endpoint
+  app.post("/api/azure/tts", async (req, res) => {
+    const { text, languageCode, voiceName } = req.body;
+    const key = process.env.AZURE_SPEECH_KEY;
+    const region = process.env.AZURE_SPEECH_REGION || "centralindia";
+
+    if (!key) {
+      return res.status(400).json({ error: "AZURE_SPEECH_KEY not configured in .env" });
+    }
+
+    try {
+      const selectedVoice = voiceName || (languageCode === 'hi' ? 'hi-IN-SwaraNeural' : `${languageCode}-IN-Neural`);
+      const ssml = `<speak version='1.0' xml:lang='${languageCode || 'hi-IN'}'><voice name='${selectedVoice}'>${text}</voice></speak>`;
+
+      const url = `https://${region}.tts.speech.microsoft.com/cognitiveservices/v1`;
+      const response = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Ocp-Apim-Subscription-Key": key,
+          "Content-Type": "application/ssml+xml",
+          "X-Microsoft-OutputFormat": "audio-24khz-48kbitrate-mono-mp3",
+          "User-Agent": "BharatBridge"
+        },
+        body: ssml
+      });
+
+      if (!response.ok) {
+        const errText = await response.text();
+        throw new Error(`Azure TTS HTTP ${response.status}: ${errText}`);
+      }
+
+      const audioBuffer = await response.arrayBuffer();
+      const base64Audio = Buffer.from(audioBuffer).toString("base64");
+      res.json({ audio: base64Audio, format: "audio/mp3" });
+    } catch (error: any) {
+      console.error("Azure TTS Error:", error);
+      res.status(500).json({ error: error.message || "Azure Neural TTS Failed" });
+    }
+  });
+
 
   // Room management
   type LanguageGroup = {
