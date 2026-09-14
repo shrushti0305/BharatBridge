@@ -36,6 +36,7 @@ import { onAuthStateChanged, User, signOut } from "firebase/auth";
 import { 
   collection, 
   addDoc, 
+  setDoc,
   onSnapshot, 
   query, 
   orderBy, 
@@ -559,8 +560,9 @@ export default function App() {
 
   const startLiveSession = async () => {
     const activeUserId = user?.uid || `guest-${Math.random().toString(36).substring(2, 9)}`;
+    const pinCode = Math.floor(100000 + Math.random() * 900000).toString(); // Memorable 6-digit PIN (e.g. 582941)
     const sessionData = {
-      name: `Live Session - ${sourceLang.name} to ${targetLang.name}`,
+      name: `Live Session #${pinCode} - ${sourceLang.name} to ${targetLang.name}`,
       createdAt: serverTimestamp(),
       speakerId: activeUserId,
       speakerGender: profile.gender,
@@ -569,10 +571,9 @@ export default function App() {
       status: 'active'
     };
 
-    let sessionId = `session-${Date.now()}`;
+    const sessionId = pinCode;
     try {
-      const docRef = await addDoc(collection(db, "sessions"), sessionData);
-      sessionId = docRef.id;
+      await setDoc(doc(db, "sessions", pinCode), sessionData);
     } catch (error) {
       console.warn("Firestore save fallback to local session ID:", error);
     }
@@ -627,11 +628,12 @@ export default function App() {
     }
   };
 
-  const joinLiveSession = async (sessionId: string) => {
+  const joinLiveSession = async (rawSessionId: string) => {
+    const sessionId = rawSessionId.trim();
     let sessionData = {
       sourceLang: sourceLang.code,
       targetLang: targetLang.code,
-      name: `Live Session #${sessionId.slice(-4)}`
+      name: `Live Session #${sessionId}`
     };
 
     try {
