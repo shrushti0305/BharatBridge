@@ -1108,22 +1108,40 @@ export default function App() {
                         <span className="text-[10px] text-slate-500 uppercase tracking-widest">{sessionRole === 'speaker' ? 'Broadcasting' : 'Listening'}</span>
                         <div className="flex items-center gap-1 px-2 py-0.5 bg-blue-500/10 border border-blue-500/20 rounded-full">
                           <Users size={10} className="text-blue-400" />
-                          <span className="text-[9px] font-bold text-blue-400">{listenerCount}</span>
+                          <span className="text-[9px] font-bold text-blue-400">{listenerCount} listeners</span>
                         </div>
                       </div>
-                      <button 
-                        onClick={() => {
-                          const link = `${window.location.origin}${window.location.pathname}?session=${currentSession?.id}`;
-                          navigator.clipboard.writeText(link);
-                          setCopiedId(true);
-                          setTimeout(() => setCopiedId(false), 2000);
-                        }}
-                        className="flex items-center gap-2 text-[10px] font-mono text-blue-400 hover:text-blue-300 transition-colors group"
-                      >
-                        <span className="opacity-60">Invite Link</span>
-                        <Share2 size={10} className="opacity-60 group-hover:opacity-100 transition-opacity" />
-                        {copiedId && <span className="text-[8px] text-green-400 uppercase font-bold ml-1">Copied</span>}
-                      </button>
+                      
+                      {/* Prominent Session ID Display */}
+                      <div className="flex items-center gap-2 mt-0.5">
+                        <span className="text-[10px] font-mono text-slate-400">ID: <strong className="text-orange-400 select-all font-bold">{currentSession?.id}</strong></span>
+                        <button 
+                          onClick={() => {
+                            if (currentSession?.id) {
+                              navigator.clipboard.writeText(currentSession.id);
+                              setCopiedId(true);
+                              setTimeout(() => setCopiedId(false), 2000);
+                            }
+                          }}
+                          className="px-1.5 py-0.5 bg-white/5 hover:bg-white/10 border border-white/10 rounded text-[9px] font-mono text-slate-300 hover:text-white transition-colors"
+                          title="Copy Session ID"
+                        >
+                          {copiedId ? 'COPIED!' : 'COPY ID'}
+                        </button>
+                        <button 
+                          onClick={() => {
+                            const host = window.location.host;
+                            const link = `${window.location.protocol}//${host}${window.location.pathname}?session=${currentSession?.id}`;
+                            navigator.clipboard.writeText(link);
+                            setCopiedId(true);
+                            setTimeout(() => setCopiedId(false), 2000);
+                          }}
+                          className="flex items-center gap-1 text-[9px] font-mono text-blue-400 hover:text-blue-300 transition-colors group ml-1"
+                        >
+                          <Share2 size={9} />
+                          <span>COPY LINK</span>
+                        </button>
+                      </div>
                     </div>
                     <div className="flex items-center gap-2">
                       {/* Playback Speed Selector (1.0x - 2.0x) */}
