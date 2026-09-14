@@ -558,54 +558,54 @@ export default function App() {
   };
 
   const startLiveSession = async () => {
-    if (!user) {
-      await signInWithGoogle();
-      return;
-    }
-    try {
-      const sessionData = {
-        name: `Live Session - ${sourceLang.name} to ${targetLang.name}`,
-        createdAt: serverTimestamp(),
-        speakerId: user.uid,
-        speakerGender: profile.gender,
-        sourceLang: sourceLang.code,
-        targetLang: targetLang.code,
-        status: 'active'
-      };
-      const docRef = await addDoc(collection(db, "sessions"), sessionData);
-      const sessionId = docRef.id;
-      setCurrentSession({ id: sessionId, ...sessionData } as Session);
-      setIsLive(true);
-      setSessionRole('speaker');
+    const activeUserId = user?.uid || `guest-${Math.random().toString(36).substring(2, 9)}`;
+    const sessionData = {
+      name: `Live Session - ${sourceLang.name} to ${targetLang.name}`,
+      createdAt: serverTimestamp(),
+      speakerId: activeUserId,
+      speakerGender: profile.gender,
+      sourceLang: sourceLang.code,
+      targetLang: targetLang.code,
+      status: 'active'
+    };
 
-      // Setup WebSocket
-      const socket = new WebSocket(`${window.location.protocol === "https:" ? "wss:" : "ws:"}//${window.location.host}`);
-      socket.onopen = () => {
-        socket.send(JSON.stringify({ 
-          type: "join", 
-          sessionId, 
-          role: "speaker", 
-          gender: profile.gender,
-          targetLang: targetLang.code
-        }));
-      };
-      socket.onmessage = (event) => {
-        const msg = JSON.parse(event.data);
-        if (msg.type === "audio") playAudioChunk(msg.audio);
-        if (msg.type === "stats") setListenerCount(msg.listeners);
-        if (msg.type === "transcription") {
-          if (msg.isFinal && currentSession && sessionRole === 'speaker') {
-            pushMessageToLive(msg.originalText, msg.translatedText);
-          }
-        }
-        if (msg.type === "interrupted") {
-          nextStartTimeRef.current = 0;
-        }
-      };
-      setWs(socket);
+    let sessionId = `session-${Date.now()}`;
+    try {
+      const docRef = await addDoc(collection(db, "sessions"), sessionData);
+      sessionId = docRef.id;
     } catch (error) {
-      handleFirestoreError(error, OperationType.CREATE, "sessions");
+      console.warn("Firestore save fallback to local session ID:", error);
     }
+
+    setCurrentSession({ id: sessionId, ...sessionData } as Session);
+    setIsLive(true);
+    setSessionRole('speaker');
+
+    // Setup WebSocket
+    const socket = new WebSocket(`${window.location.protocol === "https:" ? "wss:" : "ws:"}//${window.location.host}`);
+    socket.onopen = () => {
+      socket.send(JSON.stringify({ 
+        type: "join", 
+        sessionId, 
+        role: "speaker", 
+        gender: profile.gender,
+        targetLang: targetLang.code
+      }));
+    };
+    socket.onmessage = (event) => {
+      const msg = JSON.parse(event.data);
+      if (msg.type === "audio") playAudioChunk(msg.audio);
+      if (msg.type === "stats") setListenerCount(msg.listeners);
+      if (msg.type === "transcription") {
+        if (msg.isFinal && currentSession && sessionRole === 'speaker') {
+          pushMessageToLive(msg.originalText, msg.translatedText);
+        }
+      }
+      if (msg.type === "interrupted") {
+        nextStartTimeRef.current = 0;
+      }
+    };
+    setWs(socket);
   };
 
   const endLiveSession = async () => {
@@ -613,7 +613,8 @@ export default function App() {
     try {
       await updateDoc(doc(db, "sessions", currentSession.id), {
         status: 'finished'
-      });
+      }).catch(() => {});
+    } finally {
       setIsLive(false);
       setSessionRole(null);
       setCurrentSession(null);
@@ -623,71 +624,66 @@ export default function App() {
       if (outputAudioCtxRef.current) outputAudioCtxRef.current.close();
       inputAudioCtxRef.current = null;
       outputAudioCtxRef.current = null;
-    } catch (error) {
-      handleFirestoreError(error, OperationType.UPDATE, `sessions/${currentSession.id}`);
     }
   };
 
   const joinLiveSession = async (sessionId: string) => {
-    if (!user) {
-      await signInWithGoogle();
-      return;
-    }
+    let sessionData = {
+      sourceLang: sourceLang.code,
+      targetLang: targetLang.code,
+      name: `Live Session #${sessionId.slice(-4)}`
+    };
+
     try {
       const snapshot = await getDocs(query(collection(db, "sessions"), where("__name__", "==", sessionId)));
-      if (snapshot.empty) {
-        alert("Session not found");
-        return;
+      if (!snapshot.empty) {
+        const data = snapshot.docs[0].data();
+        sessionData = { ...sessionData, ...data };
+        const s = LANGUAGES.find(l => l.code === data.sourceLang);
+        const t = LANGUAGES.find(l => l.code === data.targetLang);
+        if (s) setSourceLang(s);
+        if (t) setTargetLang(t);
       }
-      const data = snapshot.docs[0].data();
-      setCurrentSession({ id: snapshot.docs[0].id, ...data } as Session);
-      setIsLive(true);
-      setSessionRole('listener');
-      
-      const s = LANGUAGES.find(l => l.code === data.sourceLang);
-      const t = LANGUAGES.find(l => l.code === data.targetLang);
-      if (s) setSourceLang(s);
-      if (t) setTargetLang(t);
-
-      // Setup WebSocket
-      const socket = new WebSocket(`${window.location.protocol === "https:" ? "wss:" : "ws:"}//${window.location.host}`);
-      socket.onopen = () => {
-        socket.send(JSON.stringify({ 
-          type: "join", 
-          sessionId, 
-          role: "listener",
-          targetLang: targetLang.code
-        }));
-      };
-      socket.onmessage = (event) => {
-        const msg = JSON.parse(event.data);
-        if (msg.type === "audio") playAudioChunk(msg.audio);
-        if (msg.type === "stats") setListenerCount(msg.listeners);
-        if (msg.type === "transcription") {
-          // Add to local messages if it matches our target language or if we want to show it
-          // Note: Firestore listener also adds messages, but they might be in the session's default lang
-          if (msg.isFinal) {
-            setMessages(prev => {
-              // Check if we already have this message (id might be tricky since it's local vs firestore)
-              // For now, just append if it's new content
-              const exists = prev.some(m => m.originalText === msg.originalText && m.translatedText === msg.translatedText);
-              if (exists) return prev;
-              return [...prev, {
-                id: `live-${Date.now()}`,
-                originalText: msg.originalText,
-                translatedText: msg.translatedText,
-                timestamp: { seconds: Math.floor(Date.now() / 1000) } as any,
-                sourceLang: sourceLang.code,
-                targetLang: msg.targetLang || targetLang.code
-              } as FBMessage];
-            });
-          }
-        }
-      };
-      setWs(socket);
     } catch (error) {
-      handleFirestoreError(error, OperationType.GET, `sessions/${sessionId}`);
+      console.warn("Firestore lookup fallback:", error);
     }
+
+    setCurrentSession({ id: sessionId, ...sessionData } as Session);
+    setIsLive(true);
+    setSessionRole('listener');
+
+    // Setup WebSocket
+    const socket = new WebSocket(`${window.location.protocol === "https:" ? "wss:" : "ws:"}//${window.location.host}`);
+    socket.onopen = () => {
+      socket.send(JSON.stringify({ 
+        type: "join", 
+        sessionId, 
+        role: "listener",
+        targetLang: targetLang.code
+      }));
+    };
+    socket.onmessage = (event) => {
+      const msg = JSON.parse(event.data);
+      if (msg.type === "audio") playAudioChunk(msg.audio);
+      if (msg.type === "stats") setListenerCount(msg.listeners);
+      if (msg.type === "transcription") {
+        if (msg.isFinal) {
+          setMessages(prev => {
+            const exists = prev.some(m => m.originalText === msg.originalText && m.translatedText === msg.translatedText);
+            if (exists) return prev;
+            return [...prev, {
+              id: `live-${Date.now()}`,
+              originalText: msg.originalText,
+              translatedText: msg.translatedText,
+              timestamp: { seconds: Math.floor(Date.now() / 1000) } as any,
+              sourceLang: sourceLang.code,
+              targetLang: msg.targetLang || targetLang.code
+            } as FBMessage];
+          });
+        }
+      }
+    };
+    setWs(socket);
   };
 
   const pushMessageToLive = async (original: string, translated: string) => {

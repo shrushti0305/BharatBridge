@@ -56,7 +56,7 @@ async function startServer() {
 
     try {
       // Dynamic import to avoid missing dependency failures
-      const { BlobServiceClient } = await import("@azure/storage-blob");
+      const { BlobServiceClient } = await import("@azure/storage-blob" as any);
       const blobServiceClient = BlobServiceClient.fromConnectionString(connectionString);
       const containerClient = blobServiceClient.getContainerClient(containerName);
       await containerClient.createIfNotExists({ access: "container" });
