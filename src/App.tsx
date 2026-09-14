@@ -1192,510 +1192,433 @@ export default function App() {
   };
 
   return (
-    <div className="min-h-screen bg-[#020408] text-slate-200 font-sans selection:bg-orange-500/30 flex flex-col overflow-x-hidden">
+    <div className="min-h-screen bg-[#07090e] text-slate-200 font-sans selection:bg-orange-500/30 flex flex-col overflow-x-hidden">
       {/* Header */}
-      <header className="flex justify-between items-center py-6 px-8 border-b border-white/5 bg-black/20 backdrop-blur-md sticky top-0 z-40">
-        <div className="flex items-center gap-4">
-          <div className="w-10 h-10 bg-gradient-to-tr from-orange-500 via-white to-green-600 rounded-lg flex items-center justify-center shadow-[0_0_20px_rgba(255,165,0,0.3)]">
-            <div className="w-6 h-6 border-2 border-slate-900 rounded-full flex items-center justify-center font-bold text-[10px]">BB</div>
+      <header className="flex justify-between items-center py-4 px-6 md:px-8 border-b border-white/[0.06] bg-[#07090e]/80 backdrop-blur-xl sticky top-0 z-40">
+        <div className="flex items-center gap-3">
+          <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-orange-500 to-amber-600 flex items-center justify-center font-extrabold text-white text-xs shadow-md shadow-orange-500/20">
+            BB
           </div>
           <div>
-            <h1 className="text-xl font-bold tracking-tight text-white leading-none">BharatBridge</h1>
-            <p className="text-[10px] text-slate-500 uppercase tracking-widest mt-1">Unified Indian Language Grid</p>
+            <div className="flex items-center gap-2">
+              <h1 className="text-base font-bold tracking-tight text-white leading-none">BharatBridge</h1>
+              <span className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-orange-500/10 text-orange-400 border border-orange-500/20">v4.2</span>
+            </div>
+            <p className="text-[10px] text-slate-400 mt-0.5 font-medium">Real-time Indian Language Intelligence</p>
           </div>
         </div>
-        <div className="flex items-center gap-6">
+
+        <div className="flex items-center gap-3">
           {user ? (
-            <div className="flex items-center gap-3 bg-white/5 border border-white/10 rounded-full pl-2 pr-4 py-1.5 shadow-lg">
-              {user.photoURL && <img src={user.photoURL} alt={user.displayName || ''} className="w-8 h-8 rounded-full border border-white/20" referrerPolicy="no-referrer" />}
-              <div className="flex flex-col">
-                <span className="text-xs font-bold text-white leading-none">{user.displayName}</span>
-                <button onClick={() => signOut(auth)} className="text-[10px] text-slate-500 hover:text-red-400 transition-colors text-left">Sign Out</button>
-              </div>
+            <div className="flex items-center gap-2.5 bg-white/[0.04] border border-white/10 rounded-full pl-1.5 pr-3 py-1 text-xs">
+              {user.photoURL && <img src={user.photoURL} alt={user.displayName || ''} className="w-6 h-6 rounded-full border border-white/20" referrerPolicy="no-referrer" />}
+              <span className="font-medium text-white truncate max-w-[100px] sm:max-w-none">{user.displayName}</span>
+              <button onClick={() => signOut(auth)} className="text-[10px] text-slate-400 hover:text-red-400 transition-colors ml-1">Sign Out</button>
             </div>
           ) : (
             <button 
               onClick={signInWithGoogle}
-              className="px-6 py-2 bg-orange-500 hover:bg-orange-600 text-white text-xs font-bold rounded-full transition-all shadow-[0_0_20px_rgba(249,115,22,0.3)]"
+              className="px-4 py-1.5 bg-gradient-to-r from-orange-500 to-amber-600 hover:from-orange-600 hover:to-amber-700 text-white text-xs font-semibold rounded-full transition-all shadow-md shadow-orange-500/20"
             >
-              Get Started
+              Sign In
             </button>
           )}
+
           {isAdminUser && (
             <button 
               onClick={() => setModalOpen({ open: true, type: "admin" })}
-              className="p-2 bg-blue-500/10 hover:bg-blue-500/20 border border-blue-500/20 rounded-full text-blue-400 transition-all shadow-lg"
+              className="p-2 bg-blue-500/10 hover:bg-blue-500/20 border border-blue-500/20 rounded-xl text-blue-400 transition-all"
               title="Admin Panel"
             >
-              <Languages size={20} />
+              <Languages size={18} />
             </button>
           )}
+
           <button 
             onClick={() => setModalOpen({ open: true, type: "history" })}
-            className="p-2 bg-white/5 hover:bg-white/10 border border-white/10 rounded-full text-slate-400 hover:text-white transition-all shadow-lg flex items-center gap-1.5 px-3"
+            className="px-3 py-1.5 bg-white/[0.04] hover:bg-white/[0.08] border border-white/10 rounded-xl text-slate-300 hover:text-white transition-all flex items-center gap-2 text-xs font-medium"
             title="Saved Session History & Downloads"
           >
-            <History size={18} />
-            <span className="text-xs font-semibold hidden sm:inline">Saved Sessions ({savedSessionsHistory.length})</span>
+            <History size={16} className="text-orange-400" />
+            <span className="hidden sm:inline">Saved Sessions</span>
+            {savedSessionsHistory.length > 0 && (
+              <span className="px-1.5 py-0.2 bg-white/10 rounded-full text-[10px] font-mono text-slate-300">{savedSessionsHistory.length}</span>
+            )}
           </button>
+
           <button 
             onClick={() => setModalOpen({ open: true, type: "profile" })}
-            className="p-2 bg-white/5 hover:bg-white/10 border border-white/10 rounded-full text-slate-400 hover:text-white transition-all shadow-lg"
+            className="p-2 bg-white/[0.04] hover:bg-white/[0.08] border border-white/10 rounded-xl text-slate-400 hover:text-white transition-all"
+            title="Preferences"
           >
-            <Settings size={20} />
+            <Settings size={18} />
           </button>
-          <div className="hidden md:flex items-center gap-2 px-3 py-1 bg-white/5 rounded-full border border-white/10">
-            <div className={`w-2 h-2 rounded-full ${isListening ? 'bg-red-500 shadow-[0_0_8px_#ef4444]' : 'bg-green-500 shadow-[0_0_8px_#22c55e]'}`}></div>
-            <span className="text-[11px] font-medium text-slate-400 uppercase tracking-wider">
-              STT Pipeline: {isListening ? 'Streaming' : 'Active'}
-            </span>
-          </div>
-          <div className="text-right hidden sm:block">
-            <p className="text-[10px] text-slate-500 uppercase">Server Node</p>
-            <p className="text-xs font-mono text-orange-400">BHARAT-WEST-042</p>
-          </div>
         </div>
       </header>
 
-      <main className="flex-1 max-w-[1440px] mx-auto w-full grid grid-cols-1 lg:grid-cols-12 gap-6 p-6 lg:p-8 overflow-hidden">
+      <main className="flex-1 max-w-[1440px] mx-auto w-full grid grid-cols-1 lg:grid-cols-12 gap-5 p-5 lg:p-6 overflow-hidden">
         
         {/* Left Column: Source Input */}
         <section className="lg:col-span-4 flex flex-col gap-4">
-          <div className="bg-white/5 border border-white/10 rounded-2xl p-5 flex-1 flex flex-col min-h-[400px]">
-            <div className="flex justify-between items-center mb-4">
-              <h2 className="text-[11px] font-bold text-slate-500 uppercase tracking-widest">Source Input</h2>
-              <div className="flex gap-2">
-                <button 
-                  onClick={() => setAutoDetect(!autoDetect)}
-                  className={`px-2 py-1 rounded text-[10px] border transition-colors ${autoDetect ? 'bg-orange-500/20 text-orange-400 border-orange-500/30' : 'bg-white/5 text-slate-500 border-white/10'}`}
-                >
-                  AUTO DETECT
-                </button>
+          <div className="bg-[#0f1422]/60 border border-white/[0.07] rounded-2xl p-5 flex-1 flex flex-col min-h-[420px] backdrop-blur-xl shadow-xl">
+            <div className="flex justify-between items-center mb-3">
+              <div className="flex items-center gap-2">
+                <span className="w-2 h-2 rounded-full bg-orange-500"></span>
+                <h2 className="text-xs font-semibold text-slate-400 uppercase tracking-wider">Input Text & Speech</h2>
               </div>
+              <button 
+                onClick={() => setAutoDetect(!autoDetect)}
+                className={`px-2 py-0.5 rounded-lg text-[10px] font-mono border transition-all ${autoDetect ? 'bg-orange-500/20 text-orange-400 border-orange-500/30' : 'bg-white/5 text-slate-500 border-white/10 hover:text-slate-300'}`}
+              >
+                AUTO DETECT
+              </button>
             </div>
 
             <button 
               onClick={() => setModalOpen({ open: true, type: "source" })}
-              className="flex items-center gap-4 p-4 bg-white/5 rounded-xl border border-white/5 mb-4 hover:bg-white/10 transition-colors group text-left"
+              className="flex items-center gap-3 p-3.5 bg-white/[0.03] rounded-xl border border-white/[0.06] mb-4 hover:bg-white/[0.06] transition-all group text-left"
             >
-              <div className="w-12 h-12 rounded-full bg-slate-800 flex items-center justify-center text-xl shadow-inner">
+              <div className="w-10 h-10 rounded-xl bg-orange-500/10 border border-orange-500/20 flex items-center justify-center text-lg font-bold text-orange-400">
                 {sourceLang.nativeName[0]}
               </div>
               <div className="flex-1">
-                <p className="text-xs text-slate-400">From Language</p>
-                <p className="text-lg font-semibold text-white">
+                <p className="text-[10px] text-slate-400 uppercase tracking-wider">Source Language</p>
+                <p className="text-base font-semibold text-white">
                   {autoDetect ? "Auto Detect" : sourceLang.nativeName}
-                  <span className="text-slate-500 font-normal ml-2 text-sm hidden sm:inline">{autoDetect ? "" : sourceLang.name}</span>
+                  <span className="text-slate-400 font-normal ml-2 text-xs hidden sm:inline">{autoDetect ? "" : `(${sourceLang.name})`}</span>
                 </p>
               </div>
               <ChevronDown size={16} className="text-slate-500 group-hover:text-orange-400 transition-colors" />
             </button>
 
-            <div className="flex-1 bg-black/40 rounded-xl p-6 font-serif text-lg leading-relaxed text-slate-300 relative group">
+            <div className="flex-1 bg-black/40 rounded-xl p-4 text-base leading-relaxed text-slate-200 relative group border border-white/[0.04] focus-within:border-orange-500/30 transition-colors">
               <textarea
                 dir={sourceLang.direction}
                 value={inputText}
                 onChange={(e) => setInputText(e.target.value)}
-                placeholder={`Speak or type in ${sourceLang.name}...`}
-                className="w-full h-full bg-transparent border-none outline-none resize-none placeholder:text-slate-700 leading-relaxed"
+                placeholder={`Type or speak in ${sourceLang.name}...`}
+                className="w-full h-full bg-transparent border-none outline-none resize-none placeholder:text-slate-600 leading-relaxed"
               />
               {isListening && (
-                <div className="absolute top-2 right-2 flex gap-1">
-                  <span className="w-1 h-3 bg-orange-500 rounded-full animate-pulse"></span>
-                  <span className="w-1 h-3 bg-orange-500 rounded-full delay-75 animate-pulse"></span>
-                  <span className="w-1 h-3 bg-orange-500 rounded-full delay-150 animate-pulse"></span>
+                <div className="absolute top-3 right-3 flex items-center gap-1.5 bg-red-500/10 border border-red-500/20 px-2.5 py-1 rounded-full">
+                  <span className="w-2 h-2 bg-red-500 rounded-full animate-pulse"></span>
+                  <span className="text-[10px] font-mono text-red-400 uppercase">Listening</span>
                 </div>
               )}
             </div>
 
-            <div className="mt-4 pt-4 border-t border-white/5 flex items-center justify-between">
+            <div className="mt-4 pt-3 border-t border-white/[0.06] flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <button 
                   onClick={toggleListening}
-                  className={`p-3 rounded-xl transition-all ${isListening ? 'bg-red-500/20 text-red-400 border border-red-500/30 animate-pulse' : 'bg-orange-500/20 text-orange-400 border border-orange-500/30 hover:bg-orange-500/30'}`}
+                  className={`p-2.5 rounded-xl transition-all ${isListening ? 'bg-red-500 text-white shadow-lg shadow-red-500/30 animate-pulse' : 'bg-orange-500/15 text-orange-400 border border-orange-500/30 hover:bg-orange-500/25'}`}
+                  title={isListening ? "Stop Microphone" : "Start Microphone"}
                 >
-                  {isListening ? <MicOff size={20} /> : <Mic size={20} />}
+                  {isListening ? <MicOff size={18} /> : <Mic size={18} />}
                 </button>
                 <button 
                   onClick={() => speak(inputText, sourceLang)}
                   disabled={!inputText}
-                  className="p-3 bg-white/5 text-slate-400 border border-white/10 rounded-xl hover:bg-white/10 transition-colors disabled:opacity-20"
+                  className="p-2.5 bg-white/5 text-slate-300 border border-white/10 rounded-xl hover:bg-white/10 transition-colors disabled:opacity-20"
+                  title="Listen to Speech"
                 >
-                  <Volume2 size={20} />
+                  <Volume2 size={18} />
                 </button>
               </div>
-              <div className="text-[10px] text-slate-500 uppercase font-mono tracking-tighter">
-                {inputText.length} CHARS / {inputText.split(/\s+/).filter(Boolean).length} WORDS
+              <div className="text-[10px] font-mono text-slate-500">
+                {inputText.length} chars • {inputText.split(/\s+/).filter(Boolean).length} words
               </div>
-            </div>
-          </div>
-
-          <div className="h-24 bg-white/5 border border-white/10 rounded-2xl p-4 flex items-center justify-between">
-            <div>
-              <p className="text-[10px] text-slate-500 uppercase mb-1">Audio Profile</p>
-              <div className="flex items-end gap-1 h-8">
-                {[2, 4, 6, 3, 5, 7, 2, 4, 6, 3].map((h, i) => (
-                  <motion.div 
-                    key={i}
-                    animate={isListening ? { height: [h*2, h*4, h*2] } : { height: h*2 }}
-                    transition={{ repeat: Infinity, duration: 0.5, delay: i * 0.05 }}
-                    className="w-1 bg-orange-500/60 rounded-full"
-                  />
-                ))}
-              </div>
-            </div>
-            <div className="text-right">
-              <p className="text-[10px] text-slate-500 uppercase">Sampling Rate</p>
-              <p className="text-xs font-mono text-slate-300">48kHz / 24-bit</p>
             </div>
           </div>
         </section>
 
         {/* Center Column: Bridge */}
         <section className="lg:col-span-4 flex flex-col gap-4">
-          <div className="bg-[#0A0F1A] border border-blue-500/20 rounded-2xl p-6 flex-1 flex flex-col shadow-[inset_0_0_30px_rgba(59,130,246,0.05)]">
-            <div className="flex items-center justify-between mb-6">
-              <h2 className="text-[11px] font-bold text-blue-400 uppercase tracking-widest text-center flex-1">Neural Translation Bridge</h2>
-              {isLive && (
-                <div className="flex items-center gap-2 px-2 py-1 bg-red-500/10 border border-red-500/20 rounded-full">
-                  <div className="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse"></div>
-                  <span className="text-[9px] font-bold text-red-400 uppercase">Live</span>
+          {!isLive ? (
+            <div className="bg-[#0f1422]/80 border border-white/[0.07] rounded-2xl p-6 flex-1 flex flex-col justify-center items-center backdrop-blur-xl shadow-xl min-h-[420px]">
+              <div className="max-w-md w-full text-center space-y-6">
+                <div>
+                  <div className="w-12 h-12 rounded-2xl bg-gradient-to-tr from-orange-500 to-amber-600 flex items-center justify-center mx-auto mb-3 text-white font-bold shadow-lg shadow-orange-500/20">
+                    BB
+                  </div>
+                  <h2 className="text-2xl font-extrabold text-white tracking-tight">Live Event Session</h2>
+                  <p className="text-xs text-slate-400 mt-1">Host an event or join an existing session via 6-digit PIN / QR Code</p>
                 </div>
-              )}
-            </div>
-            
-            <div className="flex flex-col gap-6 items-center flex-1 justify-center relative">
-              <div className="w-full h-px bg-gradient-to-r from-transparent via-blue-500/30 to-transparent absolute top-1/2"></div>
-              
-              {!isLive ? (
-                <div className="z-10 w-full space-y-8">
-                  <div className="bg-slate-900/60 border border-white/10 p-10 rounded-[40px] backdrop-blur-2xl shadow-2xl relative overflow-hidden group">
-                    <div className="absolute inset-0 bg-gradient-to-br from-orange-500/5 via-transparent to-green-500/5 opacity-50"></div>
-                    <div className="relative z-10 text-center space-y-8">
-                      <div>
-                        <h2 className="text-3xl font-black text-white tracking-tight mb-2">Bharat Bridge</h2>
-                        <p className="text-[10px] text-slate-500 uppercase tracking-[0.4em] font-bold">Bridging 1.4 Billion Voices</p>
-                      </div>
 
-                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
-                        <button 
-                          onClick={startLiveSession}
-                          className="flex flex-col items-center gap-4 p-8 bg-gradient-to-b from-orange-500/20 to-orange-500/5 border border-orange-500/30 rounded-3xl hover:border-orange-500/60 transition-all hover:scale-[1.02] group"
-                        >
-                          <div className="w-16 h-16 rounded-2xl bg-orange-500/20 flex items-center justify-center text-orange-400 group-hover:bg-orange-500 group-hover:text-white transition-all shadow-lg">
-                            <Mic size={32} />
-                          </div>
-                          <div className="text-center">
-                            <span className="block text-sm font-bold text-white mb-1">Host Event</span>
-                            <span className="block text-[9px] text-slate-500 uppercase tracking-widest">Speaker Mode</span>
-                          </div>
-                        </button>
-
-                        <button 
-                          onClick={() => setModalOpen({ open: true, type: "join" })}
-                          className="flex flex-col items-center gap-4 p-8 bg-gradient-to-b from-blue-500/20 to-blue-500/5 border border-blue-500/30 rounded-3xl hover:border-blue-500/60 transition-all hover:scale-[1.02] group"
-                        >
-                          <div className="w-16 h-16 rounded-2xl bg-blue-500/20 flex items-center justify-center text-blue-400 group-hover:bg-blue-500 group-hover:text-white transition-all shadow-lg">
-                            <Volume2 size={32} />
-                          </div>
-                          <div className="text-center">
-                            <span className="block text-sm font-bold text-white mb-1">Join Event</span>
-                            <span className="block text-[9px] text-slate-500 uppercase tracking-widest">Listener Mode</span>
-                          </div>
-                        </button>
-                      </div>
-
-                      <div className="pt-4 border-t border-white/5">
-                         <div className="flex items-center justify-center gap-8">
-                            <div className="text-center">
-                               <p className="text-[10px] text-slate-600 uppercase mb-1">Source</p>
-                               <button onClick={() => setModalOpen({open: true, type: 'source'})} className="text-xs font-bold text-orange-400 hover:text-orange-300 transition-colors">{sourceLang.nativeName}</button>
-                            </div>
-                            <ArrowRightLeft size={14} className="text-slate-800" />
-                            <div className="text-center">
-                               <p className="text-[10px] text-slate-600 uppercase mb-1">Your Language</p>
-                               <button onClick={() => setModalOpen({open: true, type: 'target'})} className="text-xs font-bold text-blue-400 hover:text-blue-300 transition-colors">{targetLang.nativeName}</button>
-                            </div>
-                         </div>
-                      </div>
+                <div className="grid grid-cols-2 gap-4">
+                  <button 
+                    onClick={startLiveSession}
+                    className="flex flex-col items-center gap-3 p-6 bg-gradient-to-b from-orange-500/15 to-orange-500/5 border border-orange-500/30 rounded-2xl hover:border-orange-500/60 transition-all hover:scale-[1.02] group"
+                  >
+                    <div className="w-12 h-12 rounded-xl bg-orange-500/20 flex items-center justify-center text-orange-400 group-hover:bg-orange-500 group-hover:text-white transition-all shadow-md">
+                      <Mic size={24} />
                     </div>
+                    <div>
+                      <span className="block text-sm font-bold text-white">Host Event</span>
+                      <span className="block text-[10px] text-slate-400 mt-0.5">Speaker Mode</span>
+                    </div>
+                  </button>
+
+                  <button 
+                    onClick={() => setModalOpen({ open: true, type: "join" })}
+                    className="flex flex-col items-center gap-3 p-6 bg-gradient-to-b from-blue-500/15 to-blue-500/5 border border-blue-500/30 rounded-2xl hover:border-blue-500/60 transition-all hover:scale-[1.02] group"
+                  >
+                    <div className="w-12 h-12 rounded-xl bg-blue-500/20 flex items-center justify-center text-blue-400 group-hover:bg-blue-500 group-hover:text-white transition-all shadow-md">
+                      <Volume2 size={24} />
+                    </div>
+                    <div>
+                      <span className="block text-sm font-bold text-white">Join Event</span>
+                      <span className="block text-[10px] text-slate-400 mt-0.5">Listener Mode</span>
+                    </div>
+                  </button>
+                </div>
+
+                <div className="pt-4 border-t border-white/[0.06] flex items-center justify-center gap-6">
+                  <div className="text-center">
+                    <p className="text-[10px] text-slate-500 uppercase tracking-wider mb-0.5">Source</p>
+                    <button onClick={() => setModalOpen({open: true, type: 'source'})} className="text-xs font-semibold text-orange-400 hover:text-orange-300 transition-colors">{sourceLang.nativeName}</button>
+                  </div>
+                  <ArrowRightLeft size={14} className="text-slate-600" />
+                  <div className="text-center">
+                    <p className="text-[10px] text-slate-500 uppercase tracking-wider mb-0.5">Target</p>
+                    <button onClick={() => setModalOpen({open: true, type: 'target'})} className="text-xs font-semibold text-blue-400 hover:text-blue-300 transition-colors">{targetLang.nativeName}</button>
                   </div>
                 </div>
-              ) : (
-                <div className="z-10 w-full space-y-4">
-                  <div className="flex items-center justify-between px-1">
-                    <div className="flex flex-col gap-1">
-                      <div className="flex items-center gap-2">
-                        <span className="text-[10px] text-slate-500 uppercase tracking-widest">{sessionRole === 'speaker' ? 'Broadcasting' : 'Listening'}</span>
-                        <div className="flex items-center gap-1 px-2 py-0.5 bg-blue-500/10 border border-blue-500/20 rounded-full">
-                          <Users size={10} className="text-blue-400" />
-                          <span className="text-[9px] font-bold text-blue-400">{listenerCount} listeners</span>
+              </div>
+            </div>
+          ) : (
+            <div className="bg-[#0f1422]/80 border border-white/[0.07] rounded-2xl p-5 flex-1 flex flex-col backdrop-blur-xl shadow-xl min-h-[420px]">
+              <div className="space-y-4">
+                <div className="flex items-center justify-between border-b border-white/[0.06] pb-3">
+                  <div className="flex items-center gap-2">
+                    <span className="w-2 h-2 rounded-full bg-red-500 animate-pulse"></span>
+                    <span className="text-xs font-bold text-white uppercase tracking-wider">{sessionRole === 'speaker' ? 'Broadcasting' : 'Listening'}</span>
+                    <span className="text-[10px] font-mono px-2 py-0.5 bg-blue-500/10 text-blue-400 border border-blue-500/20 rounded-full">{listenerCount} listeners</span>
+                  </div>
+
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={() => setModalOpen({ open: true, type: "qr" })}
+                      aria-label="View QR Code"
+                      className="p-1.5 bg-orange-500/10 border border-orange-500/30 rounded-lg text-orange-400 hover:bg-orange-500/20 transition-all"
+                      title="Show QR Code for Mobile Joining"
+                    >
+                      <QrCode size={14} />
+                    </button>
+                    <button 
+                      onClick={sessionRole === 'speaker' ? endLiveSession : () => { setIsLive(false); setCurrentSession(null); if(ws) ws.close(); }}
+                      className="px-2.5 py-1 bg-red-500/15 border border-red-500/30 rounded-lg text-[10px] font-bold text-red-400 uppercase hover:bg-red-500/25 transition-all"
+                    >
+                      {sessionRole === 'speaker' ? 'End' : 'Leave'}
+                    </button>
+                  </div>
+                </div>
+
+                {/* Session PIN & Copy Link */}
+                <div className="flex items-center justify-between bg-black/30 p-2.5 rounded-xl border border-white/[0.04]">
+                  <div className="flex items-center gap-2">
+                    <span className="text-[10px] font-mono text-slate-400 uppercase">Session PIN:</span>
+                    <span className="text-sm font-mono font-bold text-orange-400">{currentSession?.id}</span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <button 
+                      onClick={() => {
+                        if (currentSession?.id) {
+                          navigator.clipboard.writeText(currentSession.id);
+                          setCopiedId(true);
+                          setTimeout(() => setCopiedId(false), 2000);
+                        }
+                      }}
+                      className="px-2 py-1 bg-white/5 hover:bg-white/10 border border-white/10 rounded text-[9px] font-mono text-slate-300 transition-colors"
+                    >
+                      {copiedId ? 'COPIED' : 'COPY PIN'}
+                    </button>
+                    <button 
+                      onClick={() => {
+                        const host = window.location.host;
+                        const link = `${window.location.protocol}//${host}${window.location.pathname}?session=${currentSession?.id}`;
+                        navigator.clipboard.writeText(link);
+                        setCopiedId(true);
+                        setTimeout(() => setCopiedId(false), 2000);
+                      }}
+                      className="flex items-center gap-1 text-[9px] font-mono text-blue-400 hover:text-blue-300 transition-colors"
+                    >
+                      <Share2 size={10} />
+                      <span>LINK</span>
+                    </button>
+                  </div>
+                </div>
+
+                {/* Live Controls Toolbar */}
+                <div className="flex flex-wrap items-center justify-between gap-2 bg-white/[0.02] p-2 rounded-xl border border-white/[0.04]">
+                  <div className="flex items-center gap-1 bg-white/5 border border-white/10 rounded-lg px-2 py-1">
+                    <Gauge size={12} className="text-orange-400" />
+                    <select
+                      value={playbackRate}
+                      onChange={(e) => setPlaybackRate(parseFloat(e.target.value))}
+                      className="bg-transparent text-[10px] font-bold text-white outline-none cursor-pointer"
+                    >
+                      <option value="1.0" className="bg-[#0f172a]">1.0x Speed</option>
+                      <option value="1.25" className="bg-[#0f172a]">1.25x</option>
+                      <option value="1.5" className="bg-[#0f172a]">1.5x</option>
+                      <option value="1.75" className="bg-[#0f172a]">1.75x</option>
+                      <option value="2.0" className="bg-[#0f172a]">2.0x Speed</option>
+                    </select>
+                  </div>
+
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      onClick={syncToAzure}
+                      disabled={azureSyncStatus.syncing || messages.length === 0}
+                      className="px-2 py-1 bg-sky-500/10 border border-sky-500/20 rounded-lg text-[10px] font-bold text-sky-400 uppercase hover:bg-sky-500/20 transition-all flex items-center gap-1 disabled:opacity-30"
+                      title="Sync to Azure Storage"
+                    >
+                      <CloudUpload size={11} className={azureSyncStatus.syncing ? 'animate-bounce' : ''} />
+                      {azureSyncStatus.syncing ? 'Syncing' : 'Azure'}
+                    </button>
+
+                    <button 
+                      onClick={() => exportTranscriptTXT(messages, currentSession?.name, currentSession?.id)}
+                      className="px-2 py-1 bg-blue-500/10 border border-blue-500/20 rounded-lg text-[10px] font-bold text-blue-400 uppercase hover:bg-blue-500/20 transition-all flex items-center gap-1"
+                      title="Download TXT"
+                    >
+                      <FileText size={11} />
+                      TXT
+                    </button>
+
+                    <button 
+                      onClick={() => exportTranscriptJSON(messages, currentSession?.name, currentSession?.id)}
+                      className="px-2 py-1 bg-emerald-500/10 border border-emerald-500/20 rounded-lg text-[10px] font-bold text-emerald-400 uppercase hover:bg-emerald-500/20 transition-all flex items-center gap-1"
+                      title="Download JSON"
+                    >
+                      <FileJson size={11} />
+                      JSON
+                    </button>
+
+                    <button 
+                      onClick={() => {
+                        if (audioBufferRef.current.length === 0) {
+                          alert("No session audio captured yet.");
+                          return;
+                        }
+                        let totalLength = 0;
+                        for (const chunk of audioBufferRef.current) totalLength += chunk.length;
+                        const merged = new Float32Array(totalLength);
+                        let offset = 0;
+                        for (const chunk of audioBufferRef.current) {
+                          merged.set(chunk, offset);
+                          offset += chunk.length;
+                        }
+                        downloadAudioWAV(merged, `session-audio-${currentSession?.id || 'event'}.wav`);
+                      }}
+                      className="px-2 py-1 bg-purple-500/10 border border-purple-500/20 rounded-lg text-[10px] font-bold text-purple-400 uppercase hover:bg-purple-500/20 transition-all flex items-center gap-1"
+                      title="Download WAV Audio"
+                    >
+                      <Music size={11} />
+                      WAV
+                    </button>
+                  </div>
+                </div>
+
+                {/* Messages Feed */}
+                <div className="h-[280px] overflow-y-auto space-y-2.5 pr-1 scrollbar-thin">
+                  {messages.length === 0 ? (
+                    <div className="h-full flex flex-col items-center justify-center text-slate-600 space-y-2">
+                      <RotateCw size={20} className="animate-spin text-blue-400 opacity-60" />
+                      <p className="text-[10px] uppercase font-mono tracking-wider">Listening for incoming live transcriptions...</p>
+                    </div>
+                  ) : (
+                    messages.map((msg, idx) => (
+                      <motion.div 
+                        initial={{ opacity: 0, y: 4 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        key={msg.id || idx} 
+                        className="p-3 bg-white/[0.03] border border-white/[0.05] rounded-xl space-y-1 group hover:border-blue-500/30 transition-all"
+                      >
+                        <div className="flex justify-between items-center text-[10px] text-slate-500 font-mono">
+                          <span>#{msg.id ? msg.id.slice(-4) : idx + 1}</span>
+                          <span>{new Date(msg.timestamp?.seconds * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
                         </div>
-                      </div>
-                      
-                      {/* Prominent Session ID Display */}
-                      <div className="flex items-center gap-2 mt-0.5">
-                        <span className="text-[10px] font-mono text-slate-400">ID: <strong className="text-orange-400 select-all font-bold">{currentSession?.id}</strong></span>
-                        <button 
-                          onClick={() => {
-                            if (currentSession?.id) {
-                              navigator.clipboard.writeText(currentSession.id);
-                              setCopiedId(true);
-                              setTimeout(() => setCopiedId(false), 2000);
-                            }
-                          }}
-                          className="px-1.5 py-0.5 bg-white/5 hover:bg-white/10 border border-white/10 rounded text-[9px] font-mono text-slate-300 hover:text-white transition-colors"
-                          title="Copy Session ID"
-                        >
-                          {copiedId ? 'COPIED!' : 'COPY ID'}
-                        </button>
-                        <button 
-                          onClick={() => {
-                            const host = window.location.host;
-                            const link = `${window.location.protocol}//${host}${window.location.pathname}?session=${currentSession?.id}`;
-                            navigator.clipboard.writeText(link);
-                            setCopiedId(true);
-                            setTimeout(() => setCopiedId(false), 2000);
-                          }}
-                          className="flex items-center gap-1 text-[9px] font-mono text-blue-400 hover:text-blue-300 transition-colors group ml-1"
-                        >
-                          <Share2 size={9} />
-                          <span>COPY LINK</span>
-                        </button>
-                      </div>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      {/* Interactive QR Code Button */}
-                      <button
-                        onClick={() => setModalOpen({ open: true, type: "qr" })}
-                        aria-label="View QR Code"
-                        className="p-1.5 bg-orange-500/10 border border-orange-500/30 rounded-lg text-orange-400 hover:bg-orange-500/20 transition-all"
-                        title="Show QR Code for Mobile Joining"
-                      >
-                        <QrCode size={14} />
-                      </button>
-
-                      {/* Playback Speed Selector (1.0x - 2.0x) */}
-                      <div className="flex items-center gap-1 bg-white/5 border border-white/10 rounded-lg px-2 py-1">
-                        <Gauge size={12} className="text-orange-400" />
-                        <select
-                          value={playbackRate}
-                          onChange={(e) => setPlaybackRate(parseFloat(e.target.value))}
-                          aria-label="Audio Playback Speed"
-                          className="bg-transparent text-[10px] font-bold text-white outline-none cursor-pointer"
-                        >
-                          <option value="1.0" className="bg-[#0f172a]">1.0x</option>
-                          <option value="1.25" className="bg-[#0f172a]">1.25x</option>
-                          <option value="1.5" className="bg-[#0f172a]">1.5x</option>
-                          <option value="1.75" className="bg-[#0f172a]">1.75x</option>
-                          <option value="2.0" className="bg-[#0f172a]">2.0x</option>
-                        </select>
-                      </div>
-
-                      {/* Azure Cloud Sync Button */}
-                      <button
-                        onClick={syncToAzure}
-                        disabled={azureSyncStatus.syncing || messages.length === 0}
-                        aria-label="Sync Captions to Azure Storage"
-                        className="px-2.5 py-1.5 bg-sky-500/10 border border-sky-500/20 rounded-lg text-[10px] font-bold text-sky-400 uppercase hover:bg-sky-500/20 transition-all flex items-center gap-1 disabled:opacity-30"
-                        title="Sync captions to Azure Storage"
-                      >
-                        <CloudUpload size={12} className={azureSyncStatus.syncing ? 'animate-bounce' : ''} />
-                        {azureSyncStatus.syncing ? 'Syncing' : 'Azure'}
-                      </button>
-
-                      {/* TXT Download */}
-                      <button 
-                        onClick={() => exportTranscriptTXT(messages, currentSession?.name, currentSession?.id)}
-                        aria-label="Export TXT"
-                        className="px-2.5 py-1.5 bg-blue-500/10 border border-blue-500/20 rounded-lg text-[10px] font-bold text-blue-400 uppercase hover:bg-blue-500/20 transition-all flex items-center gap-1"
-                        title="Download Text (.TXT)"
-                      >
-                        <FileText size={12} />
-                        TXT
-                      </button>
-
-                      {/* JSON Download */}
-                      <button 
-                        onClick={() => exportTranscriptJSON(messages, currentSession?.name, currentSession?.id)}
-                        aria-label="Export JSON"
-                        className="px-2.5 py-1.5 bg-emerald-500/10 border border-emerald-500/20 rounded-lg text-[10px] font-bold text-emerald-400 uppercase hover:bg-emerald-500/20 transition-all flex items-center gap-1"
-                        title="Download Data (.JSON)"
-                      >
-                        <FileJson size={12} />
-                        JSON
-                      </button>
-
-                      {/* WAV Audio Download */}
-                      <button 
-                        onClick={() => {
-                          if (audioBufferRef.current.length === 0) {
-                            alert("No session audio captured yet.");
-                            return;
-                          }
-                          let totalLength = 0;
-                          for (const chunk of audioBufferRef.current) totalLength += chunk.length;
-                          const merged = new Float32Array(totalLength);
-                          let offset = 0;
-                          for (const chunk of audioBufferRef.current) {
-                            merged.set(chunk, offset);
-                            offset += chunk.length;
-                          }
-                          downloadAudioWAV(merged, `session-audio-${currentSession?.id || 'event'}.wav`);
-                        }}
-                        aria-label="Export WAV Audio"
-                        className="px-2.5 py-1.5 bg-purple-500/10 border border-purple-500/20 rounded-lg text-[10px] font-bold text-purple-400 uppercase hover:bg-purple-500/20 transition-all flex items-center gap-1"
-                        title="Download Audio (.WAV)"
-                      >
-                        <Music size={12} />
-                        WAV
-                      </button>
-
-                      <button 
-                        onClick={sessionRole === 'speaker' ? endLiveSession : () => { setIsLive(false); setCurrentSession(null); if(ws) ws.close(); }}
-                        aria-label="End or Leave Session"
-                        className="px-3 py-1.5 bg-red-500/10 border border-red-500/20 rounded-lg text-[10px] font-bold text-red-400 uppercase hover:bg-red-500/20 transition-all"
-                      >
-                        {sessionRole === 'speaker' ? 'End' : 'Leave'}
-                      </button>
-                    </div>
-                  </div>
-
-                  {azureSyncStatus.message && (
-                    <div className={`p-2 rounded-lg text-[10px] font-mono text-center border ${azureSyncStatus.success ? 'bg-green-500/10 border-green-500/30 text-green-400' : 'bg-red-500/10 border-red-500/30 text-red-400'}`}>
-                      {azureSyncStatus.message}
-                    </div>
-                  )}
-
-                  <div className="h-[350px] overflow-y-auto space-y-3 pr-2 scrollbar-thin">
-                    {messages.length === 0 ? (
-                      <div className="h-full flex flex-col items-center justify-center opacity-40">
-                        <RotateCw size={24} className="animate-spin text-blue-500 mb-2" />
-                        <p className="text-[10px] text-slate-500 uppercase tracking-widest">Awaiting Transmission...</p>
-                      </div>
-                    ) : (
-                      messages.map((msg) => (
-                        <motion.div 
-                          initial={{ opacity: 0, x: -10 }}
-                          animate={{ opacity: 1, x: 0 }}
-                          key={msg.id} 
-                          className="p-3 bg-white/5 border border-white/5 rounded-xl space-y-1 group hover:border-blue-500/30 transition-all"
-                        >
-                          <div className="flex justify-between items-start">
-                             <span className="text-[10px] text-slate-600 font-mono">#{msg.id.slice(-4)}</span>
-                             <span className="text-[9px] text-slate-500">{new Date(msg.timestamp?.seconds * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
-                          </div>
-                          <p className="text-[11px] text-slate-400 font-medium leading-relaxed italic border-l-2 border-slate-700 pl-2">
-                            {msg.originalText}
-                          </p>
-                          <p className="text-sm font-semibold text-white pt-1">
-                            {msg.translatedText}
-                          </p>
-                        </motion.div>
-                      ))
-                    )}
-                  </div>
-
-                  {sessionRole === 'speaker' && (
-                    <button 
-                      onClick={toggleListening}
-                      className={`w-full py-4 rounded-xl flex items-center justify-center gap-3 font-bold uppercase tracking-widest transition-all ${
-                        isListening 
-                        ? 'bg-red-500 text-white shadow-[0_0_30px_rgba(239,68,68,0.3)]' 
-                        : 'bg-orange-500 text-white shadow-[0_0_30px_rgba(249,115,22,0.3)]'
-                      }`}
-                    >
-                      {isListening ? <MicOff size={16} /> : <Mic size={16} />}
-                      {isListening ? 'Stop' : 'Broadcast'}
-                    </button>
+                        <p className="text-xs text-slate-400 italic border-l-2 border-slate-700 pl-2 py-0.5">
+                          {msg.originalText}
+                        </p>
+                        <p className="text-sm font-semibold text-white pt-0.5">
+                          {msg.translatedText}
+                        </p>
+                      </motion.div>
+                    ))
                   )}
                 </div>
-              )}
-            </div>
-          </div>
 
-          <div className="bg-white/5 border border-white/10 rounded-2xl p-5">
-            <h3 className="text-[11px] text-slate-500 uppercase mb-3 tracking-widest">Saved Configurations</h3>
-            <div className="grid grid-cols-2 gap-2">
-              {profile.savedPairs.length === 0 ? (
-                <div className="col-span-2 py-4 text-center border border-dashed border-white/10 rounded-xl">
-                   <p className="text-[10px] text-slate-600">No saved pairs</p>
-                </div>
-              ) : (
-                profile.savedPairs.slice(0, 4).map(pair => {
-                  const s = LANGUAGES.find(l => l.code === pair.sourceCode);
-                  const t = LANGUAGES.find(l => l.code === pair.targetCode);
-                  const isActive = sourceLang.code === pair.sourceCode && targetLang.code === pair.targetCode;
-                  return (
-                    <button 
-                      key={pair.id}
-                      onClick={() => loadPair(pair)}
-                      className={`p-3 rounded-xl border text-center transition-all ${
-                        isActive ? "bg-orange-500/10 border-orange-500/30 text-orange-400" : "bg-slate-800/30 border-white/5 hover:bg-slate-800/50"
-                      }`}
-                    >
-                      <p className="text-[10px] text-slate-500 uppercase mb-1">{s?.name} → {t?.name}</p>
-                      <p className="text-xs font-semibold text-slate-300">{s?.nativeName[0]} {t?.nativeName[0]}</p>
-                    </button>
-                  );
-                })
-              )}
+                {sessionRole === 'speaker' && (
+                  <button 
+                    onClick={toggleListening}
+                    className={`w-full py-3.5 rounded-xl flex items-center justify-center gap-2 font-bold uppercase tracking-wider text-xs transition-all ${
+                      isListening 
+                      ? 'bg-red-500 text-white shadow-lg shadow-red-500/30' 
+                      : 'bg-gradient-to-r from-orange-500 to-amber-600 text-white shadow-lg shadow-orange-500/20'
+                    }`}
+                  >
+                    {isListening ? <MicOff size={16} /> : <Mic size={16} />}
+                    {isListening ? 'Stop Broadcast' : 'Start Broadcast'}
+                  </button>
+                )}
+              </div>
             </div>
-          </div>
+          )}
         </section>
 
         {/* Right Column: Target Output */}
         <section className="lg:col-span-4 flex flex-col gap-4">
-          <div className="bg-white/5 border border-white/10 rounded-2xl p-5 flex-1 flex flex-col min-h-[400px]">
-            <div className="flex justify-between items-center mb-4">
-              <h2 className="text-[11px] font-bold text-slate-500 uppercase tracking-widest">Target Output</h2>
+          <div className="bg-[#0f1422]/60 border border-white/[0.07] rounded-2xl p-5 flex-1 flex flex-col min-h-[420px] backdrop-blur-xl shadow-xl">
+            <div className="flex justify-between items-center mb-3">
+              <div className="flex items-center gap-2">
+                <span className="w-2 h-2 rounded-full bg-blue-500"></span>
+                <h2 className="text-xs font-semibold text-slate-400 uppercase tracking-wider">Target Translation</h2>
+              </div>
               <button 
                 onClick={() => setModalOpen({ open: true, type: "target" })}
-                className="text-[10px] text-blue-400 hover:text-blue-300 uppercase font-bold tracking-tighter transition-colors"
+                className="text-[10px] text-blue-400 hover:text-blue-300 font-semibold uppercase tracking-wider transition-colors"
               >
-                Change Target
+                Change
               </button>
             </div>
 
+            {/* Language Selection Card */}
             <button 
               onClick={() => setModalOpen({ open: true, type: "target" })}
-              className="flex items-center gap-4 p-4 bg-white/5 rounded-xl border border-white/5 mb-4 hover:bg-white/10 transition-colors group text-left"
+              className="flex items-center gap-3 p-3.5 bg-white/[0.03] rounded-xl border border-white/[0.06] mb-4 hover:bg-white/[0.06] transition-all group text-left"
             >
-              <div className="w-12 h-12 rounded-full bg-slate-800 flex items-center justify-center text-xl shadow-inner">
+              <div className="w-10 h-10 rounded-xl bg-blue-500/10 border border-blue-500/20 flex items-center justify-center text-lg font-bold text-blue-400">
                 {targetLang.nativeName[0]}
               </div>
               <div className="flex-1">
-                <p className="text-xs text-slate-400">To Language</p>
-                <p className="text-lg font-semibold text-white">
+                <p className="text-[10px] text-slate-400 uppercase tracking-wider">Target Language</p>
+                <p className="text-base font-semibold text-white">
                   {targetLang.nativeName}
-                  <span className="text-slate-500 font-normal ml-2 text-sm hidden sm:inline">{targetLang.name}</span>
+                  <span className="text-slate-400 font-normal ml-2 text-xs hidden sm:inline">({targetLang.name})</span>
                 </p>
               </div>
               <ChevronDown size={16} className="text-slate-500 group-hover:text-blue-400 transition-colors" />
             </button>
 
+            {/* Translated Text Output */}
             <div 
               dir={targetLang.direction}
-              className="flex-1 bg-black/40 rounded-xl p-6 font-serif text-lg leading-relaxed text-slate-300 overflow-y-auto"
+              className="flex-1 bg-black/40 rounded-xl p-4 text-base leading-relaxed text-slate-200 overflow-y-auto border border-white/[0.04]"
             >
               <AnimatePresence mode="wait">
                 {isTranslating ? (
-                  <motion.div 
-                    initial={{ opacity: 0 }}
-                    animate={{ opacity: 1 }}
-                    exit={{ opacity: 0 }}
-                    className="flex flex-col gap-2"
-                  >
+                  <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="space-y-2 py-2">
                     <div className="h-4 bg-white/5 rounded w-full animate-pulse"></div>
-                    <div className="h-4 bg-white/5 rounded w-5/6 animate-pulse"></div>
                     <div className="h-4 bg-white/5 rounded w-4/6 animate-pulse"></div>
                   </motion.div>
                 ) : (
                   <motion.p
                     key={translatedText}
-                    initial={{ opacity: 0, x: targetLang.direction === 'rtl' ? 10 : -10 }}
-                    animate={{ opacity: 1, x: 0 }}
-                    className={!translatedText ? 'text-slate-700' : ''}
+                    initial={{ opacity: 0 }}
+                    animate={{ opacity: 1 }}
+                    className={!translatedText ? 'text-slate-600 italic text-sm' : ''}
                   >
                     {translatedText || `Translated content in ${targetLang.name} will appear here...`}
                   </motion.p>
@@ -1703,67 +1626,44 @@ export default function App() {
               </AnimatePresence>
             </div>
 
-            <div className="mt-4 pt-4 border-t border-white/5 flex items-center justify-between">
+            {/* Action Footer */}
+            <div className="mt-4 pt-3 border-t border-white/[0.06] flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <button 
                   onClick={() => speak(translatedText, targetLang)}
                   disabled={!translatedText}
-                  className="p-3 bg-blue-500/20 text-blue-400 border border-blue-500/30 hover:bg-blue-500/30 rounded-xl transition-all disabled:opacity-10"
+                  className="p-2.5 bg-blue-500/15 text-blue-400 border border-blue-500/30 hover:bg-blue-500/25 rounded-xl transition-all disabled:opacity-20"
+                  title="Listen to Speech"
                 >
-                  <Volume2 size={20} />
+                  <Volume2 size={18} />
                 </button>
                 <button 
                   onClick={() => copyToClipboard(translatedText)}
                   disabled={!translatedText}
-                  className="p-3 bg-white/5 text-slate-400 border border-white/10 rounded-xl hover:bg-white/10 transition-colors disabled:opacity-10"
+                  className="p-2.5 bg-white/5 text-slate-300 border border-white/10 rounded-xl hover:bg-white/10 transition-colors disabled:opacity-20"
+                  title="Copy to Clipboard"
                 >
-                  {copied ? <Check size={20} className="text-green-500" /> : <Copy size={20} />}
+                  {copied ? <Check size={18} className="text-emerald-400" /> : <Copy size={18} />}
                 </button>
               </div>
-              <div className="flex items-center gap-2 px-3 py-1 bg-white/5 rounded-full border border-white/5">
-                <div className={`w-1.5 h-1.5 rounded-full ${translatedText ? 'bg-green-500' : 'bg-slate-700'}`} />
-                <span className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">Real-time Stream</span>
+              <div className="flex items-center gap-1.5 text-[10px] font-mono text-slate-500">
+                <span className={`w-1.5 h-1.5 rounded-full ${translatedText ? 'bg-emerald-400' : 'bg-slate-700'}`}></span>
+                <span>{translatedText ? 'Synced' : 'Ready'}</span>
               </div>
-            </div>
-          </div>
-
-          <div className={`bg-slate-900/80 border border-white/10 rounded-2xl p-5 ${targetLang.direction === 'rtl' ? 'rtl' : ''}`}>
-            <div className="flex justify-between items-center mb-2" dir="ltr">
-              <h2 className="text-[11px] font-bold text-slate-500 uppercase tracking-widest">Node Status</h2>
-              <span className="text-[10px] px-2 py-0.5 bg-green-500/10 text-green-500 rounded-full border border-green-500/20">Synced</span>
-            </div>
-            <div className="flex items-center justify-between">
-              <p className="text-xs text-slate-400 font-mono uppercase tracking-tighter">Availability Zone</p>
-              <p className="text-xs text-white font-mono">ASIA-SOUTH-01</p>
             </div>
           </div>
         </section>
       </main>
 
-      {/* Footer */}
-      <footer className="h-20 mt-auto border-t border-white/5 bg-black/40 backdrop-blur-xl flex items-center justify-between px-8 text-[11px] text-slate-500">
-        <div className="flex gap-8 items-center">
-          <div className="flex items-center gap-3">
-            <div className="w-8 h-8 bg-white/5 rounded-lg flex items-center justify-center border border-white/10">
-              <ArrowRightLeft size={16} />
-            </div>
-            <span className="font-bold text-slate-300">BHARAT BRIDGE GRID</span>
-          </div>
-          <div className="hidden md:flex gap-6">
-            <div className="flex items-center gap-2">
-              <span className="w-1.5 h-1.5 rounded-full bg-green-500"></span>
-              <span>22 Core Languages Loaded</span>
-            </div>
-            <div className="flex items-center gap-2">
-              <span className="w-1.5 h-1.5 rounded-full bg-orange-500"></span>
-              <span>Quality Assurance: High</span>
-            </div>
-          </div>
+      {/* Minimalist Footer */}
+      <footer className="py-3 border-t border-white/[0.06] bg-[#07090e] flex items-center justify-between px-6 md:px-8 text-xs text-slate-500">
+        <div className="flex items-center gap-3">
+          <span className="font-semibold text-slate-400">BharatBridge</span>
+          <span className="w-1 h-1 rounded-full bg-slate-700"></span>
+          <span>22 Official Languages</span>
         </div>
-        <div className="flex gap-6 items-center">
-          <span className="uppercase tracking-widest hidden sm:inline">Architecture: Neural Matrix v4.2.0</span>
-          <div className="w-px h-4 bg-white/10 hidden sm:block"></div>
-          <span className="font-mono text-[9px]">© 2026 BHARATBRIDGE PLATFORM</span>
+        <div className="font-mono text-[10px] text-slate-600">
+          © 2026 BharatBridge • Neural Matrix v4.2
         </div>
       </footer>
 
