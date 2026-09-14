@@ -23,12 +23,15 @@ import {
   Plus,
   Download,
   Share2,
-  Users
+  Users,
+  CloudUpload,
+  Gauge
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { LANGUAGES, POPULAR_LANGUAGES } from "./languages";
 import { LanguageConfig, UserProfile, TranslationPair, Session, Message as FBMessage } from "./types";
 import { auth, db, signInWithGoogle, handleFirestoreError, OperationType } from "./lib/firebase";
+import { uploadCaptionToAzure } from "./lib/azure-storage";
 import { onAuthStateChanged, User, signOut } from "firebase/auth";
 import { 
   collection, 
@@ -453,6 +456,9 @@ export default function App() {
   const [listenerCount, setListenerCount] = useState(0);
   const [copiedId, setCopiedId] = useState(false);
 
+  const [playbackRate, setPlaybackRate] = useState<number>(1.0);
+  const [azureSyncStatus, setAzureSyncStatus] = useState<{ syncing: boolean; success?: boolean; message?: string }>({ syncing: false });
+
   const inputAudioCtxRef = useRef<AudioContext | null>(null);
   const outputAudioCtxRef = useRef<AudioContext | null>(null);
   const nextStartTimeRef = useRef<number>(0);
@@ -517,6 +523,22 @@ export default function App() {
     return () => unsubscribe();
   }, [currentSession]);
 
+  const syncToAzure = async () => {
+    if (messages.length === 0) return;
+    setAzureSyncStatus({ syncing: true });
+    const result = await uploadCaptionToAzure(
+      currentSession?.id || 'session-demo',
+      currentSession?.name || 'Live Event',
+      messages
+    );
+    if (result.success) {
+      setAzureSyncStatus({ syncing: false, success: true, message: result.blobName ? `Uploaded: ${result.blobName}` : 'Synced to Azure Storage' });
+    } else {
+      setAzureSyncStatus({ syncing: false, success: false, message: result.error || 'Sync failed' });
+    }
+    setTimeout(() => setAzureSyncStatus({ syncing: false }), 4000);
+  };
+
   const playAudioChunk = (base64: string) => {
     if (!outputAudioCtxRef.current) {
       outputAudioCtxRef.current = new AudioContext({ sampleRate: 24000 });
@@ -527,11 +549,12 @@ export default function App() {
     buffer.getChannelData(0).set(pcm);
     const source = ctx.createBufferSource();
     source.buffer = buffer;
+    source.playbackRate.value = playbackRate;
     source.connect(ctx.destination);
     
     const startTime = Math.max(ctx.currentTime, nextStartTimeRef.current);
     source.start(startTime);
-    nextStartTimeRef.current = startTime + buffer.duration;
+    nextStartTimeRef.current = startTime + (buffer.duration / playbackRate);
   };
 
   const startLiveSession = async () => {
@@ -1107,8 +1130,38 @@ export default function App() {
                       </button>
                     </div>
                     <div className="flex items-center gap-2">
+                      {/* Playback Speed Selector (1.0x - 2.0x) */}
+                      <div className="flex items-center gap-1 bg-white/5 border border-white/10 rounded-lg px-2 py-1">
+                        <Gauge size={12} className="text-orange-400" />
+                        <select
+                          value={playbackRate}
+                          onChange={(e) => setPlaybackRate(parseFloat(e.target.value))}
+                          aria-label="Audio Playback Speed"
+                          className="bg-transparent text-[10px] font-bold text-white outline-none cursor-pointer"
+                        >
+                          <option value="1.0" className="bg-[#0f172a]">1.0x</option>
+                          <option value="1.25" className="bg-[#0f172a]">1.25x</option>
+                          <option value="1.5" className="bg-[#0f172a]">1.5x</option>
+                          <option value="1.75" className="bg-[#0f172a]">1.75x</option>
+                          <option value="2.0" className="bg-[#0f172a]">2.0x</option>
+                        </select>
+                      </div>
+
+                      {/* Azure Cloud Sync Button */}
+                      <button
+                        onClick={syncToAzure}
+                        disabled={azureSyncStatus.syncing || messages.length === 0}
+                        aria-label="Sync Captions to Azure Storage"
+                        className="px-3 py-1.5 bg-sky-500/10 border border-sky-500/20 rounded-lg text-[10px] font-bold text-sky-400 uppercase hover:bg-sky-500/20 transition-all flex items-center gap-1.5 disabled:opacity-30"
+                        title="Sync captions to Azure Storage"
+                      >
+                        <CloudUpload size={12} className={azureSyncStatus.syncing ? 'animate-bounce' : ''} />
+                        {azureSyncStatus.syncing ? 'Syncing...' : 'Azure Sync'}
+                      </button>
+
                       <button 
                         onClick={() => exportTranscript(messages, currentSession?.name, currentSession?.id)}
+                        aria-label="Export Transcript"
                         className="px-3 py-1.5 bg-blue-500/10 border border-blue-500/20 rounded-lg text-[10px] font-bold text-blue-400 uppercase hover:bg-blue-500/20 transition-all flex items-center gap-2"
                       >
                         <Download size={12} />
@@ -1116,12 +1169,19 @@ export default function App() {
                       </button>
                       <button 
                         onClick={sessionRole === 'speaker' ? endLiveSession : () => { setIsLive(false); setCurrentSession(null); if(ws) ws.close(); }}
+                        aria-label="End or Leave Session"
                         className="px-3 py-1.5 bg-red-500/10 border border-red-500/20 rounded-lg text-[10px] font-bold text-red-400 uppercase hover:bg-red-500/20 transition-all"
                       >
                         {sessionRole === 'speaker' ? 'End' : 'Leave'}
                       </button>
                     </div>
                   </div>
+
+                  {azureSyncStatus.message && (
+                    <div className={`p-2 rounded-lg text-[10px] font-mono text-center border ${azureSyncStatus.success ? 'bg-green-500/10 border-green-500/30 text-green-400' : 'bg-red-500/10 border-red-500/30 text-red-400'}`}>
+                      {azureSyncStatus.message}
+                    </div>
+                  )}
 
                   <div className="h-[350px] overflow-y-auto space-y-3 pr-2 scrollbar-thin">
                     {messages.length === 0 ? (

@@ -30,8 +30,56 @@ async function startServer() {
 
   // Health check
   app.get("/api/health", (req, res) => {
-    res.json({ status: "ok", mode: process.env.NODE_ENV || 'development' });
+    res.json({ 
+      status: "ok", 
+      mode: process.env.NODE_ENV || 'development',
+      azureStorageConfigured: Boolean(process.env.AZURE_STORAGE_CONNECTION_STRING)
+    });
   });
+
+  // Azure Blob Storage Upload for Captions
+  app.post("/api/azure/upload-caption", async (req, res) => {
+    const { sessionId, sessionName, captions } = req.body;
+    const connectionString = process.env.AZURE_STORAGE_CONNECTION_STRING;
+    const containerName = process.env.AZURE_STORAGE_CONTAINER_NAME || "bharat-bridge-captions";
+
+    if (!connectionString) {
+      // Graceful fallback when Azure keys are not yet added to .env
+      return res.status(200).json({
+        success: true,
+        mock: true,
+        message: "Azure Storage keys not set in .env. Captions logged locally.",
+        blobName: `captions-${sessionId || 'session'}.json`,
+        blobUrl: `local://storage/captions-${sessionId || 'session'}.json`
+      });
+    }
+
+    try {
+      // Dynamic import to avoid missing dependency failures
+      const { BlobServiceClient } = await import("@azure/storage-blob");
+      const blobServiceClient = BlobServiceClient.fromConnectionString(connectionString);
+      const containerClient = blobServiceClient.getContainerClient(containerName);
+      await containerClient.createIfNotExists({ access: "container" });
+
+      const blobName = `captions-${sessionId}-${Date.now()}.json`;
+      const blockBlobClient = containerClient.getBlockBlobClient(blobName);
+      const content = JSON.stringify({ sessionId, sessionName, createdAt: new Date().toISOString(), captions }, null, 2);
+
+      await blockBlobClient.upload(content, content.length, {
+        blobHTTPHeaders: { blobContentType: "application/json" }
+      });
+
+      res.json({
+        success: true,
+        blobName,
+        blobUrl: blockBlobClient.url
+      });
+    } catch (error: any) {
+      console.error("Azure Storage Upload Error:", error);
+      res.status(500).json({ error: error.message || "Failed to upload to Azure Storage" });
+    }
+  });
+
 
   // Room management
   type LanguageGroup = {
