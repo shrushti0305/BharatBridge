@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { useState, useEffect, useRef, useMemo } from "react";
+import React, { useState, useEffect, useRef, useMemo, FormEvent } from "react";
 import { 
   Mic, 
   MicOff, 
@@ -25,13 +25,20 @@ import {
   Share2,
   Users,
   CloudUpload,
-  Gauge
+  Gauge,
+  QrCode,
+  FileText,
+  FileJson,
+  Music,
+  History
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { LANGUAGES, POPULAR_LANGUAGES } from "./languages";
 import { LanguageConfig, UserProfile, TranslationPair, Session, Message as FBMessage } from "./types";
 import { auth, db, signInWithGoogle, handleFirestoreError, OperationType } from "./lib/firebase";
 import { uploadCaptionToAzure } from "./lib/azure-storage";
+import { generateQRCodeSVG } from "./lib/qrcode";
+import { downloadAudioWAV } from "./lib/audio-export";
 import { onAuthStateChanged, User, signOut } from "firebase/auth";
 import { 
   collection, 
@@ -236,7 +243,7 @@ const AdminModal = ({ isOpen, onClose }: { isOpen: boolean; onClose: () => void 
               <h3 className="font-bold text-white">{selectedSession ? selectedSession.name : 'Select a Session'}</h3>
               {selectedSession && sessionMessages.length > 0 && (
                 <button 
-                  onClick={() => exportTranscript(sessionMessages, selectedSession.name, selectedSession.id)}
+                  onClick={() => exportTranscriptTXT(sessionMessages, selectedSession.name, selectedSession.id)}
                   className="p-2 bg-white/5 hover:bg-white/10 border border-white/10 rounded-lg text-slate-400 hover:text-blue-400 transition-all flex items-center gap-2"
                   title="Download Transcript"
                 >
@@ -413,9 +420,239 @@ function base64ToPcm(base64: string): Float32Array {
   return float32;
 }
 
-const exportTranscript = (messages: FBMessage[], sessionName?: string, sessionId?: string) => {
+const QRModal = ({ isOpen, onClose, sessionId }: { isOpen: boolean; onClose: () => void; sessionId: string }) => {
+  if (!isOpen) return null;
+  const host = window.location.host;
+  const inviteUrl = `${window.location.protocol}//${host}${window.location.pathname}?session=${sessionId}`;
+  const qrImageSrc = generateQRCodeSVG(inviteUrl, 220);
+
+  return (
+    <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-xl" onClick={onClose} role="dialog" aria-modal="true" aria-labelledby="qr-modal-title">
+      <motion.div initial={{ scale: 0.9, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.9, opacity: 0 }} className="w-full max-w-sm bg-[#0f172a] border border-white/10 rounded-[32px] p-8 shadow-2xl text-center space-y-6" onClick={(e) => e.stopPropagation()}>
+        <div className="flex justify-between items-center border-b border-white/5 pb-4">
+          <h3 id="qr-modal-title" className="font-bold text-xl text-white">Scan to Join</h3>
+          <button onClick={onClose} aria-label="Close QR Modal" className="w-8 h-8 bg-white/5 hover:bg-white/10 border border-white/10 rounded-full flex items-center justify-center text-slate-400 transition-colors">
+            <X size={16} />
+          </button>
+        </div>
+
+        <div className="bg-white p-4 rounded-2xl inline-block shadow-inner">
+          <img src={qrImageSrc} alt={`QR Code for session ${sessionId}`} className="w-48 h-48 mx-auto" />
+        </div>
+
+        <div className="space-y-1">
+          <p className="text-xs text-slate-400 uppercase font-mono tracking-widest">Event Session PIN Code</p>
+          <p className="text-3xl font-black text-orange-400 font-mono tracking-wider">{sessionId}</p>
+        </div>
+
+        <button 
+          onClick={() => {
+            navigator.clipboard.writeText(inviteUrl);
+          }}
+          className="w-full py-3 bg-orange-500 hover:bg-orange-600 text-white text-xs font-bold rounded-xl transition-all shadow-[0_0_20px_rgba(249,115,22,0.3)] flex items-center justify-center gap-2"
+        >
+          <Share2 size={16} />
+          Copy Direct Link
+        </button>
+      </motion.div>
+    </motion.div>
+  );
+};
+
+const JoinModal = ({ isOpen, onClose, onJoin }: { isOpen: boolean; onClose: () => void; onJoin: (pin: string) => void }) => {
+  const [pin, setPin] = useState("");
+  if (!isOpen) return null;
+
+  const handleSubmit = (e: FormEvent) => {
+    e.preventDefault();
+    if (pin.trim()) {
+      onJoin(pin.trim());
+      onClose();
+    }
+  };
+
+  return (
+    <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-xl" onClick={onClose} role="dialog" aria-modal="true">
+      <motion.div initial={{ scale: 0.9, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.9, opacity: 0 }} className="w-full max-w-md bg-[#0f172a] border border-white/10 rounded-[32px] p-8 shadow-2xl space-y-6" onClick={(e) => e.stopPropagation()}>
+        <div className="flex justify-between items-center border-b border-white/5 pb-4">
+          <div>
+            <h3 className="font-bold text-xl text-white">Join Event Session</h3>
+            <p className="text-xs text-slate-500 mt-0.5">Enter 6-digit Session PIN Code</p>
+          </div>
+          <button onClick={onClose} aria-label="Close Join Modal" className="w-8 h-8 bg-white/5 hover:bg-white/10 border border-white/10 rounded-full flex items-center justify-center text-slate-400">
+            <X size={16} />
+          </button>
+        </div>
+
+        <form onSubmit={handleSubmit} className="space-y-4">
+          <div className="space-y-2">
+            <label className="text-xs font-mono text-slate-400 uppercase tracking-wider block text-center">Session PIN Code</label>
+            <input 
+              type="text"
+              value={pin}
+              onChange={(e) => setPin(e.target.value)}
+              placeholder="e.g. 582941"
+              maxLength={12}
+              autoFocus
+              className="w-full text-center text-3xl font-mono font-bold tracking-widest bg-white/5 border border-white/10 rounded-2xl py-4 text-orange-400 focus:border-orange-500 outline-none uppercase"
+            />
+          </div>
+
+          <button 
+            type="submit"
+            disabled={!pin.trim()}
+            className="w-full py-4 bg-blue-500 hover:bg-blue-600 disabled:opacity-40 text-white text-sm font-bold rounded-2xl transition-all shadow-[0_0_20px_rgba(59,130,246,0.3)] uppercase tracking-wider flex items-center justify-center gap-2"
+          >
+            <Users size={18} />
+            Connect to Session
+          </button>
+        </form>
+      </motion.div>
+    </motion.div>
+  );
+};
+
+interface SavedSessionRecord {
+  id: string;
+  name: string;
+  date: string;
+  sourceLang: string;
+  targetLang: string;
+  messages: FBMessage[];
+}
+
+const HistoryModal = ({ 
+  isOpen, 
+  onClose, 
+  savedSessions,
+  onDelete
+}: { 
+  isOpen: boolean; 
+  onClose: () => void; 
+  savedSessions: SavedSessionRecord[];
+  onDelete: (id: string) => void;
+}) => {
+  const [selectedHistory, setSelectedHistory] = useState<SavedSessionRecord | null>(savedSessions[0] || null);
+
+  useEffect(() => {
+    if (savedSessions.length > 0 && !selectedHistory) {
+      setSelectedHistory(savedSessions[0]);
+    }
+  }, [savedSessions]);
+
+  if (!isOpen) return null;
+
+  return (
+    <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-xl" onClick={onClose} role="dialog" aria-modal="true">
+      <motion.div initial={{ scale: 0.9, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.9, opacity: 0 }} className="w-full max-w-4xl bg-[#0f172a] border border-white/10 rounded-[32px] shadow-2xl overflow-hidden flex h-[80vh]" onClick={e => e.stopPropagation()}>
+        {/* Sidebar */}
+        <div className="w-1/3 border-r border-white/5 flex flex-col bg-slate-900/40">
+          <div className="p-6 border-b border-white/5 flex justify-between items-center">
+            <div>
+              <h3 className="font-bold text-white text-lg">My Saved Sessions</h3>
+              <p className="text-[10px] text-slate-500 uppercase tracking-wider mt-0.5">Saved locally on your device</p>
+            </div>
+          </div>
+          <div className="flex-1 overflow-y-auto p-4 space-y-2 scrollbar-thin">
+            {savedSessions.length === 0 ? (
+              <div className="p-8 text-center border border-dashed border-white/10 rounded-2xl">
+                <History size={24} className="mx-auto text-slate-600 mb-2" />
+                <p className="text-xs text-slate-500">No saved session history yet.</p>
+                <p className="text-[10px] text-slate-600 mt-1">Join or host a live session to auto-save transcripts and downloadable audio.</p>
+              </div>
+            ) : (
+              savedSessions.map(s => (
+                <div 
+                  key={s.id} 
+                  onClick={() => setSelectedHistory(s)}
+                  className={`w-full p-4 rounded-xl border text-left transition-all cursor-pointer group relative ${selectedHistory?.id === s.id ? 'bg-orange-500/10 border-orange-500/30' : 'bg-white/5 border-white/5 hover:border-white/10'}`}
+                >
+                  <div className="flex justify-between items-start">
+                    <p className="text-xs font-bold text-white truncate pr-4">{s.name}</p>
+                    <button 
+                      onClick={(e) => { e.stopPropagation(); onDelete(s.id); if (selectedHistory?.id === s.id) setSelectedHistory(null); }}
+                      className="text-slate-600 hover:text-red-400 opacity-0 group-hover:opacity-100 transition-opacity"
+                      title="Delete saved session"
+                    >
+                      <Trash2 size={14} />
+                    </button>
+                  </div>
+                  <p className="text-[10px] text-slate-400 font-mono mt-1">ID: {s.id} • {s.date}</p>
+                  <div className="mt-2 flex items-center justify-between">
+                    <span className="text-[9px] px-2 py-0.5 bg-white/5 border border-white/10 rounded text-slate-300 uppercase font-mono">{s.sourceLang} → {s.targetLang}</span>
+                    <span className="text-[10px] font-mono text-orange-400">{s.messages?.length || 0} msgs</span>
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+
+        {/* Content Viewer */}
+        <div className="flex-1 flex flex-col bg-black/20">
+          <div className="p-6 border-b border-white/5 flex justify-between items-center">
+            <div>
+              <h3 className="font-bold text-white">{selectedHistory ? selectedHistory.name : 'Select a Session'}</h3>
+              {selectedHistory && <p className="text-xs text-slate-400 font-mono">Date: {selectedHistory.date}</p>}
+            </div>
+
+            {selectedHistory && (
+              <div className="flex items-center gap-2">
+                <button 
+                  onClick={() => exportTranscriptTXT(selectedHistory.messages, selectedHistory.name, selectedHistory.id)}
+                  className="px-3 py-1.5 bg-blue-500/10 border border-blue-500/20 rounded-lg text-blue-400 hover:bg-blue-500/20 text-xs font-bold uppercase flex items-center gap-1.5 transition-all"
+                  title="Download .TXT"
+                >
+                  <FileText size={14} />
+                  TXT
+                </button>
+                <button 
+                  onClick={() => exportTranscriptJSON(selectedHistory.messages, selectedHistory.name, selectedHistory.id)}
+                  className="px-3 py-1.5 bg-emerald-500/10 border border-emerald-500/20 rounded-lg text-emerald-400 hover:bg-emerald-500/20 text-xs font-bold uppercase flex items-center gap-1.5 transition-all"
+                  title="Download .JSON"
+                >
+                  <FileJson size={14} />
+                  JSON
+                </button>
+              </div>
+            )}
+
+            <button onClick={onClose} className="p-2 bg-white/5 rounded-full text-slate-400 hover:text-white"><X size={16}/></button>
+          </div>
+
+          <div className="flex-1 overflow-y-auto p-6 space-y-4 scrollbar-thin">
+            {!selectedHistory ? (
+              <div className="h-full flex flex-col items-center justify-center text-slate-600">
+                <FileText size={32} className="mb-2 opacity-50" />
+                <p className="text-xs">Select a session from the list to view its saved transcript.</p>
+              </div>
+            ) : selectedHistory.messages.length === 0 ? (
+              <p className="text-xs text-slate-500 text-center py-8">No messages recorded in this session.</p>
+            ) : (
+              selectedHistory.messages.map((m, idx) => (
+                <div key={m.id || idx} className="p-4 bg-white/5 border border-white/5 rounded-2xl space-y-2">
+                  <div className="flex justify-between items-center text-[10px] text-slate-500 uppercase tracking-widest font-mono">
+                    <span>#{m.id ? m.id.slice(-6) : idx + 1}</span>
+                  </div>
+                  <p className="text-xs text-slate-400 font-medium leading-relaxed italic border-l-2 border-slate-700 pl-3 py-0.5">
+                    {m.originalText}
+                  </p>
+                  <p className="text-sm font-semibold text-white pt-1">
+                    {m.translatedText}
+                  </p>
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+      </motion.div>
+    </motion.div>
+  );
+};
+
+const exportTranscriptTXT = (messages: FBMessage[], sessionName?: string, sessionId?: string) => {
   if (messages.length === 0) return;
-  const sessionInfo = `Session: ${sessionName || 'Unknown'}\nID: ${sessionId || 'N/A'}\nDate: ${new Date().toLocaleString()}\n\n`;
+  const sessionInfo = `Bharat Bridge Session: ${sessionName || 'Live Event'}\nPIN ID: ${sessionId || 'N/A'}\nDate: ${new Date().toLocaleString()}\n\n`;
   const content = messages
     .slice()
     .sort((a, b) => (a.timestamp?.seconds || 0) - (b.timestamp?.seconds || 0))
@@ -425,11 +662,39 @@ const exportTranscript = (messages: FBMessage[], sessionName?: string, sessionId
     })
     .join("\n---\n\n");
   
-  const blob = new Blob([sessionInfo + content], { type: "text/plain" });
+  const blob = new Blob([sessionInfo + content], { type: "text/plain;charset=utf-8" });
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
   link.href = url;
   link.download = `transcript-${sessionId || 'session'}.txt`;
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  URL.revokeObjectURL(url);
+};
+
+const exportTranscriptJSON = (messages: FBMessage[], sessionName?: string, sessionId?: string) => {
+  if (messages.length === 0) return;
+  const payload = {
+    sessionId: sessionId || 'session',
+    sessionName: sessionName || 'Live Event',
+    exportedAt: new Date().toISOString(),
+    totalMessages: messages.length,
+    messages: messages.map(m => ({
+      id: m.id,
+      timestamp: m.timestamp ? new Date(m.timestamp.seconds * 1000).toISOString() : new Date().toISOString(),
+      sourceLanguage: m.sourceLang,
+      originalText: m.originalText,
+      targetLanguage: m.targetLang,
+      translatedText: m.translatedText
+    }))
+  };
+
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `transcript-${sessionId || 'session'}.json`;
   document.body.appendChild(link);
   link.click();
   document.body.removeChild(link);
@@ -481,9 +746,53 @@ export default function App() {
   const [translatedText, setTranslatedText] = useState("");
   const [isTranslating, setIsTranslating] = useState(false);
   const [isListening, setIsListening] = useState(false);
-  const [modalOpen, setModalOpen] = useState<{ open: boolean; type: "source" | "target" | "profile" | "admin" }>({ open: false, type: "source" });
+  const [modalOpen, setModalOpen] = useState<{ open: boolean; type: "source" | "target" | "profile" | "admin" | "qr" | "join" | "history" }>({ open: false, type: "source" });
   const [autoDetect, setAutoDetect] = useState(false);
   const [copied, setCopied] = useState(false);
+
+  const audioBufferRef = useRef<Float32Array[]>([]);
+
+  const [savedSessionsHistory, setSavedSessionsHistory] = useState<SavedSessionRecord[]>(() => {
+    try {
+      const saved = localStorage.getItem("bharat_bridge_saved_sessions");
+      return saved ? JSON.parse(saved) : [];
+    } catch (e) {
+      return [];
+    }
+  });
+
+  const handleDeleteSavedSession = (id: string) => {
+    setSavedSessionsHistory(prev => {
+      const nextList = prev.filter(s => s.id !== id);
+      localStorage.setItem("bharat_bridge_saved_sessions", JSON.stringify(nextList));
+      return nextList;
+    });
+  };
+
+  useEffect(() => {
+    if (currentSession && messages.length > 0) {
+      setSavedSessionsHistory(prev => {
+        const idx = prev.findIndex(s => s.id === currentSession.id);
+        const updatedRecord: SavedSessionRecord = {
+          id: currentSession.id,
+          name: currentSession.name || `Session #${currentSession.id}`,
+          date: new Date().toLocaleDateString() + " " + new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+          sourceLang: sourceLang.name,
+          targetLang: targetLang.name,
+          messages: messages
+        };
+        let nextList: SavedSessionRecord[];
+        if (idx >= 0) {
+          nextList = [...prev];
+          nextList[idx] = updatedRecord;
+        } else {
+          nextList = [updatedRecord, ...prev];
+        }
+        localStorage.setItem("bharat_bridge_saved_sessions", JSON.stringify(nextList));
+        return nextList;
+      });
+    }
+  }, [messages, currentSession]);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -546,6 +855,7 @@ export default function App() {
     }
     const ctx = outputAudioCtxRef.current;
     const pcm = base64ToPcm(base64);
+    audioBufferRef.current.push(pcm);
     const buffer = ctx.createBuffer(1, pcm.length, 24000);
     buffer.getChannelData(0).set(pcm);
     const source = ctx.createBufferSource();
@@ -578,9 +888,11 @@ export default function App() {
       console.warn("Firestore save fallback to local session ID:", error);
     }
 
+    audioBufferRef.current = [];
     setCurrentSession({ id: sessionId, ...sessionData } as Session);
     setIsLive(true);
     setSessionRole('speaker');
+    setModalOpen({ open: true, type: "qr" });
 
     // Setup WebSocket
     const socket = new WebSocket(`${window.location.protocol === "https:" ? "wss:" : "ws:"}//${window.location.host}`);
@@ -650,6 +962,7 @@ export default function App() {
       console.warn("Firestore lookup fallback:", error);
     }
 
+    audioBufferRef.current = [];
     setCurrentSession({ id: sessionId, ...sessionData } as Session);
     setIsLive(true);
     setSessionRole('listener');
@@ -794,6 +1107,7 @@ export default function App() {
 
         processor.onaudioprocess = (e) => {
           const pcm = e.inputBuffer.getChannelData(0);
+          audioBufferRef.current.push(new Float32Array(pcm));
           const base64 = pcmToBase64(pcm);
           
           if (ws && ws.readyState === WebSocket.OPEN) {
@@ -916,6 +1230,14 @@ export default function App() {
               <Languages size={20} />
             </button>
           )}
+          <button 
+            onClick={() => setModalOpen({ open: true, type: "history" })}
+            className="p-2 bg-white/5 hover:bg-white/10 border border-white/10 rounded-full text-slate-400 hover:text-white transition-all shadow-lg flex items-center gap-1.5 px-3"
+            title="Saved Session History & Downloads"
+          >
+            <History size={18} />
+            <span className="text-xs font-semibold hidden sm:inline">Saved Sessions ({savedSessionsHistory.length})</span>
+          </button>
           <button 
             onClick={() => setModalOpen({ open: true, type: "profile" })}
             className="p-2 bg-white/5 hover:bg-white/10 border border-white/10 rounded-full text-slate-400 hover:text-white transition-all shadow-lg"
@@ -1070,10 +1392,7 @@ export default function App() {
                         </button>
 
                         <button 
-                          onClick={() => {
-                            const id = prompt("Enter Event/Session ID:");
-                            if (id) joinLiveSession(id);
-                          }}
+                          onClick={() => setModalOpen({ open: true, type: "join" })}
                           className="flex flex-col items-center gap-4 p-8 bg-gradient-to-b from-blue-500/20 to-blue-500/5 border border-blue-500/30 rounded-3xl hover:border-blue-500/60 transition-all hover:scale-[1.02] group"
                         >
                           <div className="w-16 h-16 rounded-2xl bg-blue-500/20 flex items-center justify-center text-blue-400 group-hover:bg-blue-500 group-hover:text-white transition-all shadow-lg">
@@ -1146,6 +1465,16 @@ export default function App() {
                       </div>
                     </div>
                     <div className="flex items-center gap-2">
+                      {/* Interactive QR Code Button */}
+                      <button
+                        onClick={() => setModalOpen({ open: true, type: "qr" })}
+                        aria-label="View QR Code"
+                        className="p-1.5 bg-orange-500/10 border border-orange-500/30 rounded-lg text-orange-400 hover:bg-orange-500/20 transition-all"
+                        title="Show QR Code for Mobile Joining"
+                      >
+                        <QrCode size={14} />
+                      </button>
+
                       {/* Playback Speed Selector (1.0x - 2.0x) */}
                       <div className="flex items-center gap-1 bg-white/5 border border-white/10 rounded-lg px-2 py-1">
                         <Gauge size={12} className="text-orange-400" />
@@ -1168,21 +1497,60 @@ export default function App() {
                         onClick={syncToAzure}
                         disabled={azureSyncStatus.syncing || messages.length === 0}
                         aria-label="Sync Captions to Azure Storage"
-                        className="px-3 py-1.5 bg-sky-500/10 border border-sky-500/20 rounded-lg text-[10px] font-bold text-sky-400 uppercase hover:bg-sky-500/20 transition-all flex items-center gap-1.5 disabled:opacity-30"
+                        className="px-2.5 py-1.5 bg-sky-500/10 border border-sky-500/20 rounded-lg text-[10px] font-bold text-sky-400 uppercase hover:bg-sky-500/20 transition-all flex items-center gap-1 disabled:opacity-30"
                         title="Sync captions to Azure Storage"
                       >
                         <CloudUpload size={12} className={azureSyncStatus.syncing ? 'animate-bounce' : ''} />
-                        {azureSyncStatus.syncing ? 'Syncing...' : 'Azure Sync'}
+                        {azureSyncStatus.syncing ? 'Syncing' : 'Azure'}
                       </button>
 
+                      {/* TXT Download */}
                       <button 
-                        onClick={() => exportTranscript(messages, currentSession?.name, currentSession?.id)}
-                        aria-label="Export Transcript"
-                        className="px-3 py-1.5 bg-blue-500/10 border border-blue-500/20 rounded-lg text-[10px] font-bold text-blue-400 uppercase hover:bg-blue-500/20 transition-all flex items-center gap-2"
+                        onClick={() => exportTranscriptTXT(messages, currentSession?.name, currentSession?.id)}
+                        aria-label="Export TXT"
+                        className="px-2.5 py-1.5 bg-blue-500/10 border border-blue-500/20 rounded-lg text-[10px] font-bold text-blue-400 uppercase hover:bg-blue-500/20 transition-all flex items-center gap-1"
+                        title="Download Text (.TXT)"
                       >
-                        <Download size={12} />
-                        Export
+                        <FileText size={12} />
+                        TXT
                       </button>
+
+                      {/* JSON Download */}
+                      <button 
+                        onClick={() => exportTranscriptJSON(messages, currentSession?.name, currentSession?.id)}
+                        aria-label="Export JSON"
+                        className="px-2.5 py-1.5 bg-emerald-500/10 border border-emerald-500/20 rounded-lg text-[10px] font-bold text-emerald-400 uppercase hover:bg-emerald-500/20 transition-all flex items-center gap-1"
+                        title="Download Data (.JSON)"
+                      >
+                        <FileJson size={12} />
+                        JSON
+                      </button>
+
+                      {/* WAV Audio Download */}
+                      <button 
+                        onClick={() => {
+                          if (audioBufferRef.current.length === 0) {
+                            alert("No session audio captured yet.");
+                            return;
+                          }
+                          let totalLength = 0;
+                          for (const chunk of audioBufferRef.current) totalLength += chunk.length;
+                          const merged = new Float32Array(totalLength);
+                          let offset = 0;
+                          for (const chunk of audioBufferRef.current) {
+                            merged.set(chunk, offset);
+                            offset += chunk.length;
+                          }
+                          downloadAudioWAV(merged, `session-audio-${currentSession?.id || 'event'}.wav`);
+                        }}
+                        aria-label="Export WAV Audio"
+                        className="px-2.5 py-1.5 bg-purple-500/10 border border-purple-500/20 rounded-lg text-[10px] font-bold text-purple-400 uppercase hover:bg-purple-500/20 transition-all flex items-center gap-1"
+                        title="Download Audio (.WAV)"
+                      >
+                        <Music size={12} />
+                        WAV
+                      </button>
+
                       <button 
                         onClick={sessionRole === 'speaker' ? endLiveSession : () => { setIsLive(false); setCurrentSession(null); if(ws) ws.close(); }}
                         aria-label="End or Leave Session"
@@ -1399,9 +1767,9 @@ export default function App() {
         </div>
       </footer>
 
-      {/* Language Modal (Themed) */}
+      {/* Modals */}
       <AnimatePresence>
-        {modalOpen.open && modalOpen.type !== "profile" && (
+        {(modalOpen.type === "source" || modalOpen.type === "target") && (
           <LanguageModal 
             isOpen={modalOpen.open} 
             title={modalOpen.type === "source" ? "Source Selection" : "Target Selection"}
@@ -1413,6 +1781,28 @@ export default function App() {
             }}
           />
         )}
+        {modalOpen.open && modalOpen.type === "qr" && (
+          <QRModal 
+            isOpen={modalOpen.open}
+            onClose={() => setModalOpen({ ...modalOpen, open: false })}
+            sessionId={currentSession?.id || '582941'}
+          />
+        )}
+        {modalOpen.open && modalOpen.type === "join" && (
+          <JoinModal 
+            isOpen={modalOpen.open}
+            onClose={() => setModalOpen({ ...modalOpen, open: false })}
+            onJoin={(pin) => joinLiveSession(pin)}
+          />
+        )}
+        {modalOpen.open && modalOpen.type === "history" && (
+          <HistoryModal 
+            isOpen={modalOpen.open}
+            onClose={() => setModalOpen({ ...modalOpen, open: false })}
+            savedSessions={savedSessionsHistory}
+            onDelete={handleDeleteSavedSession}
+          />
+        )}
         {modalOpen.open && modalOpen.type === "profile" && (
           <ProfileModal 
             isOpen={modalOpen.open}
@@ -1420,7 +1810,6 @@ export default function App() {
             profile={profile}
             onUpdate={(newProfile) => {
               setProfile(newProfile);
-              // Update current session if defaults changed
               if (newProfile.defaultSourceCode !== profile.defaultSourceCode) {
                 const s = LANGUAGES.find(l => l.code === newProfile.defaultSourceCode);
                 if (s) setSourceLang(s);
