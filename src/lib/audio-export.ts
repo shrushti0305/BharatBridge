@@ -2,7 +2,7 @@
  * Utility to encode PCM audio buffers into downloadable WAV audio files.
  */
 
-export function encodeWAV(samples: Float32Array, sampleRate = 24000): Blob {
+export function encodeWAV(samples: Float32Array, sampleRate = 16000): Blob {
   const buffer = new ArrayBuffer(44 + samples.length * 2);
   const view = new DataView(buffer);
 
@@ -49,9 +49,9 @@ function writeString(view: DataView, offset: number, string: string) {
   }
 }
 
-export function downloadAudioWAV(samples: Float32Array, filename = 'session-audio.wav') {
+export function downloadAudioWAV(samples: Float32Array, filename = 'session-audio.wav', sampleRate = 16000) {
   if (samples.length === 0) return;
-  const blob = encodeWAV(samples);
+  const blob = encodeWAV(samples, sampleRate);
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;

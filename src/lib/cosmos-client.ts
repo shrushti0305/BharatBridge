@@ -95,9 +95,13 @@ export async function getContainer(containerName: "sessions" | "messages" | stri
     partitionKeyPath = "/sessionId";
   } else if (containerName === "sessions") {
     partitionKeyPath = "/id";
+  } else if (containerName === "metrics") {
+    partitionKeyPath = "/day";
   }
 
   const messageTtlSeconds = process.env.COSMOS_MESSAGE_TTL_SECONDS ? Number(process.env.COSMOS_MESSAGE_TTL_SECONDS) : undefined;
+  const metricsTtlDays = process.env.METRICS_TTL_DAYS ? Number(process.env.METRICS_TTL_DAYS) : 90;
+
   const containerDef: any = {
     id: containerName,
     partitionKey: { paths: [partitionKeyPath] }
@@ -105,6 +109,8 @@ export async function getContainer(containerName: "sessions" | "messages" | stri
 
   if (containerName === "messages" && messageTtlSeconds !== undefined && !isNaN(messageTtlSeconds)) {
     containerDef.defaultTtl = messageTtlSeconds;
+  } else if (containerName === "metrics") {
+    containerDef.defaultTtl = metricsTtlDays * 86400;
   }
 
   try {

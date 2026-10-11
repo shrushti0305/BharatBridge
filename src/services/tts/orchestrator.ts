@@ -40,7 +40,22 @@ export class TTSOrchestrator {
     const primaryProvider = this.providers.get(this.primaryName);
     if (primaryProvider && primaryProvider.isConfigured()) {
       try {
-        return await primaryProvider.synthesize(request);
+        const startTime = Date.now();
+        const response = await primaryProvider.synthesize(request);
+        const { observabilityService, generateEventId } = await import("../observability");
+        observabilityService.recordEvent({
+          eventId: request.requestId || (request as any).eventId || generateEventId(),
+          sessionId: request.sessionId || "global",
+          sourceLanguage: "en",
+          targetLanguage: request.languageCode?.split("-")[0] || "hi",
+          stage: "TTS",
+          eventType: "TTS_SUCCESS",
+          status: "SUCCESS",
+          provider: "smallest",
+          latencyMs: Date.now() - startTime,
+          charCount: cleanText.length
+        });
+        return response;
       } catch (err: any) {
         console.warn(`[TTSOrchestrator] Primary provider (${this.primaryName}) failed:`, err.message || err);
       }

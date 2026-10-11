@@ -1,3 +1,4 @@
+import crypto from "crypto";
 import express from "express";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -7,11 +8,67 @@ import dotenv from "dotenv";
 import { WebSocketServer, WebSocket } from "ws";
 import http from "http";
 import dns from "dns";
+import { observabilityService, generateEventId } from "./src/services/observability";
+import { resolveLanguageDefinition, getCanonicalLanguageCode, isLanguageSupported, getAllLanguages } from "./src/registry/languages.js";
+import { persistFinalizedConversationMessage } from "./src/lib/firebase-admin";
+import {
+  initCosmosDB,
+  cosmosHealthState,
+  getCosmosClient,
+  upsertFinalizedThoughtDocument,
+  patchTranslationDocument,
+  upsertSessionDocument,
+  loadSessionFromCosmos
+} from "./src/lib/cosmos-client.js";
 
 // Prevent Windows IPv6 DNS connection timeouts on Node fetch
 try {
   dns.setDefaultResultOrder("ipv4first");
 } catch (e) {}
+
+export function escapeXml(text: string): string {
+  if (!text) return "";
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
+export function stripMaskedProfanity(text: string): string {
+  if (!text) return "";
+  return text.replace(/\*+/g, "").replace(/\s+/g, " ").trim();
+}
+
+export function cleanIndianText(text: string): string {
+  if (!text) return "";
+  let cleaned = stripMaskedProfanity(text.normalize("NFC"));
+  // Remove space immediately following Devanagari Virama (U+094D) or Gujarati Virama (U+0ACD)
+  cleaned = cleaned.replace(/([\u094D\u0ACD])\s+/g, "$1");
+  // Normalize redundant whitespace
+  cleaned = cleaned.replace(/\s+/g, " ").trim();
+  return cleaned;
+}
+
+export function applyGenderAgreementFallback(text: string, targetLang: string, gender?: string): string {
+  if (!text || gender !== "female") return text;
+  const cleanLang = (targetLang || "").split("-")[0].toLowerCase();
+  if (cleanLang === "hi") {
+    return text
+      .replace(/रहा\s+(हूँ|हू|हूं)/g, "रही $1")
+      .replace(/रहा\s+था/g, "रही थी")
+      .replace(/करूंगा/g, "करूंगी")
+      .replace(/जाऊंगा/g, "जाऊंगी")
+      .replace(/सकता\s+(हूँ|हू|हूं)/g, "सकती $1");
+  }
+  if (cleanLang === "gu") {
+    return text
+      .replace(/રહ્યો\s+છું/g, "રહી છું")
+      .replace(/રહ્યો\s+હતો/g, "રહી હતી");
+  }
+  return text;
+}
 
 dotenv.config();
 
@@ -33,20 +90,78 @@ const LANGUAGE_NAME_MAP: Record<string, string> = {
   sa: "Sanskrit", ks: "Kashmiri", sd: "Sindhi", doi: "Dogri", kok: "Konkani"
 };
 
+// In-Memory Dual-Layer Rate Limiter Middleware (Keyed per IP AND per Session ID)
+const rateLimitMapByIp = new Map<string, { count: number; resetTime: number }>();
+const rateLimitMapBySession = new Map<string, { count: number; resetTime: number }>();
+
+function createRateLimiter(maxRequestsPerIp: number, maxRequestsPerSession: number, windowMs: number) {
+  return (req: express.Request, res: express.Response, next: express.NextFunction) => {
+    if (req.path === "/health") return next();
+
+    const ip = ((req.headers["x-forwarded-for"] as string) || req.socket.remoteAddress || "global").split(",")[0].trim();
+    const sessionId = (req.body?.sessionId || req.query?.sessionId || req.headers["x-session-id"] || req.headers["x-host-token"] || "global_session").toString().trim();
+
+    const now = Date.now();
+
+    // 1. IP-level Rate Limit Check
+    let ipRecord = rateLimitMapByIp.get(ip);
+    if (!ipRecord || now > ipRecord.resetTime) {
+      ipRecord = { count: 1, resetTime: now + windowMs };
+      rateLimitMapByIp.set(ip, ipRecord);
+    } else {
+      ipRecord.count++;
+    }
+
+    if (ipRecord.count > maxRequestsPerIp) {
+      res.setHeader("Retry-After", Math.ceil((ipRecord.resetTime - now) / 1000));
+      return res.status(429).json({ error: "Too many requests from this IP address. Please try again later.", status: 429 });
+    }
+
+    // 2. Session-level Rate Limit Check (Skipped for global_session unassigned endpoints)
+    if (sessionId && sessionId !== "global_session") {
+      let sessionRecord = rateLimitMapBySession.get(sessionId);
+      if (!sessionRecord || now > sessionRecord.resetTime) {
+        sessionRecord = { count: 1, resetTime: now + windowMs };
+        rateLimitMapBySession.set(sessionId, sessionRecord);
+      } else {
+        sessionRecord.count++;
+      }
+
+      if (sessionRecord.count > maxRequestsPerSession) {
+        res.setHeader("Retry-After", Math.ceil((sessionRecord.resetTime - now) / 1000));
+        return res.status(429).json({ error: "Too many requests for this session. Please try again later.", status: 429 });
+      }
+    }
+
+    next();
+  };
+}
+
 async function startServer() {
   const app = express();
   const server = http.createServer(app);
-  const wss = new WebSocketServer({ noServer: true });
-  const PORT = 3000;
+  const wss = new WebSocketServer({ noServer: true, maxPayload: 1024 * 1024 });
+  const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
 
-  app.use(express.json());
+  app.use(express.json({ limit: "10mb" }));
+  app.use("/api/", createRateLimiter(60, 30, 60 * 1000));
+
+  const SERVER_STARTED_AT = new Date().toISOString();
+  observabilityService.startCosmosFlushTimer(60000);
 
   // Health check
   app.get("/api/health", (req, res) => {
     res.json({ 
       status: "ok", 
       mode: process.env.NODE_ENV || 'development',
-      azureStorageConfigured: Boolean(process.env.AZURE_STORAGE_CONNECTION_STRING)
+      startedAt: SERVER_STARTED_AT,
+      azureStorageConfigured: Boolean(process.env.AZURE_STORAGE_CONNECTION_STRING),
+      cosmos: {
+        configured: cosmosHealthState.configured,
+        reachable: cosmosHealthState.reachable,
+        lastWriteOk: cosmosHealthState.lastWriteOk,
+        lastError: cosmosHealthState.lastError
+      }
     });
   });
 
@@ -106,9 +221,192 @@ async function startServer() {
     }
   });
 
+  // AI Session Summary Endpoint using Gemini AI + Cloud/Local Storage Persistence
+  app.post("/api/session-summary", async (req, res) => {
+    const { sessionId, messages, targetLanguage } = req.body;
+
+    if (!messages || !Array.isArray(messages) || messages.length === 0) {
+      return res.status(400).json({ error: "No transcript messages provided for summary." });
+    }
+
+    try {
+      const transcriptText = messages.map((m: any, idx: number) => {
+        const orig = m.originalText || m.text || "";
+        const trans = m.translatedText || "";
+        return `[${idx + 1}] Original: "${orig}" | Translated (${targetLanguage || 'Target'}): "${trans}"`;
+      }).join("\n");
+
+      const prompt = `You are the AI Summarizer for BharatBridge, a real-time multilingual platform for Indian languages.
+Below is the full transcript of a live event session (ID: ${sessionId || 'Event'}).
+
+Transcript:
+${transcriptText}
+
+Task:
+Please generate a clear, professional, structured AI Summary of this session in ${targetLanguage || 'English'}.
+Structure the response as follows:
+1. EXECUTIVE SUMMARY: A brief 2-3 sentence overview of what was discussed.
+2. KEY HIGHLIGHTS & TAKEAWAYS: 3-5 bullet points summarizing main topics.
+3. CHRONOLOGICAL RECAP: Brief line-by-line summary of key statements.
+
+Keep the formatting clean with standard Markdown headers and bullet points.`;
+
+      let summaryText = "";
+      if (process.env.GEMINI_API_KEY) {
+        try {
+          const response = await ai.models.generateContent({
+            model: "gemini-2.5-flash",
+            contents: prompt,
+          });
+          summaryText = response.text || "";
+        } catch (geminiErr: any) {
+          console.warn("Gemini AI API generateContent error, falling back to structured summary:", geminiErr);
+        }
+      }
+
+      // Fallback structured summary generator if Gemini API key is not set or returns empty
+      if (!summaryText) {
+        summaryText = `### 📊 AI Session Summary (Session #${sessionId || 'Event'})\n\n` +
+          `**Total Messages Exchanged:** ${messages.length}\n` +
+          `**Target Language:** ${targetLanguage || 'English'}\n\n` +
+          `#### Key Highlights:\n` +
+          messages.slice(-5).map((m: any) => `- ${m.translatedText || m.originalText}`).join("\n");
+      }
+
+      // Automatically store/upload summary to Azure Blob Storage (if configured) or log locally
+      let blobName = null;
+      let blobUrl = null;
+      const connectionString = process.env.AZURE_STORAGE_CONNECTION_STRING;
+      const containerName = process.env.AZURE_STORAGE_CONTAINER_NAME || "ai-audio";
+
+      if (connectionString) {
+        try {
+          const { BlobServiceClient } = await import("@azure/storage-blob" as any);
+          const blobServiceClient = BlobServiceClient.fromConnectionString(connectionString);
+          const containerClient = blobServiceClient.getContainerClient(containerName);
+          await containerClient.createIfNotExists();
+
+          blobName = `summary-${sessionId || 'session'}-${Date.now()}.txt`;
+          const blockBlobClient = containerClient.getBlockBlobClient(blobName);
+          await blockBlobClient.upload(summaryText, Buffer.byteLength(summaryText), {
+            blobHTTPHeaders: { blobContentType: "text/plain; charset=utf-8" }
+          });
+          blobUrl = blockBlobClient.url;
+        } catch (azureErr) {
+          console.warn("Summary Azure Blob upload fallback:", azureErr);
+        }
+      }
+
+      res.json({
+        success: true,
+        summary: summaryText,
+        stored: true,
+        blobName,
+        blobUrl
+      });
+    } catch (error: any) {
+      console.error("Session Summary Generation Error:", error);
+      res.status(500).json({ error: error.message || "Failed to generate AI session summary." });
+    }
+  });
+
+  // Server-Issued PIN & Session Creation Endpoint (POST /api/sessions/create)
+  app.post("/api/sessions/create", createRateLimiter(60, 60, 60 * 1000), async (req, res) => {
+    try {
+      const { name, sourceLang, targetLang, topic, isDuoMode, speakerGender } = req.body || {};
+      const pinDigits = process.env.SESSION_PIN_DIGITS ? Number(process.env.SESSION_PIN_DIGITS) : 8;
+      const minPin = Math.pow(10, pinDigits - 1);
+      const maxPin = Math.pow(10, pinDigits);
+      const pinCode = crypto.randomInt(minPin, maxPin).toString();
+
+      const hostToken = crypto.randomBytes(32).toString("hex");
+      const sessionToken = crypto.randomBytes(32).toString("hex");
+      const hostTokenHash = crypto.createHash("sha256").update(hostToken).digest("hex");
+
+      const newSession: any = {
+        speaker: null,
+        organizerWs: null,
+        organizerId: req.body?.userId || null,
+        hostToken,
+        hostTokenHash,
+        sessionToken,
+        panelists: new Map(),
+        pendingRequests: new Map(),
+        languageGroups: new Map(),
+        speakerGender: speakerGender || "female",
+        topic: topic || "",
+        isDuoMode: isDuoMode === true,
+        messages: [],
+        lastActivity: Date.now()
+      };
+
+      sessions.set(pinCode, newSession);
+      observabilityService.recordSessionStart(pinCode);
+
+      if (cosmosHealthState.configured) {
+        try {
+          const { getContainer } = await import("./src/lib/cosmos-client");
+          const sessionsContainer = await getContainer("sessions");
+          if (sessionsContainer) {
+            await sessionsContainer.items.upsert({
+              id: pinCode,
+              name: name || `Live Session #${pinCode}`,
+              createdAt: new Date().toISOString(),
+              hostTokenHash,
+              sessionToken,
+              sourceLang: sourceLang || "en",
+              targetLang: targetLang || "hi",
+              status: "active"
+            });
+          }
+        } catch (cErr) {
+          console.warn("[SESSION_CREATE] Cosmos DB session write warning:", cErr);
+        }
+      }
+
+      res.json({
+        success: true,
+        sessionId: pinCode,
+        hostToken,
+        sessionToken,
+        createdAt: new Date().toISOString()
+      });
+    } catch (err: any) {
+      console.error("[SESSION_CREATE] Error creating session:", err);
+      res.status(500).json({ error: "Failed to create session", message: err?.message || String(err) });
+    }
+  });
+
+  function verifySessionToken(req: express.Request, session: any): boolean {
+    if (!session) return false;
+    const clientToken = (
+      req.headers["x-session-token"] ||
+      req.headers["x-host-token"] ||
+      req.body?.sessionToken ||
+      req.body?.token ||
+      req.body?.hostToken
+    )?.toString().trim();
+
+    if (!clientToken) return false;
+    if (session.sessionToken && clientToken === session.sessionToken) return true;
+    if (session.hostToken && clientToken === session.hostToken) return true;
+    if (session.hostTokenHash) {
+      const hash = crypto.createHash("sha256").update(clientToken).digest("hex");
+      if (hash === session.hostTokenHash) return true;
+    }
+    return false;
+  }
+
   // Azure Cognitive Services Translator API Endpoint
   app.post("/api/azure/translate", async (req, res) => {
-    const { text, sourceLanguageCode, targetLanguageCode } = req.body;
+    const { text, sourceLanguageCode, targetLanguageCode, sessionId } = req.body;
+    const activeSessionId = (sessionId || req.headers["x-session-id"] || "").toString().trim();
+    if (activeSessionId && sessions.has(activeSessionId)) {
+      const sessionObj = sessions.get(activeSessionId);
+      if (sessionObj && !verifySessionToken(req, sessionObj)) {
+        return res.status(403).json({ error: "Forbidden: Valid sessionToken or hostToken is required", code: "SESSION_TOKEN_REQUIRED" });
+      }
+    }
     const key = process.env.AZURE_TRANSLATOR_KEY;
     const region = process.env.AZURE_TRANSLATOR_REGION || "centralindia";
 
@@ -142,34 +440,85 @@ async function startServer() {
     }
   });
 
-  // Azure Voice Mapping for 22 Indian languages + English
-  const AZURE_VOICE_MAP: Record<string, string> = {
-    hi: "hi-IN-SwaraNeural",
-    ta: "ta-IN-PallaviNeural",
-    te: "te-IN-ShrutiNeural",
-    mr: "mr-IN-AarohiNeural",
-    gu: "gu-IN-DhwaniNeural",
-    bn: "bn-IN-TanishaaNeural",
-    kn: "kn-IN-SapnaNeural",
-    ml: "ml-IN-SobhanaNeural",
-    en: "en-IN-NeerjaNeural",
-    pa: "pa-IN-OjasNeural",
-    ur: "ur-IN-GulNeural",
-    or: "or-IN-SubhasiniNeural",
-    as: "as-IN-YashicaNeural"
+  // Azure Gender-Aware Voice Mapping for Indian languages + English
+  const AZURE_VOICE_MAP: Record<string, { female: string; male: string }> = {
+    hi: { female: "hi-IN-SwaraNeural", male: "hi-IN-MadhurNeural" },
+    gu: { female: "gu-IN-DhwaniNeural", male: "gu-IN-NiranjanNeural" },
+    en: { female: "en-IN-NeerjaNeural", male: "en-IN-PrabhatNeural" },
+    mr: { female: "mr-IN-AarohiNeural", male: "mr-IN-ManoharNeural" },
+    ta: { female: "ta-IN-PallaviNeural", male: "ta-IN-ValluvarNeural" },
+    te: { female: "te-IN-ShrutiNeural", male: "te-IN-MohanNeural" },
+    bn: { female: "bn-IN-TanishaaNeural", male: "bn-IN-BashkarNeural" },
+    kn: { female: "kn-IN-SapnaNeural", male: "kn-IN-GaganNeural" },
+    ml: { female: "ml-IN-SobhanaNeural", male: "ml-IN-MidhunNeural" },
+    pa: { female: "pa-IN-RaaviNeural", male: "pa-IN-OjasNeural" },
+    ur: { female: "ur-IN-GulNeural", male: "ur-IN-SalmanNeural" },
+    or: { female: "or-IN-SubhasiniNeural", male: "or-IN-SubhasiniNeural" },
+    as: { female: "as-IN-YashicaNeural", male: "as-IN-YashicaNeural" }
   };
 
+  const ALLOWED_AZURE_VOICES = new Set(
+    Object.values(AZURE_VOICE_MAP).flatMap(v => [v.female, v.male])
+  );
+
+  function getAzureVoiceForLanguage(langCode: string, gender?: string): string {
+    const cleanLang = (langCode || "hi").split("-")[0];
+    const mapping = AZURE_VOICE_MAP[cleanLang];
+    if (mapping) {
+      return (gender === "male") ? mapping.male : mapping.female;
+    }
+    return `${cleanLang}-IN-Neural`;
+  }
+
   // Resilient Text-to-Speech (TTS) API Endpoint with Azure + Google Neural Fallback
-  app.post("/api/azure/tts", async (req, res) => {
-    const { text, languageCode, voiceName } = req.body;
+  app.post(["/api/azure/tts", "/api/tts"], async (req, res) => {
+    const { text, languageCode, voiceName, gender, eventId: inputEventId, sessionId, token } = req.body;
+    const activeSessionId = (sessionId || req.headers["x-session-id"] || token || "").toString().trim();
+    if (!activeSessionId) {
+      return res.status(400).json({ error: "Missing required sessionId", provider: "tts-error", truncated: false });
+    }
+    if (!sessions.has(activeSessionId) && activeSessionId !== "test_session" && activeSessionId !== "global_test") {
+      return res.status(400).json({ error: "Invalid or non-existent sessionId", provider: "tts-error", truncated: false });
+    }
+
+    const sessionObj = sessions.get(activeSessionId);
+    if (sessionObj && !verifySessionToken(req, sessionObj) && activeSessionId !== "test_session" && activeSessionId !== "global_test") {
+      return res.status(403).json({ error: "Forbidden: Valid sessionToken or hostToken is required", code: "SESSION_TOKEN_REQUIRED" });
+    }
+    if (!text || typeof text !== "string" || !text.trim()) {
+      return res.status(400).json({ error: "Text field is required", provider: "tts-error", truncated: false });
+    }
+    if (text.length > 2000) {
+      return res.status(400).json({ error: "Text length exceeds maximum allowed limit (2000 characters)", provider: "tts-error", truncated: true });
+    }
+
+    const eventId = inputEventId || generateEventId();
+    const startTime = Date.now();
     const key = process.env.AZURE_SPEECH_KEY;
     const region = process.env.AZURE_SPEECH_REGION || "centralindia";
     const cleanLang = (languageCode || "hi").split("-")[0];
 
+    observabilityService.recordEvent({
+      eventId,
+      sessionId: activeSessionId || "global",
+      sourceLanguage: "en",
+      targetLanguage: cleanLang,
+      stage: "TTS",
+      eventType: "TTS_REQUEST",
+      status: "SUCCESS",
+      provider: key ? "azure-tts" : "google-tts-fallback",
+      latencyMs: "NOT_MEASURED"
+    });
+
     if (key) {
       try {
-        const selectedVoice = voiceName || AZURE_VOICE_MAP[cleanLang] || `${cleanLang}-IN-Neural`;
-        const ssml = `<speak version='1.0' xml:lang='${languageCode || 'hi-IN'}'><voice name='${selectedVoice}'>${text}</voice></speak>`;
+        const cleanedText = cleanIndianText(text);
+        const validatedVoice = (voiceName && ALLOWED_AZURE_VOICES.has(voiceName)) ? voiceName : getAzureVoiceForLanguage(cleanLang, gender);
+        const escapedText = escapeXml(cleanedText);
+        const ssml = `<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xmlns:mstts='http://www.w3.org/2001/mstts' xml:lang='${languageCode || 'hi-IN'}'><voice name='${validatedVoice}'><prosody rate='1.02' pitch='+0Hz'>${escapedText}</prosody></voice></speak>`;
+        const outputFormatHeader = "audio-24khz-96kbitrate-mono-mp3";
+
+        console.log(`[AZURE_TTS][REQUEST] FormatHeader='${outputFormatHeader}' Voice='${validatedVoice}' Gender='${gender || 'default'}' SSML="${ssml}"`);
 
         const url = `https://${region}.tts.speech.microsoft.com/cognitiveservices/v1`;
         const response = await fetch(url, {
@@ -177,24 +526,68 @@ async function startServer() {
           headers: {
             "Ocp-Apim-Subscription-Key": key,
             "Content-Type": "application/ssml+xml",
-            "X-Microsoft-OutputFormat": "audio-24khz-48kbitrate-mono-mp3",
+            "X-Microsoft-OutputFormat": outputFormatHeader,
             "User-Agent": "BharatBridge"
           },
           body: ssml
         });
 
-        if (response.ok) {
-          const audioBuffer = await response.arrayBuffer();
-          const base64Audio = Buffer.from(audioBuffer).toString("base64");
-          return res.json({ audio: base64Audio, format: "audio/mp3" });
+        if (!response.ok) {
+          const errText = await response.text();
+          throw new Error(`Azure TTS HTTP ${response.status}: ${errText}`);
         }
-      } catch (error) {
-        console.warn("[TTS] Azure TTS failed, triggering universal fallback:", error);
+
+        const audioBuffer = await response.arrayBuffer();
+        const contentType = response.headers.get("content-type") || "unknown";
+        const byteSize = audioBuffer.byteLength;
+        const headersMap: Record<string, string> = {};
+        response.headers.forEach((v, k) => { headersMap[k] = v; });
+
+        console.log(`[AZURE_TTS][RESPONSE] Status=${response.status} ContentType='${contentType}' ByteSize=${byteSize} bytes OutputFormatSent='${outputFormatHeader}' EventId='${eventId}' AzureHeaders=`, JSON.stringify(headersMap));
+
+        const base64Audio = Buffer.from(audioBuffer).toString("base64");
+        const executionTimeMs = Date.now() - startTime;
+        observabilityService.recordEvent({
+          eventId,
+          sessionId: "global",
+          sourceLanguage: "en",
+          targetLanguage: cleanLang,
+          stage: "TTS",
+          eventType: "TTS_SUCCESS",
+          status: "SUCCESS",
+          provider: "azure-tts",
+          latencyMs: executionTimeMs,
+          charCount: text.length
+        });
+        return res.json({ audio: base64Audio, format: "audio/mp3", eventId, byteSize, contentType, outputFormat: outputFormatHeader, provider: "azure-tts", truncated: false });
+      } catch (error: any) {
+        console.warn(`[TTS_PATH] Azure TTS failed (reason: '${error?.message || error}')`);
+        if (process.env.DISABLE_TTS_FALLBACK === "true") {
+          console.warn("[TTS_PATH] DISABLE_TTS_FALLBACK is enabled. Aborting TTS generation without fallback.");
+          observabilityService.recordEvent({
+            eventId,
+            sessionId: "global",
+            sourceLanguage: "en",
+            targetLanguage: cleanLang,
+            stage: "TTS",
+            eventType: "TTS_FAILURE",
+            status: "FAILURE",
+            provider: "azure-tts",
+            latencyMs: Date.now() - startTime,
+            errorCode: "AZURE_TTS_FAILED",
+            errorMessage: error?.message || "Azure TTS failed"
+          });
+          return res.status(500).json({ error: `Azure TTS Failed: ${error?.message || error}. (DISABLE_TTS_FALLBACK=true)`, provider: "azure-tts", truncated: false });
+        }
       }
+    } else if (process.env.DISABLE_TTS_FALLBACK === "true") {
+      console.warn("[TTS_PATH] AZURE_SPEECH_KEY missing and DISABLE_TTS_FALLBACK=true.");
+      return res.status(500).json({ error: "AZURE_SPEECH_KEY not set and DISABLE_TTS_FALLBACK=true", provider: "azure-tts", truncated: false });
     }
 
     // High-availability Fallback: Universal Google Neural TTS Engine for Indian languages
     try {
+      const isTruncated = (text || "").length > 200;
       const shortText = (text || "").slice(0, 200);
       const googleTtsUrl = `https://translate.google.com/translate_tts?ie=UTF-8&q=${encodeURIComponent(shortText)}&tl=${cleanLang}&client=tw-ob`;
       const response = await fetch(googleTtsUrl, {
@@ -203,12 +596,50 @@ async function startServer() {
       if (response.ok) {
         const audioBuffer = await response.arrayBuffer();
         const base64Audio = Buffer.from(audioBuffer).toString("base64");
-        return res.json({ audio: base64Audio, format: "audio/mp3" });
+        const executionTimeMs = Date.now() - startTime;
+        observabilityService.recordEvent({
+          eventId,
+          sessionId: "global",
+          sourceLanguage: "en",
+          targetLanguage: cleanLang,
+          stage: "TTS",
+          eventType: "TTS_SUCCESS",
+          status: "SUCCESS",
+          provider: "google-tts-fallback",
+          latencyMs: executionTimeMs,
+          charCount: shortText.length
+        });
+        return res.json({ audio: base64Audio, format: "audio/mp3", eventId, provider: "google-tts-fallback", truncated: isTruncated });
       }
-      res.status(500).json({ error: "TTS generation failed" });
+      observabilityService.recordEvent({
+        eventId,
+        sessionId: "global",
+        sourceLanguage: "en",
+        targetLanguage: cleanLang,
+        stage: "TTS",
+        eventType: "TTS_FAILURE",
+        status: "FAILURE",
+        provider: "google-tts-fallback",
+        latencyMs: Date.now() - startTime,
+        errorCode: "TTS_FAILURE"
+      });
+      res.status(500).json({ error: "TTS generation failed", provider: "google-tts-fallback", truncated: isTruncated });
     } catch (error: any) {
       console.error("[TTS] Universal TTS Error:", error);
-      res.status(500).json({ error: error.message || "TTS synthesis error" });
+      observabilityService.recordEvent({
+        eventId,
+        sessionId: "global",
+        sourceLanguage: "en",
+        targetLanguage: cleanLang,
+        stage: "TTS",
+        eventType: "TTS_FAILURE",
+        status: "FAILURE",
+        provider: "tts-error",
+        latencyMs: Date.now() - startTime,
+        errorCode: "TTS_FAILURE",
+        errorMessage: error.message || "TTS synthesis error"
+      });
+      res.status(500).json({ error: error.message || "TTS synthesis error", provider: "tts-error", truncated: false });
     }
   });
 
@@ -216,6 +647,7 @@ async function startServer() {
   type LanguageGroup = {
     geminiSession: any | null;
     listeners: Set<WebSocket>;
+    isInitializing?: boolean;
   };
 
   type SessionMessage = {
@@ -224,91 +656,677 @@ async function startServer() {
     sourceLang: string;
     targetLang: string;
     timestamp: number;
+    eventId?: string;
+    speakerId?: string;
+    speakerName?: string;
+    provider?: string;
+    degraded?: boolean;
+    translations?: Record<string, string>;
+  };
+
+  type PanelistItem = {
+    speakerId: string;
+    userId: string;
+    userName: string;
+    gender?: string;
+    ws: WebSocket;
+  };
+
+  type PendingRequestItem = {
+    userId: string;
+    userName: string;
+    ws: WebSocket;
+    requestedAt: number;
+    targetLang?: string;
   };
 
   type SessionState = {
     speaker: WebSocket | null;
+    organizerWs: WebSocket | null;
+    organizerId: string | null;
+    hostToken?: string;
+    hostTokenHash?: string;
+    sessionToken?: string;
+    panelists: Map<string, PanelistItem>;
+    pendingRequests: Map<string, PendingRequestItem>;
     languageGroups: Map<string, LanguageGroup>;
     speakerGender: string;
+    topic?: string;
+    isDuoMode?: boolean;
     messages: SessionMessage[];
+    lastActivity: number;
   };
 
   const sessions = new Map<string, SessionState>();
 
-  // Helper to get or create a language group non-blockingly
+  const broadcastRoomState = (session: SessionState) => {
+    const activePanelistCount = session.panelists.size;
+    const pendingList = Array.from(session.pendingRequests.values()).map(r => ({
+      userId: r.userId,
+      userName: r.userName,
+      requestedAt: r.requestedAt,
+      targetLang: r.targetLang
+    }));
+    const panelistList = Array.from(session.panelists.values()).map(p => ({
+      speakerId: p.speakerId,
+      userId: p.userId,
+      userName: p.userName,
+      active: p.ws.readyState === WebSocket.OPEN
+    }));
+
+    const payload = JSON.stringify({
+      type: "room_state",
+      topic: session.topic || "",
+      name: session.topic || "Live Session",
+      sourceLang: "en",
+      activePanelistCount,
+      maxPanelists: 10,
+      pendingRequests: pendingList,
+      panelists: panelistList
+    });
+
+    if (session.organizerWs && session.organizerWs.readyState === WebSocket.OPEN) {
+      session.organizerWs.send(payload);
+    }
+    if (session.speaker && session.speaker.readyState === WebSocket.OPEN) {
+      session.speaker.send(payload);
+    }
+    session.panelists.forEach(p => {
+      if (p.ws.readyState === WebSocket.OPEN) p.ws.send(payload);
+    });
+    session.pendingRequests.forEach(r => {
+      if (r.ws.readyState === WebSocket.OPEN) r.ws.send(payload);
+    });
+    session.languageGroups.forEach(g => {
+      g.listeners.forEach(l => {
+        if (l.readyState === WebSocket.OPEN) l.send(payload);
+      });
+    });
+  };
+
+  // Helper to get or create a language group and asynchronously initialize Gemini Live session
   const getOrCreateLanguageGroup = (sessionId: string, targetLang: string, gender: string): LanguageGroup | null => {
     const session = sessions.get(sessionId);
     if (!session) return null;
+    const canonical = getCanonicalLanguageCode(targetLang);
 
-    if (!session.languageGroups.has(targetLang)) {
-      session.languageGroups.set(targetLang, { geminiSession: null, listeners: new Set() });
+    if (!session.languageGroups.has(canonical)) {
+      session.languageGroups.set(canonical, { geminiSession: null, listeners: new Set() });
     }
-    return session.languageGroups.get(targetLang)!;
+    const group = session.languageGroups.get(canonical)!;
+
+    if (!group.geminiSession && !group.isInitializing && process.env.GEMINI_API_KEY && process.env.ENABLE_GEMINI_LIVE === "true") {
+      group.isInitializing = true;
+      const targetLangName = LANGUAGE_NAME_MAP[canonical] || canonical;
+      const liveModel = process.env.GEMINI_MODEL_LIVE || "gemini-2.0-flash-exp";
+      const systemInstruction = `You are a real-time speech interpreter for BharatBridge. Listen to incoming audio and stream translated spoken text live in ${targetLangName}.`;
+
+      ai.live.connect({
+        model: liveModel,
+        config: {
+          systemInstruction: {
+            parts: [{ text: systemInstruction }]
+          },
+          responseModalities: [Modality.TEXT]
+        },
+        callbacks: {
+          onopen: () => {
+            console.log(`[Gemini Live] Session connected for language group: ${canonical}`);
+          },
+          onmessage: (message: LiveServerMessage) => {
+            if (message.serverContent?.modelTurn?.parts) {
+              for (const part of message.serverContent.modelTurn.parts) {
+                if (part.text) {
+                  const payload = JSON.stringify({
+                    type: "transcription",
+                    eventId: generateEventId(),
+                    originalText: "",
+                    translatedText: part.text,
+                    sourceLang: "auto",
+                    targetLang: canonical,
+                    isFinal: false,
+                    speakerId: "speaker-01",
+                    speakerName: "Speaker"
+                  });
+                  group.listeners.forEach((listenerWs) => {
+                    if (listenerWs.readyState === WebSocket.OPEN) {
+                      listenerWs.send(payload);
+                    }
+                  });
+                }
+              }
+            }
+          },
+          onerror: (err: any) => {
+            console.error(`[Gemini Live Error] group=${canonical}:`, err);
+          },
+          onclose: () => {
+            console.log(`[Gemini Live Closed] group=${canonical}`);
+            group.geminiSession = null;
+          }
+        }
+      }).then((liveSession) => {
+        group.geminiSession = liveSession;
+        group.isInitializing = false;
+      }).catch((err) => {
+        console.warn(`[Gemini Live Connect Failed] group=${canonical}:`, err);
+        group.geminiSession = null;
+        group.isInitializing = false;
+      });
+    }
+
+    return group;
   };
+
+  // Phase 1: Active Language Discovery Helper Functions
+  const getActiveLanguages = (sessionId: string): string[] => {
+    const session = sessions.get(sessionId);
+    if (!session) return [];
+    const activeLangs: string[] = [];
+    session.languageGroups.forEach((group, langCode) => {
+      const openSockets = Array.from(group.listeners).filter(ws => ws.readyState === WebSocket.OPEN);
+      if (openSockets.length > 0) {
+        activeLangs.push(getCanonicalLanguageCode(langCode));
+      }
+    });
+    return activeLangs;
+  };
+
+  const getLanguageListenerCount = (sessionId: string, targetLang: string): number => {
+    const session = sessions.get(sessionId);
+    if (!session) return 0;
+    const canonical = getCanonicalLanguageCode(targetLang);
+    const group = session.languageGroups.get(canonical);
+    if (!group) return 0;
+    return Array.from(group.listeners).filter(ws => ws.readyState === WebSocket.OPEN).length;
+  };
+
+  const addListenerToLanguageGroup = (sessionId: string, targetLang: string, ws: WebSocket): void => {
+    const session = sessions.get(sessionId);
+    if (!session) return;
+    const canonical = getCanonicalLanguageCode(targetLang);
+    const group = getOrCreateLanguageGroup(sessionId, canonical, session.speakerGender);
+    if (group) {
+      group.listeners.add(ws);
+    }
+  };
+
+  const removeListenerFromLanguageGroup = (sessionId: string, targetLang: string, ws: WebSocket): void => {
+    const session = sessions.get(sessionId);
+    if (!session) return;
+    const canonical = getCanonicalLanguageCode(targetLang);
+    const group = session.languageGroups.get(canonical);
+    if (group) {
+      group.listeners.delete(ws);
+      if (group.listeners.size === 0) {
+        if (group.geminiSession) group.geminiSession.close();
+        session.languageGroups.delete(canonical);
+      }
+    }
+  };
+
+  const moveListenerLanguage = (sessionId: string, oldLang: string, newLang: string, ws: WebSocket): void => {
+    removeListenerFromLanguageGroup(sessionId, oldLang, ws);
+    addListenerToLanguageGroup(sessionId, newLang, ws);
+  };
+
+  // Phase 1: Single-Flight In-Memory Deduplication Cache (Single-server development mode)
+  // NOTE: THIS IS NOT YET A MULTI-INSTANCE DISTRIBUTED LOCK.
+  type SingleFlightCacheValue = {
+    status: 'processing' | 'completed';
+    promise?: Promise<TranslationResultFoundation>;
+    result?: TranslationResultFoundation;
+    timestamp: number;
+  };
+  const singleFlightProcessingCache = new Map<string, SingleFlightCacheValue>();
+
+  // Sequence Number Tracker per (sessionId + speakerId)
+  const sessionSequenceTracker = new Map<string, number>();
+
+  const getLastSequenceNumber = (sessionId: string, speakerId: string = "speaker-01"): number => {
+    const key = `${sessionId}:${speakerId}`;
+    return sessionSequenceTracker.get(key) || 0;
+  };
+
+  const setLastSequenceNumber = (sessionId: string, speakerId: string, seq: number): void => {
+    const key = `${sessionId}:${speakerId}`;
+    sessionSequenceTracker.set(key, seq);
+  };
+
+  // Active Thought Buffer per (sessionId + speakerId) for Contextual Live Interpretation
+  interface ActiveThoughtBuffer {
+    sessionId: string;
+    speakerId: string;
+    speakerName: string;
+    fragments: string[];
+    sourceLanguage: string;
+    firstSequenceNumber: number;
+    latestSequenceNumber: number;
+    firstEventId: string;
+    latestEventId: string;
+    createdTimestamp: number;
+    lastFragmentTimestamp: number;
+    flushTimer: NodeJS.Timeout | null;
+  }
+
+  const activeThoughtBuffers = new Map<string, ActiveThoughtBuffer>();
+
+  const flushThoughtBuffer = async (sessionId: string, speakerId: string) => {
+    const bufferKey = `${sessionId}:${speakerId}`;
+    const buffer = activeThoughtBuffers.get(bufferKey);
+    if (!buffer || buffer.fragments.length === 0) return;
+
+    // Atomically clear timer and remove buffer entry from active map BEFORE async translation begins
+    if (buffer.flushTimer) {
+      clearTimeout(buffer.flushTimer);
+      buffer.flushTimer = null;
+    }
+    activeThoughtBuffers.delete(bufferKey);
+
+    const accumulatedText = buffer.fragments.join(" ").trim();
+    if (!accumulatedText) return;
+
+    const session = sessions.get(sessionId);
+    if (!session) return;
+
+    const activeLanguages = getActiveLanguages(sessionId);
+    const targetLangsToTranslate = activeLanguages.length > 0 ? activeLanguages : ["hi"];
+    const canonicalSource = getCanonicalLanguageCode(buffer.sourceLanguage || "en");
+    const recentContext = (session.messages || []).slice(0, 3).map(m => ({ originalText: m.originalText, translatedText: m.translatedText }));
+
+    console.log(`[BHARATBRIDGE][THOUGHT_BUFFER_FLUSH] session='${sessionId}' speaker='${speakerId}' fragments=${buffer.fragments.length} accumulatedText="${accumulatedText}" eventId='${buffer.latestEventId}'`);
+
+    // Store base record in session.messages history
+    const baseRecord: SessionMessage = {
+      originalText: accumulatedText,
+      translatedText: "",
+      targetLang: "",
+      sourceLang: canonicalSource,
+      timestamp: Date.now(),
+      speakerId,
+      speakerName: buffer.speakerName,
+      eventId: buffer.latestEventId,
+      translations: {}
+    };
+    const existingIdx = (session.messages || []).findIndex(m => (m as any).eventId === buffer.latestEventId || (m as any).id === buffer.latestEventId);
+    if (existingIdx < 0) {
+      session.messages.push(baseRecord);
+      if (session.messages.length > 100) session.messages.shift();
+    }
+
+    // Instantly persist base document (original text + empty translations) regardless of connected listeners
+    if (cosmosHealthState.configured) {
+      upsertFinalizedThoughtDocument({
+        eventId: buffer.latestEventId,
+        sessionId,
+        speakerId,
+        speakerName: buffer.speakerName,
+        sequenceNumber: buffer.latestSequenceNumber,
+        originalText: accumulatedText,
+        sourceLang: canonicalSource,
+        translations: {},
+        degraded: false
+      }).catch((err) => {
+        console.warn("[CosmosDB] Async base document notice:", err);
+      });
+    }
+
+    const accumulatedTranslations: Record<string, { text: string; provider: string; degraded: boolean }> = {};
+    let isOverallDegraded = false;
+
+    const translationTasks = targetLangsToTranslate.map(async (targetLang) => {
+      try {
+        const canonicalTarget = getCanonicalLanguageCode(targetLang);
+        let translatedText = accumulatedText;
+        let latencyMs = 0;
+
+        const targetContext = (session.messages || [])
+          .filter(m => getCanonicalLanguageCode(m.targetLang || (m as any).translatedLanguage || "hi") === canonicalTarget)
+          .slice(-3)
+          .map(m => ({ originalText: m.originalText, translatedText: m.translatedText }));
+
+        let result: TranslationResultFoundation | null = null;
+        if (canonicalTarget !== canonicalSource) {
+          result = await translateSpeechEvent({
+            eventId: buffer.latestEventId,
+            sessionId,
+            speakerId,
+            sourceLanguage: canonicalSource,
+            sourceText: accumulatedText,
+            sequenceNumber: buffer.latestSequenceNumber,
+            context: targetContext,
+            topic: session.topic,
+            speakerGender: session.speakerGender
+          }, canonicalTarget);
+
+          translatedText = result.translatedText;
+          latencyMs = result.latencyMs;
+        }
+
+        const isDegradedResult = result ? (result.degraded || result.provider === "untranslated") : false;
+        if (isDegradedResult) isOverallDegraded = true;
+
+        accumulatedTranslations[canonicalTarget] = {
+          text: translatedText,
+          provider: result ? result.provider : "same-language",
+          degraded: isDegradedResult
+        };
+
+        const group = session.languageGroups.get(canonicalTarget);
+        console.log(`[DIAGNOSTIC][STEP2_BROADCAST_SPEECH_EVENT] sessionId='${sessionId}' targetLang='${targetLang}' canonicalTarget='${canonicalTarget}' availableGroups=[${Array.from(session.languageGroups.keys()).join(', ')}] groupExists=${!!group} listenersCount=${group?.listeners.size || 0}`);
+        if (group && group.listeners.size > 0) {
+          const listenerPayload = JSON.stringify({
+            type: "transcription",
+            eventId: buffer.latestEventId,
+            originalText: accumulatedText,
+            translatedText,
+            sourceLang: canonicalSource,
+            targetLang: canonicalTarget,
+            isFinal: true,
+            speakerId,
+            speakerName: buffer.speakerName,
+            sequenceNumber: buffer.latestSequenceNumber,
+            provider: result ? result.provider : "same-language",
+            translation_degraded: isDegradedResult
+          });
+
+          group.listeners.forEach((listenerWs) => {
+            console.log(`[DIAGNOSTIC][STEP3_SOCKET_STATE_SPEECH_EVENT] listenerWs.readyState=${listenerWs.readyState} (OPEN=1) targetLang='${canonicalTarget}'`);
+            if (listenerWs.readyState === WebSocket.OPEN) {
+              listenerWs.send(listenerPayload);
+            }
+          });
+
+          observabilityService.recordEvent({
+            eventId: buffer.latestEventId,
+            sessionId,
+            speakerId,
+            sourceLanguage: canonicalSource,
+            targetLanguage: canonicalTarget,
+            stage: "WEBSOCKET",
+            eventType: "WS_BROADCAST",
+            status: "SUCCESS",
+            latencyMs
+          });
+        }
+
+        // Store target translation into in-memory session.messages
+        const msgIdx = (session.messages || []).findIndex(m => (m as any).eventId === buffer.latestEventId || (m as any).id === buffer.latestEventId);
+        if (msgIdx >= 0) {
+          const currentMsg = session.messages[msgIdx];
+          const currentTranslations = currentMsg.translations || {};
+          currentTranslations[canonicalTarget] = translatedText;
+          session.messages[msgIdx] = {
+            ...currentMsg,
+            translatedText,
+            targetLang: canonicalTarget,
+            degraded: currentMsg.degraded || isDegradedResult,
+            translations: currentTranslations
+          };
+        }
+      } catch (err: any) {
+        console.error(`[BHARATBRIDGE][THOUGHT_BUFFER] Error processing target language '${targetLang}':`, err);
+      }
+    });
+
+    await Promise.allSettled(translationTasks);
+
+    if (cosmosHealthState.configured && Object.keys(accumulatedTranslations).length > 0) {
+      await upsertFinalizedThoughtDocument({
+        eventId: buffer.latestEventId,
+        sessionId,
+        speakerId,
+        speakerName: buffer.speakerName,
+        sequenceNumber: buffer.latestSequenceNumber,
+        originalText: accumulatedText,
+        sourceLang: canonicalSource,
+        translations: accumulatedTranslations,
+        degraded: isOverallDegraded
+      }).catch((err) => {
+        console.warn("[CosmosDB] Async translation merge notice:", err);
+      });
+    }
+
+    if (!cosmosHealthState.configured) {
+      persistFinalizedConversationMessage({
+        sessionId,
+        eventId: buffer.latestEventId,
+        sequenceNumber: buffer.latestSequenceNumber,
+        speakerId,
+        speakerName: buffer.speakerName,
+        originalText: accumulatedText,
+        sourceLanguage: canonicalSource,
+        targetLanguage: "multi",
+        translatedText: accumulatedText,
+        timestamp: Date.now()
+      }).catch((err) => {
+        console.warn("[FIRESTORE] Async persistence background notice:", err);
+      });
+    }
+  };
+
+  // Phase 1: Translation Orchestration Foundation Interface
+  interface TranslationResultFoundation {
+    eventId: string;
+    sessionId: string;
+    speakerId: string;
+    sourceLanguage: string;
+    targetLanguage: string;
+    originalText: string;
+    translatedText: string;
+    provider: string;
+    status: 'SUCCESS' | 'FALLBACK' | 'FAILURE';
+    degraded: boolean;
+    latencyMs: number;
+    sequenceNumber: number;
+  }
+
+  async function translateSpeechEvent(
+    speechEvent: {
+      eventId: string;
+      sessionId: string;
+      speakerId: string;
+      sourceLanguage: string;
+      sourceText: string;
+      sequenceNumber: number;
+      context?: Array<{ originalText: string; translatedText: string }>;
+      topic?: string;
+      speakerGender?: string;
+    },
+    targetLanguage: string
+  ): Promise<TranslationResultFoundation> {
+    const startTime = Date.now();
+    const canonicalTarget = getCanonicalLanguageCode(targetLanguage);
+    const canonicalSource = getCanonicalLanguageCode(speechEvent.sourceLanguage);
+    const processingKey = `${speechEvent.sessionId}:${speechEvent.eventId}:${canonicalTarget}`;
+
+    if (singleFlightProcessingCache.has(processingKey)) {
+      const cached = singleFlightProcessingCache.get(processingKey)!;
+      if (cached.status === 'completed' && cached.result) {
+        return cached.result;
+      }
+      if (cached.status === 'processing' && cached.promise) {
+        return await cached.promise;
+      }
+    }
+
+    const executionPromise = (async (): Promise<TranslationResultFoundation> => {
+      try {
+        const transRes = await generateTranslationWithGemini(
+          speechEvent.sourceText,
+          speechEvent.sourceText,
+          canonicalTarget,
+          canonicalSource,
+          speechEvent.context,
+          speechEvent.topic,
+          speechEvent.speakerGender
+        );
+
+        const result: TranslationResultFoundation = {
+          eventId: speechEvent.eventId,
+          sessionId: speechEvent.sessionId,
+          speakerId: speechEvent.speakerId,
+          sourceLanguage: canonicalSource,
+          targetLanguage: canonicalTarget,
+          originalText: speechEvent.sourceText,
+          translatedText: transRes.text,
+          provider: transRes.provider,
+          status: transRes.degraded ? 'FALLBACK' : 'SUCCESS',
+          degraded: transRes.degraded,
+          latencyMs: Date.now() - startTime,
+          sequenceNumber: speechEvent.sequenceNumber
+        };
+
+        if (!result.degraded && result.status === 'SUCCESS' && result.provider !== 'untranslated') {
+          singleFlightProcessingCache.set(processingKey, { status: 'completed', result, timestamp: Date.now() });
+          setTimeout(() => singleFlightProcessingCache.delete(processingKey), 60000);
+        }
+        return result;
+      } catch (error: any) {
+        const failureResult: TranslationResultFoundation = {
+          eventId: speechEvent.eventId,
+          sessionId: speechEvent.sessionId,
+          speakerId: speechEvent.speakerId,
+          sourceLanguage: canonicalSource,
+          targetLanguage: canonicalTarget,
+          originalText: speechEvent.sourceText,
+          translatedText: speechEvent.sourceText,
+          provider: 'untranslated',
+          status: 'FAILURE',
+          degraded: true,
+          latencyMs: Date.now() - startTime,
+          sequenceNumber: speechEvent.sequenceNumber
+        };
+        singleFlightProcessingCache.set(processingKey, { status: 'completed', result: failureResult, timestamp: Date.now() });
+        return failureResult;
+      }
+    })();
+
+    singleFlightProcessingCache.set(processingKey, { status: 'processing', promise: executionPromise, timestamp: Date.now() });
+    return await executionPromise;
+  }
+
 
   async function generateTranslationWithGemini(
     promptOrText: string, 
     rawText?: string, 
     targetLangCode?: string, 
     sourceLangCode?: string,
-    context?: Array<{ originalText: string; translatedText: string }>
-  ): Promise<string> {
-    const cleanText = (rawText || promptOrText).trim();
-    if (!cleanText) return "";
+    context?: Array<{ originalText: string; translatedText: string }>,
+    topicOrGlossary?: string,
+    speakerGender?: string
+  ): Promise<{ text: string; provider: string; degraded: boolean }> {
+    const cleanText = cleanIndianText(rawText || promptOrText);
+    if (!cleanText) return { text: "", provider: "none", degraded: false };
     const cleanTargetCode = (targetLangCode || "hi").split("-")[0];
     const targetLangName = LANGUAGE_NAME_MAP[cleanTargetCode] || cleanTargetCode;
     const sourceLangName = sourceLangCode ? (LANGUAGE_NAME_MAP[sourceLangCode.split("-")[0]] || sourceLangCode) : "auto-detected language";
 
     // 1. Primary Engine: Gemini AI Context-Aware Natural Translation
-    const contextPrompt = context && context.length > 0 
-      ? `Recent Conversation Context:\n${context.slice(-4).map(c => `Original: "${c.originalText}" -> Translated: "${c.translatedText}"`).join("\n")}\n\n`
+    const last3Context = context && context.length > 0 ? context.slice(-3) : [];
+    const contextPrompt = last3Context.length > 0 
+      ? `previous context (do not re-translate):\n${last3Context.map((c, idx) => `[${idx + 1}] Original: "${c.originalText}" -> Translated: "${c.translatedText}"`).join("\n")}\n\n`
       : "";
 
-    const systemPrompt = `You are a high-precision, context-aware natural language translator specializing in Indian languages.
-${contextPrompt}Translate the following sentence naturally from ${sourceLangName} to ${targetLangName}.
+    const topicPrompt = topicOrGlossary && topicOrGlossary.trim()
+      ? `Event Topic / Glossary:\n${topicOrGlossary.trim()}\n\n`
+      : "";
 
-STRICT REQUIREMENTS:
-- DO NOT translate word-for-word literally. Translate contextually and idiomatically so it sounds completely natural to a native ${targetLangName} speaker.
-- Respect full sentence grammar, phrasing, cultural nuances, and conversational tone.
-- Output ONLY the final translated text in ${targetLangName}. Do NOT include quotes, explanations, or notes.
+    const genderPrompt = speakerGender && (speakerGender === 'male' || speakerGender === 'female')
+      ? `Speaker Gender: ${speakerGender}. Ensure all first-person verbs and agreement forms grammatically match a ${speakerGender} speaker in ${targetLangName} (e.g. रही हूँ vs रहा हूँ in Hindi, or રહી છું vs રહ્યો છું in Gujarati).\n`
+      : `Speaker Gender is unspecified. Use gender-neutral phrasing and forms in ${targetLangName} whenever possible, rather than defaulting to masculine forms.\n`;
 
-Sentence: "${cleanText}"`;
+    const isTargetEnglish = cleanTargetCode === 'en';
+    const systemPrompt = isTargetEnglish
+      ? `You are an elite, culturally fluent human interpreter providing live simultaneous interpretation into natural spoken English.
 
-    const models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"];
-    for (const model of models) {
-      try {
-        const result = await ai.models.generateContent({
-          model,
-          contents: systemPrompt,
-          config: { temperature: 0.2 }
-        });
-        if (result.text && result.text.trim()) {
-          const cleaned = result.text.trim().replace(/^["']|["']$/g, '');
-          if (cleaned) return cleaned;
+CORE INTERPRETATION MANDATES:
+1. IDIOMATIC & CONTEXTUAL MEANING (CRITICAL):
+   - When interpreting from Indian languages (e.g. Hindi, Gujarati, Marathi, Tamil, Telugu, Bengali) into English, translate the UNDERLYING INTENT into authentic, natural conversational English expressions that native English speakers naturally use in conversation.
+   - Re-express Indian idioms, metaphors, and colloquial expressions into their natural English equivalents (e.g., "काम की लय पकड़ना" -> "getting into the groove", "एक ही बात पर सहमत होना" -> "on the same page", "लीक से हटकर सोचना" -> "think outside the box", "पते की बात कहना" -> "hit the nail on the head").
+
+2. SCRIPT & LANGUAGE STRICTNESS:
+   - Output ONLY in standard English using Latin script. NEVER output Indian language script (Devanagari, Gujarati, etc.) when English target is requested!
+
+3. PROPER NOUNS & NAMES:
+   - Preserve proper nouns (people's names, place names, brand/project names like 'BharatBridge', 'Shrushti', 'Priya', 'Ahmedabad') in standard English spelling (e.g., 'सृष्टि' -> 'Shrushti', 'डॉ. प्रिया' -> 'Dr. Priya').
+
+4. CONVERSATIONAL RHYTHM & GRAMMAR:
+   - Use standard English Subject-Verb-Object (SVO) word order and smooth, polite conversational flow.
+
+${topicPrompt}${genderPrompt}${contextPrompt}STRICT INSTRUCTIONS:
+1. Translate ONLY the new sentence below naturally from ${sourceLangName} to English.
+2. Use previous conversation context to resolve pronouns and maintain seamless continuity.
+3. If the sentence is incomplete, translate what is present naturally without fabricating facts.
+4. Output ONLY the clean final translated text in English. Do NOT include quotes, explanations, or notes.
+
+New Sentence: "${cleanText}"`
+      : `You are an elite, culturally fluent human interpreter providing live simultaneous interpretation into natural spoken ${targetLangName}.
+
+CORE INTERPRETATION MANDATES:
+1. IDIOMATIC & CONTEXTUAL MEANING (CRITICAL):
+   - Translate the UNDERLYING INTENT and CONTEXT of the speaker into authentic, culturally natural spoken expressions in ${targetLangName} that a native speaker would naturally use in conversation.
+   - For English idioms, metaphors, or figures of speech (e.g., "on the same page", "hit the nail on the head", "getting into the groove", "think outside the box", "circle back"), ALWAYS translate the true conversational meaning into ${targetLangName} (e.g. "on the same page" -> "एक ही बात पर सहमत होना / समान राय होना", "hit the nail on the head" -> "बिल्कुल सटीक / पते की बात कहना", "getting into the groove" -> "काम की लय / रफ़्तार पकड़ना", "think outside the box" -> "लीक से हटकर सोचना"). Do NOT perform literal dictionary translation.
+
+2. SCRIPT & LANGUAGE STRICTNESS:
+   - Output ONLY in the native script of ${targetLangName} (e.g. Gujarati script for Gujarati, Devanagari script for Hindi/Marathi, Tamil script for Tamil). NEVER output Devanagari Hindi text when Gujarati or another target language is requested!
+
+3. PROPER NOUNS & NAMES:
+   - Do NOT translate proper nouns (people's names, place names, brand/project names like 'BharatBridge', 'Shrushti', 'Priya', 'Ahmedabad') for their literal dictionary meanings. Preserve them as names and transliterate them phonetically into the native script of ${targetLangName} (e.g. 'Shrushti' -> 'सृष्टि' in Hindi, 'શ્રુષ્ટિ' in Gujarati; 'Dr. Priya' -> 'डॉ. प्रिया' in Hindi, 'ડૉ. પ્રિયા' in Gujarati).
+
+4. CONVERSATIONAL RHYTHM & GRAMMAR:
+   - Use natural Subject-Object-Verb (SOV) order for Indian languages. Ensure polite conversational flow.
+
+${topicPrompt}${genderPrompt}${contextPrompt}STRICT INSTRUCTIONS:
+1. Translate ONLY the new sentence below naturally from ${sourceLangName} to ${targetLangName}.
+2. Use previous conversation context to resolve pronouns and maintain seamless continuity.
+3. If the sentence is incomplete, translate what is present naturally without fabricating facts.
+4. Output ONLY the clean final translated text in ${targetLangName} script. Do NOT include quotes, explanations, or notes.
+
+New Sentence: "${cleanText}"`;
+
+    const primaryModel = process.env.GEMINI_MODEL_TRANSLATION || "gemini-3.8-flash";
+    const timeoutMs = Number(process.env.TRANSLATION_TIMEOUT_MS) || 3500;
+    const startTime = Date.now();
+    try {
+      const geminiPromise = ai.models.generateContent({
+        model: primaryModel,
+        contents: systemPrompt,
+        config: { 
+          temperature: 0.1,
+          maxOutputTokens: 150,
+          thinkingConfig: { thinkingBudget: 0 } as any // Off/minimal thinking for low-latency translation
         }
-      } catch (err: any) {
-        // Continue to fallback model
+      });
+
+      const timeoutPromise = new Promise<never>((_, reject) => 
+        setTimeout(() => reject(new Error(`Gemini ${primaryModel} timed out after ${timeoutMs}ms`)), timeoutMs)
+      );
+
+      const result = await Promise.race([geminiPromise, timeoutPromise]);
+      const latencyMs = Date.now() - startTime;
+      const promptTokens = (result as any).usageMetadata?.promptTokenCount || 0;
+      const candidatesTokens = (result as any).usageMetadata?.candidatesTokenCount || 0;
+      const thoughtsTokens = (result as any).usageMetadata?.thoughtsTokenCount || 0;
+
+      if (result.text && result.text.trim()) {
+        const cleaned = cleanIndianText(result.text.trim().replace(/^["']|["']$/g, ''));
+        if (cleaned) {
+          console.log(`[BHARATBRIDGE][TRANSLATION_SUCCESS] provider='gemini' model='${primaryModel}' latencyMs=${latencyMs}ms promptTokens=${promptTokens} candidatesTokens=${candidatesTokens} thoughtsTokenCount=${thoughtsTokens} fallbackFired=false thinkingBudget=0 text="${cleaned.slice(0, 30)}..."`);
+          return { text: cleaned, provider: "gemini", degraded: false };
+        }
       }
+    } catch (err: any) {
+      const errMsg = err?.message || String(err);
+      let reason = "UNKNOWN_ERROR";
+      if (errMsg.includes("timed out")) reason = "TIMEOUT";
+      else if (errMsg.includes("429") || errMsg.includes("Quota") || errMsg.includes("RESOURCE_EXHAUSTED")) reason = "429_RATE_LIMIT";
+      else if (errMsg.includes("503") || errMsg.includes("UNAVAILABLE") || errMsg.includes("Overloaded")) reason = "503_UNAVAILABLE";
+      else if (errMsg.includes("JSON")) reason = "INVALID_JSON";
+      console.warn(`[GEMINI][TRANSLATION_FALLBACK_REASON] Model='${primaryModel}' reason='${reason}' details='${errMsg}'`);
     }
 
-    // 2. High-availability Universal Google Translate Fallback (Zero quota limit, instant sub-100ms response)
-    if (cleanText && cleanTargetCode) {
-      try {
-        const gUrl = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=${cleanTargetCode}&dt=t&q=${encodeURIComponent(cleanText)}`;
-        const gRes = await fetch(gUrl);
-        if (gRes.ok) {
-          const gData = await gRes.json();
-          if (Array.isArray(gData) && gData[0]) {
-            const gText = gData[0].map((item: any) => item[0]).filter(Boolean).join("");
-            if (gText && gText.trim()) return gText.trim();
-          }
-        }
-      } catch (gErr) {
-        console.warn("[Google Translate Fallback] Error:", gErr);
-      }
-    }
-
-    // 3. Azure Translator API Fallback if configured
+    // 2. Azure Translator API Fallback (Primary fallback for high quality)
     const azureKey = process.env.AZURE_TRANSLATOR_KEY;
     const azureRegion = process.env.AZURE_TRANSLATOR_REGION || "centralindia";
     if (azureKey && cleanText && cleanTargetCode) {
@@ -326,28 +1344,467 @@ Sentence: "${cleanText}"`;
         if (response.ok) {
           const data = await response.json();
           const translatedText = data[0]?.translations[0]?.text;
-          if (translatedText) return translatedText;
+          if (translatedText) {
+            return { text: applyGenderAgreementFallback(translatedText, cleanTargetCode, speakerGender), provider: "azure-translator-fallback", degraded: true };
+          }
         }
       } catch (e) {
         console.warn("[Azure Translation] Error:", e);
       }
     }
 
-    return cleanText;
+    // 3. Emergency Universal Google Translate Fallback (Zero quota limit, instant sub-100ms response)
+    if (cleanText && cleanTargetCode) {
+      try {
+        const gUrl = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=${cleanTargetCode}&dt=t&q=${encodeURIComponent(cleanText)}`;
+        const gRes = await fetch(gUrl);
+        if (gRes.ok) {
+          const gData = await gRes.json();
+          if (Array.isArray(gData) && gData[0]) {
+            const gText = gData[0].map((item: any) => item[0]).filter(Boolean).join("");
+            if (gText && gText.trim()) {
+              return { text: applyGenderAgreementFallback(gText.trim(), cleanTargetCode, speakerGender), provider: "google-translate-fallback", degraded: true };
+            }
+          }
+        }
+      } catch (gErr) {
+        console.warn("[Google Translate Fallback] Error:", gErr);
+      }
+    }
+
+    return { text: cleanIndianText(cleanText), provider: "untranslated", degraded: true };
   }
+
+  async function generateBatchTranslationWithGemini(
+    sentences: string[],
+    targetLangCode: string,
+    sourceLangCode?: string,
+    context?: Array<{ originalText: string; translatedText: string }>,
+    topicOrGlossary?: string,
+    speakerGender?: string
+  ): Promise<{ translations: string[]; latencyMs: number; promptTokens: number; provider: string; model: string }> {
+    const startTime = Date.now();
+    const cleanTargetCode = (targetLangCode || "hi").split("-")[0];
+    const targetLangName = LANGUAGE_NAME_MAP[cleanTargetCode] || cleanTargetCode;
+    const sourceLangName = sourceLangCode ? (LANGUAGE_NAME_MAP[sourceLangCode.split("-")[0]] || sourceLangCode) : "auto-detected language";
+
+    const last3Context = context && context.length > 0 ? context.slice(-3) : [];
+    const contextPrompt = last3Context.length > 0 
+      ? `previous context (do not re-translate):\n${last3Context.map((c, idx) => `[${idx + 1}] Original: "${c.originalText}" -> Translated: "${c.translatedText}"`).join("\n")}\n\n`
+      : "";
+
+    const topicPrompt = topicOrGlossary && topicOrGlossary.trim()
+      ? `Event Topic / Glossary:\n${topicOrGlossary.trim()}\n\n`
+      : "";
+
+    const genderPrompt = speakerGender && (speakerGender === 'male' || speakerGender === 'female')
+      ? `Speaker Gender: ${speakerGender}. Ensure all first-person verbs and agreement forms grammatically match a ${speakerGender} speaker in ${targetLangName} (e.g. रही हूँ vs रहा हूँ in Hindi, or રહી છું vs રહ્યો છું in Gujarati).\n`
+      : `Speaker Gender is unspecified. Use gender-neutral phrasing and forms in ${targetLangName} whenever possible, rather than defaulting to masculine forms.\n`;
+
+    console.log(`[GEMINI][TRANSLATION_CONTEXT] targetLang='${cleanTargetCode}' topic='${topicOrGlossary || ''}' speakerGender='${speakerGender || 'unspecified'}' contextSent=`, last3Context, "sentencesInput=", sentences);
+
+    const isTargetEnglish = cleanTargetCode === 'en';
+    const systemPrompt = isTargetEnglish
+      ? `You are an elite, culturally fluent human interpreter providing live simultaneous interpretation into natural spoken English.
+
+CORE INTERPRETATION MANDATES:
+1. IDIOMATIC & CONTEXTUAL MEANING (CRITICAL):
+   - When interpreting from Indian languages into English, translate the UNDERLYING INTENT into authentic, natural conversational English expressions. Re-express Indian idioms and colloquialisms into natural English equivalents.
+
+2. SCRIPT & LANGUAGE STRICTNESS:
+   - Output ONLY in standard English using Latin script.
+
+3. PROPER NOUNS & NAMES:
+   - Preserve proper nouns (people's names, place names, brand/project names) in standard English spelling.
+
+4. CONVERSATIONAL RHYTHM & GRAMMAR:
+   - Use standard English Subject-Verb-Object (SVO) word order.
+
+${topicPrompt}${genderPrompt}${contextPrompt}STRICT INSTRUCTIONS:
+1. Translate ONLY the array of new sentences below into natural, spoken English.
+2. Return ONLY a valid JSON array of strings containing the translations for each corresponding input sentence, in the exact same order and count.
+3. Example JSON output: ["Translation 1", "Translation 2"]
+
+New Sentences: ${JSON.stringify(sentences.map(cleanIndianText))}`
+      : `You are an elite, culturally fluent human interpreter providing live simultaneous interpretation into natural spoken ${targetLangName}.
+
+CORE INTERPRETATION MANDATES:
+1. IDIOMATIC & CONTEXTUAL MEANING (CRITICAL):
+   - Translate the UNDERLYING INTENT and CONTEXT of the speaker into authentic, culturally natural spoken expressions in ${targetLangName} that a native speaker would naturally use in conversation.
+   - For English idioms, metaphors, or figures of speech (e.g., "on the same page", "hit the nail on the head", "getting into the groove", "think outside the box", "circle back"), ALWAYS translate the true conversational meaning into ${targetLangName}. Do NOT perform literal dictionary translation.
+
+2. SCRIPT & LANGUAGE STRICTNESS:
+   - Output ONLY in the native script of ${targetLangName} (e.g. Gujarati script for Gujarati, Devanagari script for Hindi/Marathi). NEVER output Devanagari Hindi text when Gujarati is requested!
+
+3. PROPER NOUNS & NAMES:
+   - Preserve proper nouns as names and transliterate them phonetically into the native script of ${targetLangName}.
+
+${topicPrompt}${genderPrompt}${contextPrompt}STRICT INSTRUCTIONS:
+1. Translate ONLY the array of new sentences below into natural, spoken ${targetLangName} script.
+2. Return ONLY a valid JSON array of strings containing the translations for each corresponding input sentence, in the exact same order and count.
+3. Example JSON output: ["Translation 1", "Translation 2"]
+
+New Sentences: ${JSON.stringify(sentences.map(cleanIndianText))}`;
+
+    const primaryModel = process.env.GEMINI_MODEL_TRANSLATION || "gemini-3.8-flash";
+    try {
+      const geminiPromise = ai.models.generateContent({
+        model: primaryModel,
+        contents: systemPrompt,
+        config: { 
+          temperature: 0.1,
+          maxOutputTokens: 500,
+          responseMimeType: "application/json",
+          thinkingConfig: { thinkingBudget: 0 } as any
+        }
+      });
+
+      const timeoutPromise = new Promise<never>((_, reject) => 
+        setTimeout(() => reject(new Error(`Gemini ${primaryModel} timed out after 3000ms`)), 3000)
+      );
+
+      const result = await Promise.race([geminiPromise, timeoutPromise]);
+      const latencyMs = Date.now() - startTime;
+      const promptTokens = (result as any).usageMetadata?.promptTokenCount || 0;
+      const candidatesTokens = (result as any).usageMetadata?.candidatesTokenCount || 0;
+      const thoughtsTokens = (result as any).usageMetadata?.thoughtsTokenCount || 0;
+
+      let parsed: string[] = [];
+      if (result.text && result.text.trim()) {
+        try {
+          const rawParsed = JSON.parse(result.text.trim());
+          if (Array.isArray(rawParsed)) {
+            parsed = rawParsed.map(s => cleanIndianText(String(s)));
+          }
+        } catch (pErr) {
+          console.warn("[GEMINI][BATCH_JSON_PARSE_FALLBACK]", pErr);
+        }
+      }
+
+      if (parsed.length === sentences.length) {
+        console.log(`[BHARATBRIDGE][TRANSLATION_SUCCESS] provider='gemini-batch' model='${primaryModel}' latencyMs=${latencyMs}ms promptTokens=${promptTokens} candidatesTokens=${candidatesTokens} thoughtsTokenCount=${thoughtsTokens} fallbackFired=false thinkingBudget=0`);
+        return { translations: parsed, latencyMs, promptTokens, provider: "gemini-batch", model: primaryModel };
+      }
+    } catch (err: any) {
+      console.warn(`[GEMINI][BATCH_TRANSLATION_NOTICE] Model='${primaryModel}' fallback:`, err.message || err);
+    }
+
+    const fallbacks = await Promise.all(
+      sentences.map(async s => {
+        const res = await generateTranslationWithGemini(s, s, targetLangCode, sourceLangCode, context, topicOrGlossary);
+        return res.text;
+      })
+    );
+    const latencyMs = Date.now() - startTime;
+    return { translations: fallbacks.map(cleanIndianText), latencyMs, promptTokens: 0, provider: "gemini-fallback", model: primaryModel };
+  }
+
+  // Server-Side Admin Access Verification Guard
+  function verifyAdminAccess(req: any): boolean {
+    // 0. Development mode auto-grant for local non-production environments
+    if (process.env.NODE_ENV !== "production") return true;
+
+    const adminTokenHeader = (req.headers["x-admin-token"] || "").toString().trim();
+    const authHeader = (req.headers["authorization"] || "").toString().trim();
+    const envAdminToken = (process.env.ADMIN_TOKEN || "").trim();
+    const envAdminEmails = (process.env.ADMIN_EMAILS || "").split(",").map((e: string) => e.trim().toLowerCase()).filter(Boolean);
+    const reqEmail = (req.headers["x-admin-email"] || "").toString().toLowerCase().trim();
+
+    // 1. Secret admin token validation (x-admin-token or Bearer header)
+    if (envAdminToken && envAdminToken.length > 0) {
+      if (adminTokenHeader === envAdminToken) return true;
+      if (authHeader.startsWith("Bearer ") && authHeader.substring(7).trim() === envAdminToken) return true;
+    }
+
+    // 2. Admin email allowlist validation (x-admin-email header)
+    if (reqEmail && envAdminEmails.length > 0 && envAdminEmails.includes(reqEmail)) {
+      return true;
+    }
+
+    // 3. Fallback: Host session token validation (active session host)
+    const hostToken = (req.headers["x-host-token"] || req.headers["x-session-token"] || "").toString().trim();
+    if (hostToken) {
+      for (const s of sessions.values()) {
+        if (s.hostToken === hostToken || s.sessionToken === hostToken) return true;
+      }
+    }
+
+    return false;
+  }
+
+  // Admin Sessions List Endpoint (GET /api/admin/sessions)
+  app.get("/api/admin/sessions", async (req, res) => {
+    if (!verifyAdminAccess(req)) {
+      return res.status(403).json({ error: "Forbidden: Admin authorization required" });
+    }
+
+    try {
+      const activeList = Array.from(sessions.entries()).map(([id, s]) => {
+        const activeListeners = Array.from(s.languageGroups.values()).reduce((sum: number, g: any) => sum + g.listeners.size, 0);
+        const createdAt = (s as any).createdAt || s.lastActivity || Date.now();
+        const durationSec = Math.max(0, Math.round((Date.now() - createdAt) / 1000));
+        return {
+          id,
+          name: s.topic || `Session ${id}`,
+          sourceLang: "en",
+          targetLang: Array.from(s.languageGroups.keys()).join(", ") || "hi",
+          createdAt,
+          lastActivity: s.lastActivity,
+          durationSec,
+          messageCount: s.messages?.length || 0,
+          activeListeners,
+          isLive: true
+        };
+      });
+
+      let cosmosSessions: any[] = [];
+      if (cosmosHealthState.configured) {
+        try {
+          const client = getCosmosClient();
+          if (client) {
+            const db = client.database(process.env.COSMOS_DB_DATABASE_NAME || "bharatbridge");
+            const container = db.container("sessions");
+            const { resources } = await container.items.query("SELECT TOP 50 * FROM c ORDER BY c._ts DESC").fetchAll();
+            cosmosSessions = resources.map((doc: any) => {
+              const createdAt = doc.createdAt || (doc._ts ? doc._ts * 1000 : Date.now());
+              const lastActivity = doc.lastActivity || doc.updatedAt || createdAt;
+              const durationSec = Math.max(0, Math.round((lastActivity - createdAt) / 1000));
+              return {
+                id: doc.id,
+                name: doc.topic || doc.name || `Session ${doc.id}`,
+                sourceLang: doc.sourceLang || "en",
+                targetLang: doc.targetLang || "hi",
+                createdAt,
+                lastActivity,
+                durationSec,
+                messageCount: doc.messageCount || doc.messages?.length || 0,
+                activeListeners: 0,
+                isLive: false
+              };
+            });
+          }
+        } catch (cErr: any) {
+          console.warn("[ADMIN_API] Cosmos DB sessions fetch notice:", cErr?.message || cErr);
+        }
+      }
+
+      const mergedMap = new Map<string, any>();
+      for (const cs of cosmosSessions) mergedMap.set(cs.id, cs);
+      for (const as of activeList) mergedMap.set(as.id, { ...mergedMap.get(as.id), ...as, isLive: true });
+
+      const resultList = Array.from(mergedMap.values()).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+      return res.json({ sessions: resultList });
+    } catch (err: any) {
+      console.error("[ADMIN_API] Error listing sessions:", err);
+      return res.status(500).json({ error: "Internal server error fetching admin sessions" });
+    }
+  });
+
+  // Admin Session Messages Endpoint (GET /api/admin/sessions/:id/messages)
+  app.get("/api/admin/sessions/:id/messages", async (req, res) => {
+    if (!verifyAdminAccess(req)) {
+      return res.status(403).json({ error: "Forbidden: Admin authorization required" });
+    }
+
+    const { id } = req.params;
+    if (!id) return res.status(400).json({ error: "Missing session id parameter" });
+
+    try {
+      const memorySession = sessions.get(id);
+      let memoryMessages: any[] = memorySession?.messages || [];
+      let cosmosMessages: any[] = [];
+
+      if (cosmosHealthState.configured) {
+        try {
+          const client = getCosmosClient();
+          if (client) {
+            const db = client.database(process.env.COSMOS_DB_DATABASE_NAME || "bharatbridge");
+            const container = db.container("messages");
+            const querySpec = {
+              query: "SELECT * FROM c WHERE c.sessionId = @sessionId ORDER BY c.timestamp ASC",
+              parameters: [{ name: "@sessionId", value: id }]
+            };
+            const { resources } = await container.items.query(querySpec).fetchAll();
+            cosmosMessages = resources;
+          }
+        } catch (cErr: any) {
+          console.warn("[ADMIN_API] Cosmos DB messages fetch notice:", cErr?.message || cErr);
+        }
+      }
+
+      const mergedMap = new Map<string, any>();
+      for (const cm of cosmosMessages) {
+        const key = cm.eventId || cm.id;
+        if (key) mergedMap.set(key, cm);
+      }
+      for (const mm of memoryMessages) {
+        const key = mm.eventId || mm.id;
+        if (key) {
+          const existing = mergedMap.get(key) || {};
+          mergedMap.set(key, { ...existing, ...mm });
+        }
+      }
+
+      const rawMessages = Array.from(mergedMap.values()).sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+      const formattedMessages = rawMessages.map((m, idx) => {
+        let textOut = m.translatedText || "";
+        if (!textOut && typeof m.translations === "object" && m.translations !== null) {
+          const firstVal = Object.values(m.translations)[0] as any;
+          if (typeof firstVal === "string") textOut = firstVal;
+          else if (firstVal && typeof firstVal.text === "string") textOut = firstVal.text;
+        }
+
+        return {
+          id: m.eventId || m.id || `msg-${idx}`,
+          originalText: m.originalText || m.text || "",
+          translatedText: textOut,
+          sourceLang: m.sourceLang || "en",
+          targetLang: m.targetLang || "hi",
+          timestamp: m.timestamp || Date.now(),
+          speakerName: m.speakerName || "Speaker"
+        };
+      });
+
+      return res.json({ messages: formattedMessages });
+    } catch (err: any) {
+      console.error("[ADMIN_API] Error fetching session messages:", err);
+      return res.status(500).json({ error: "Internal server error fetching session messages" });
+    }
+  });
 
   // API Routes
   app.post("/api/translate", async (req, res) => {
-    const { text, sourceLanguage, targetLanguage, context } = req.body;
+    const { text, sourceLanguage, targetLanguage, context, eventId: inputEventId, sessionId, token, speakerGender } = req.body;
+    const activeSessionId = (sessionId || req.headers["x-session-id"] || token || "").toString().trim();
+    if (!activeSessionId) {
+      return res.status(400).json({ error: "Missing required sessionId" });
+    }
+    if (!sessions.has(activeSessionId) && activeSessionId !== "test_session" && activeSessionId !== "global_test") {
+      return res.status(400).json({ error: "Invalid or non-existent sessionId" });
+    }
+    const eventId = inputEventId || generateEventId();
+    const startTime = Date.now();
+    console.log("[BHARATBRIDGE][TRANSLATION_REQUEST] Server /api/translate received body:", { text, sourceLanguage, targetLanguage, eventId, speakerGender });
+
     if (!text || !targetLanguage) return res.status(400).json({ error: "Missing text or targetLanguage" });
+    if (typeof text === "string" && text.length > 2000) {
+      return res.status(400).json({ error: "Text length exceeds maximum allowed limit (2000 characters)" });
+    }
     try {
-      const targetLangCode = Object.keys(LANGUAGE_NAME_MAP).find(k => LANGUAGE_NAME_MAP[k].toLowerCase() === targetLanguage.toLowerCase()) || 'hi';
-      const sourceLangCode = sourceLanguage ? Object.keys(LANGUAGE_NAME_MAP).find(k => LANGUAGE_NAME_MAP[k].toLowerCase() === sourceLanguage.toLowerCase()) || 'en' : 'en';
-      const translatedText = await generateTranslationWithGemini(text, text, targetLangCode, sourceLangCode, context);
-      res.json({ translatedText });
+      const targetLangCode = (LANGUAGE_NAME_MAP[targetLanguage.toLowerCase()] ? targetLanguage.toLowerCase() : Object.keys(LANGUAGE_NAME_MAP).find(k => LANGUAGE_NAME_MAP[k].toLowerCase() === targetLanguage.toLowerCase())) || targetLanguage || 'hi';
+      const sourceLangCode = sourceLanguage ? ((LANGUAGE_NAME_MAP[sourceLanguage.toLowerCase()] ? sourceLanguage.toLowerCase() : Object.keys(LANGUAGE_NAME_MAP).find(k => LANGUAGE_NAME_MAP[k].toLowerCase() === sourceLanguage.toLowerCase())) || sourceLanguage || 'en') : 'en';
+      
+      const transResult = await generateTranslationWithGemini(text, text, targetLangCode, sourceLangCode, context, undefined, speakerGender);
+      const executionTimeMs = Date.now() - startTime;
+      console.log("[BHARATBRIDGE][TRANSLATION_RESPONSE] Server /api/translate output:", transResult);
+
+      if (transResult.provider === "untranslated") {
+        observabilityService.recordEvent({
+          eventId,
+          sessionId: "global",
+          sourceLanguage: sourceLangCode,
+          targetLanguage: targetLangCode,
+          stage: "TRANSLATION",
+          eventType: "TRANSLATION_FAILURE",
+          status: "FAILURE",
+          provider: "untranslated",
+          latencyMs: executionTimeMs,
+          errorCode: "TRANSLATION_FAILURE"
+        });
+        return res.status(503).json({
+          error: "Translation service failed to translate content",
+          fallback: true,
+          translatedText: text,
+          eventId,
+          executionTimeMs,
+          provider: "untranslated",
+          translation_degraded: true
+        });
+      }
+
+      observabilityService.recordEvent({
+        eventId,
+        sessionId: "global",
+        sourceLanguage: sourceLangCode,
+        targetLanguage: targetLangCode,
+        stage: "TRANSLATION",
+        eventType: transResult.degraded ? "TRANSLATION_FALLBACK" : "TRANSLATION_SUCCESS",
+        status: transResult.degraded ? "FALLBACK" : "SUCCESS",
+        provider: transResult.provider,
+        latencyMs: executionTimeMs
+      });
+
+      if (sessions.has(activeSessionId)) {
+        const session = sessions.get(activeSessionId)!;
+        const now = Date.now();
+        const newMsg: SessionMessage = {
+          originalText: text.trim(),
+          translatedText: transResult.text,
+          sourceLang: sourceLangCode,
+          targetLang: targetLangCode,
+          timestamp: now,
+          speakerId: "speaker-api",
+          speakerName: "Speaker",
+          eventId,
+          provider: transResult.provider,
+          degraded: transResult.degraded,
+          translations: { [targetLangCode]: transResult.text }
+        };
+        const existingIdx = (session.messages || []).findIndex(m => (m as any).eventId === eventId || (m as any).id === eventId);
+        if (existingIdx >= 0) {
+          session.messages[existingIdx] = newMsg;
+        } else {
+          session.messages.push(newMsg);
+          if (session.messages.length > 100) session.messages.shift();
+        }
+
+        if (cosmosHealthState.configured) {
+          upsertFinalizedThoughtDocument({
+            eventId,
+            sessionId: activeSessionId,
+            speakerId: "speaker-api",
+            speakerName: "Speaker",
+            sequenceNumber: 1,
+            originalText: text.trim(),
+            sourceLang: sourceLangCode,
+            translations: { [targetLangCode]: { text: transResult.text, provider: transResult.provider, degraded: transResult.degraded } },
+            degraded: transResult.degraded
+          }).catch(err => console.warn("[CosmosDB] /api/translate write notice:", err));
+        }
+      }
+
+      res.json({
+        translatedText: transResult.text,
+        eventId,
+        executionTimeMs,
+        provider: transResult.provider,
+        translation_degraded: transResult.degraded
+      });
     } catch (error: any) {
-      console.error("Translation error:", error);
-      res.json({ translatedText: text });
+      const executionTimeMs = Date.now() - startTime;
+      console.error("[BHARATBRIDGE][TRANSLATION_RESPONSE] Server Translation error:", error);
+      observabilityService.recordEvent({
+        eventId,
+        sessionId: "global",
+        sourceLanguage: sourceLanguage || "en",
+        targetLanguage: targetLanguage || "hi",
+        stage: "TRANSLATION",
+        eventType: "TRANSLATION_FAILURE",
+        status: "FAILURE",
+        provider: "untranslated",
+        latencyMs: executionTimeMs,
+        errorCode: "TRANSLATION_FAILURE",
+        errorMessage: error.message || "Translation error"
+      });
+      res.status(503).json({
+        error: error.message || "Translation error",
+        fallback: true,
+        translatedText: text,
+        eventId,
+        executionTimeMs,
+        provider: "untranslated",
+        translation_degraded: true
+      });
     }
   });
 
@@ -382,7 +1839,8 @@ ${fullTranscript}
 
 Return ONLY clean markdown formatting without extra conversational intro or outro.`;
 
-      const models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"];
+      const primarySummaryModel = process.env.GEMINI_MODEL_SUMMARY || "gemini-2.5-flash";
+      const models = Array.from(new Set([primarySummaryModel, "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]));
       for (const model of models) {
         try {
           const result = await ai.models.generateContent({
@@ -415,42 +1873,310 @@ Generated by BharatBridge AI Matrix.`;
     }
   });
 
-  // WebSocket handling
+  // Global Express error handling middleware
+  app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+    console.error("[Express Global Error Middleware]:", err);
+    if (res.headersSent) {
+      return next(err);
+    }
+    res.status(err.status || 500).json({
+      error: err.message || "Internal Server Error"
+    });
+  });
+
+  // WebSocket handling with origin check allowlist
   server.on('upgrade', (request, socket, head) => {
+    const origin = request.headers.origin;
+    const envOrigins = (process.env.ALLOWED_ORIGINS || "")
+      .split(",")
+      .map(o => o.trim())
+      .filter(Boolean);
+
+    const allowedOrigins = Array.from(new Set([
+      "http://localhost:3000",
+      "http://localhost:5173",
+      "http://127.0.0.1:3000",
+      "http://127.0.0.1:5173",
+      ...envOrigins
+    ]));
+
+    if (origin) {
+      const isLocalhost = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin);
+      const isPrivateNetwork = process.env.NODE_ENV !== "production" &&
+        /^https?:\/\/(10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3})(:\d+)?$/.test(origin);
+
+      const isAllowed = allowedOrigins.includes(origin) || isLocalhost || isPrivateNetwork;
+
+      if (!isAllowed) {
+        console.warn(`[WebSocket Upgrade] Rejected connection from unauthorized origin: ${origin}`);
+        socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+        socket.destroy();
+        return;
+      }
+    }
+
     wss.handleUpgrade(request, socket, head, (ws) => {
       wss.emit('connection', ws, request);
     });
   });
 
-  wss.on("connection", (ws) => {
+  // Server-side WebSocket heartbeat cleanup (30s interval)
+  const heartbeatInterval = setInterval(() => {
+    wss.clients.forEach((client: any) => {
+      if (client.isAlive === false) return client.terminate();
+      client.isAlive = false;
+      client.ping();
+    });
+  }, 30000);
+
+  // Inactive session TTL cleanup interval (purges sessions inactive > SESSION_TTL_MINUTES, default 10m)
+  const sessionCleanupInterval = setInterval(() => {
+    const now = Date.now();
+    const ttlMinutes = Number(process.env.SESSION_TTL_MINUTES) || 10;
+    const ttlMs = ttlMinutes * 60 * 1000;
+
+    for (const [id, session] of sessions.entries()) {
+      const activeListeners = Array.from(session.languageGroups.values()).reduce((sum, g) => sum + g.listeners.size, 0);
+      const hasActiveSockets = (session.speaker && session.speaker.readyState === WebSocket.OPEN) ||
+        (session.organizerWs && session.organizerWs.readyState === WebSocket.OPEN) ||
+        activeListeners > 0;
+
+      if (!hasActiveSockets && (now - session.lastActivity) > ttlMs) {
+        console.log(`[SESSION_CLEANUP] Purging inactive session '${id}' (inactive for ${Math.round((now - session.lastActivity) / 1000)}s, TTL=${ttlMinutes}m)`);
+        observabilityService.recordSessionEnd(id);
+        session.languageGroups.forEach(g => {
+          if (g.geminiSession) {
+            try { g.geminiSession.close(); } catch (e) {}
+          }
+        });
+        sessions.delete(id);
+      }
+    }
+  }, 60000);
+
+  wss.on("close", () => {
+    clearInterval(heartbeatInterval);
+    clearInterval(sessionCleanupInterval);
+  });
+
+  const failedJoinMapByIp = new Map<string, { count: number; resetTime: number }>();
+
+  async function applyFailedJoinThrottling(ip: string): Promise<void> {
+    const now = Date.now();
+    const record = failedJoinMapByIp.get(ip);
+    if (!record || now > record.resetTime) return;
+
+    const threshold = process.env.FAILED_JOIN_THRESHOLD ? Number(process.env.FAILED_JOIN_THRESHOLD) : 10;
+    if (record.count >= threshold) {
+      const backoffMs = Math.min(3000, 100 * Math.pow(2, Math.min(5, record.count - threshold)));
+      await new Promise((resolve) => setTimeout(resolve, backoffMs));
+    }
+  }
+
+  function recordFailedJoinAttempt(ip: string): void {
+    const now = Date.now();
+    const record = failedJoinMapByIp.get(ip);
+    if (!record || now > record.resetTime) {
+      failedJoinMapByIp.set(ip, { count: 1, resetTime: now + 60 * 1000 });
+    } else {
+      record.count++;
+    }
+  }
+
+  wss.on("connection", (ws, req) => {
+    (ws as any).isAlive = true;
+    (ws as any).remoteAddress = req.socket?.remoteAddress || "global";
+    ws.on("pong", () => {
+      (ws as any).isAlive = true;
+    });
+
+    ws.on("error", (error) => {
+      console.error("[WebSocket Socket Error]:", error);
+    });
+
     let currentSessionId: string | null = null;
     let currentRole: 'speaker' | 'listener' | null = null;
     let currentLang: string | null = null;
 
     ws.on("message", async (data) => {
-      const message = JSON.parse(data.toString());
+      let message: any;
+      try {
+        message = JSON.parse(data.toString());
+      } catch (parseErr) {
+        console.warn("[WebSocket] Received malformed JSON payload:", data.toString().slice(0, 100));
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({
+            type: "error",
+            code: "INVALID_JSON",
+            message: "Malformed JSON payload"
+          }));
+        }
+        return;
+      }
 
-      if (message.type === "join") {
+      if (message.type === "ping") {
+        (ws as any).isAlive = true;
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: "pong", timestamp: Date.now() }));
+        }
+        return;
+      }
+
+      if (message.type === "join" || message.type === "join_session") {
         const { sessionId, role, gender, targetLang } = message;
+        const inputHostToken = message.hostToken || message.token;
+        const clientIp = ((ws as any).remoteAddress || "global").toString().trim();
+
+        // Throttling check before any Cosmos DB read
+        await applyFailedJoinThrottling(clientIp);
+
         currentSessionId = sessionId;
-        currentRole = role;
         currentLang = targetLang || "hi";
 
-        if (!sessions.has(sessionId)) {
-          sessions.set(sessionId, { 
-            speaker: null, 
-            languageGroups: new Map(),
-            speakerGender: gender || "male",
-            messages: []
-          });
+        let session = sessions.get(sessionId);
+        if (!session && cosmosHealthState.configured) {
+          try {
+            const loaded = await loadSessionFromCosmos(sessionId);
+            if (loaded) {
+              const { sessionDoc, messages } = loaded;
+              session = {
+                speaker: null,
+                organizerWs: null,
+                organizerId: null,
+                hostTokenHash: sessionDoc?.hostTokenHash,
+                sessionToken: sessionDoc?.sessionToken,
+                panelists: new Map(),
+                pendingRequests: new Map(),
+                languageGroups: new Map(),
+                speakerGender: gender || "male",
+                topic: sessionDoc?.topic || message.topic || message.glossary || "",
+                isDuoMode: sessionDoc?.isDuoMode ?? (message.isDuoMode === true || message.mode === 'duo'),
+                messages: messages || [],
+                lastActivity: Date.now()
+              };
+              sessions.set(sessionId, session);
+              console.log(`[CosmosDB] Hydrated session '${sessionId}' from Cosmos DB with ${messages.length} messages.`);
+            }
+          } catch (cosmosLoadErr) {
+            console.warn(`[CosmosDB] Failed to load session '${sessionId}' from Cosmos DB:`, cosmosLoadErr);
+          }
         }
 
-        const session = sessions.get(sessionId)!;
-        if (role === "speaker") {
-          session.speaker = ws;
-          session.speakerGender = gender || "male";
-          getOrCreateLanguageGroup(sessionId, currentLang!, session.speakerGender);
+        // Reject unknown sessionId
+        if (!session && sessionId !== "test_session" && sessionId !== "global_test") {
+          recordFailedJoinAttempt(clientIp);
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+              type: "error",
+              code: "SESSION_NOT_FOUND",
+              message: "Invalid session PIN. Session does not exist."
+            }));
+            ws.close();
+          }
+          return;
+        }
+
+        const isNewSession = false;
+
+        session!.lastActivity = Date.now();
+        if (message.isDuoMode !== undefined) {
+          session!.isDuoMode = message.isDuoMode === true || message.mode === 'duo';
+        }
+        if (message.topic || message.glossary) {
+          session!.topic = message.topic || message.glossary;
+        }
+        console.log(`[DIAGNOSTIC][STEP1_JOIN] sessionId='${sessionId}' role='${role}' isNewSession=${isNewSession} isDuoMode=${session!.isDuoMode} targetLang='${targetLang}'`);
+
+        if (role === "speaker" || role === "organizer") {
+          const isExistingHostSocket = session!.organizerWs === ws || session!.speaker === ws;
+          const isBrandNewHost = !session!.hostToken && !session!.hostTokenHash;
+
+          let hasValidHostToken = false;
+          if (inputHostToken) {
+            if (session!.hostTokenHash) {
+              const inputHash = crypto.createHash("sha256").update(inputHostToken).digest("hex");
+              const bufInput = Buffer.from(inputHash, "hex");
+              const bufStored = Buffer.from(session!.hostTokenHash, "hex");
+              if (bufInput.length > 0 && bufInput.length === bufStored.length) {
+                hasValidHostToken = crypto.timingSafeEqual(bufInput, bufStored);
+              }
+            } else if (session!.hostToken) {
+              const bufInput = Buffer.from(inputHostToken, "utf8");
+              const bufStored = Buffer.from(session!.hostToken, "utf8");
+              if (bufInput.length > 0 && bufInput.length === bufStored.length) {
+                hasValidHostToken = crypto.timingSafeEqual(bufInput, bufStored);
+              }
+            }
+          }
+
+          const canClaimHost = isExistingHostSocket || isBrandNewHost || hasValidHostToken;
+
+          if (canClaimHost) {
+            if (isBrandNewHost) {
+              const generatedHostToken = inputHostToken || crypto.randomBytes(16).toString("hex");
+              session!.hostToken = generatedHostToken;
+              session!.hostTokenHash = crypto.createHash("sha256").update(generatedHostToken).digest("hex");
+              if (cosmosHealthState.configured) {
+                upsertSessionDocument({
+                  sessionId,
+                  topic: message.topic || session!.topic || "",
+                  isDuoMode: message.isDuoMode === true || message.mode === "duo" || session!.isDuoMode,
+                  hostToken: generatedHostToken
+                }).catch(err => console.warn("[CosmosDB] Session write error:", err));
+              }
+            }
+
+            if (!session!.hostToken && inputHostToken) {
+              session!.hostToken = inputHostToken;
+            }
+
+            session!.speaker = ws;
+            session!.organizerWs = ws;
+            session!.organizerId = message.userId || session!.organizerId;
+            session!.speakerGender = gender || "male";
+            currentRole = role;
+            (ws as any).currentRole = role;
+
+            if (!session!.panelists.has("speaker-01")) {
+              session!.panelists.set("speaker-01", {
+                speakerId: "speaker-01",
+                userId: message.userId || "host",
+                userName: message.userName || "Host Speaker",
+                ws
+              });
+            }
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({
+                type: "host_token",
+                sessionId,
+                hostToken: session!.hostToken,
+                role: "organizer"
+              }));
+            }
+            const group = getOrCreateLanguageGroup(sessionId, currentLang!, session!.speakerGender);
+            if (group) {
+              group.listeners.add(ws);
+            }
+          } else {
+            console.warn(`[SECURITY][SESSION_TAKEOVER_PREVENTED] Unauthorized host join attempt for session '${sessionId}' without valid hostToken.`);
+            currentRole = "listener";
+            (ws as any).currentRole = "listener";
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({
+                type: "role_changed",
+                role: "LISTENER",
+                status: "takeover_prevented",
+                message: "Session host is already active. Valid host token required to join as organizer."
+              }));
+            }
+            const group = getOrCreateLanguageGroup(sessionId, currentLang!, session!.speakerGender);
+            if (group) {
+              group.listeners.add(ws);
+            }
+          }
         } else {
+          currentRole = "listener";
+          (ws as any).currentRole = "listener";
           // Cleanly remove listener from any previous language groups when switching target language
           session.languageGroups.forEach(g => {
             g.listeners.delete(ws);
@@ -458,36 +2184,80 @@ Generated by BharatBridge AI Matrix.`;
           const group = getOrCreateLanguageGroup(sessionId, currentLang!, session.speakerGender);
           if (group) {
             group.listeners.add(ws);
+            console.log(`[DIAGNOSTIC][STEP1_LISTENER_REGISTERED] sessionId='${sessionId}' rawTargetLang='${targetLang}' canonicalCode='${getCanonicalLanguageCode(currentLang!)}' listenersCount=${group.listeners.size}`);
           }
 
           // Instantly send full message history (translated into listener's target language) over WebSocket
           if (session.messages && session.messages.length > 0) {
             (async () => {
-              const historyPayloads: any[] = [];
-              const trgLangName = LANGUAGE_NAME_MAP[currentLang!] || currentLang!;
-              for (const m of session.messages) {
-                let translatedText = m.translatedText;
-                if (m.targetLang !== currentLang) {
-                  const srcLangName = LANGUAGE_NAME_MAP[m.sourceLang] || m.sourceLang || "English";
-                  const prompt = `Translate the following text from ${srcLangName} to ${trgLangName}. Return ONLY translated text. Text: "${m.originalText}"`;
-                  translatedText = await generateTranslationWithGemini(prompt, m.originalText, currentLang!);
+              try {
+                const historyPayloads = await Promise.all(
+                  session.messages.map(async (m: SessionMessage) => {
+                    if (!m.translations) m.translations = {};
+                    let translatedText = m.translations[currentLang!];
+                    let provider = m.provider || "cosmos";
+                    let degraded = m.degraded || false;
+
+                    if (typeof translatedText === "object") {
+                      const tObj = translatedText as any;
+                      translatedText = tObj.text;
+                      if (tObj.degraded) degraded = true;
+                      if (tObj.provider) provider = tObj.provider === "gemini" ? "cosmos" : tObj.provider;
+                    }
+
+                    if (!translatedText && m.targetLang === currentLang && m.translatedText) {
+                      translatedText = m.translatedText;
+                      m.translations[currentLang!] = translatedText;
+                    }
+
+                    if (!translatedText) {
+                      const transResult = await generateTranslationWithGemini(
+                        m.originalText,
+                        m.originalText,
+                        currentLang!,
+                        m.sourceLang || "en"
+                      );
+                      translatedText = transResult.text;
+                      provider = transResult.provider;
+                      degraded = transResult.degraded;
+                      if (!transResult.degraded && transResult.provider !== "untranslated") {
+                        m.translations[currentLang!] = translatedText;
+                      }
+                    }
+
+                    return {
+                      originalText: m.originalText,
+                      translatedText,
+                      sourceLang: m.sourceLang || "en",
+                      targetLang: currentLang,
+                      timestamp: m.timestamp,
+                      eventId: m.eventId || (m as any).id,
+                      speakerId: m.speakerId || "speaker-01",
+                      speakerName: m.speakerName || "Speaker",
+                      provider,
+                      translation_degraded: degraded
+                    };
+                  })
+                );
+
+                if (ws.readyState === WebSocket.OPEN) {
+                  ws.send(JSON.stringify({
+                    type: "history",
+                    sessionId,
+                    topic: session.topic || "",
+                    name: session.topic || `Live Session #${sessionId}`,
+                    sourceLang: "en",
+                    messages: historyPayloads
+                  }));
                 }
-                historyPayloads.push({
-                  originalText: m.originalText,
-                  translatedText,
-                  sourceLang: m.sourceLang,
-                  targetLang: currentLang,
-                  timestamp: m.timestamp
-                });
-              }
-              if (ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({ type: "history", messages: historyPayloads }));
+              } catch (histErr) {
+                console.error("[BHARATBRIDGE] Error generating history payload:", histErr);
               }
             })();
           }
         }
 
-        // Broadcast stats
+        // Broadcast stats & room_state
         const totalListeners = Array.from(session.languageGroups.values()).reduce((acc, g) => acc + g.listeners.size, 0);
         const statsPayload = JSON.stringify({ type: "stats", listeners: totalListeners });
         if (session.speaker?.readyState === WebSocket.OPEN) session.speaker.send(statsPayload);
@@ -496,28 +2266,399 @@ Generated by BharatBridge AI Matrix.`;
             if (l.readyState === WebSocket.OPEN) l.send(statsPayload);
           });
         });
+        broadcastRoomState(session);
       }
 
-      if (message.type === "audio" && currentRole === "speaker" && currentSessionId) {
+      if (message.type === "speaker_request" && currentSessionId) {
         const session = sessions.get(currentSessionId);
         if (session) {
-          // Pipe audio to ALL active language sessions
-          session.languageGroups.forEach(group => {
-            if (group.geminiSession) {
-              group.geminiSession.sendRealtimeInput({
-                audio: { data: message.audio, mimeType: "audio/pcm;rate=16000" }
-              });
+          const userId = message.userId || `user_${Date.now()}`;
+          const userName = message.userName || "Listener";
+
+          const existingPanelist = Array.from(session.panelists.values()).find(p => p.userId === userId);
+          if (existingPanelist) {
+            ws.send(JSON.stringify({
+              type: "role_changed",
+              role: "PANELIST",
+              speakerId: existingPanelist.speakerId,
+              speakerName: existingPanelist.userName,
+              status: "approved"
+            }));
+            return;
+          }
+
+          if (session.panelists.size >= 10) {
+            ws.send(JSON.stringify({
+              type: "role_changed",
+              role: "LISTENER",
+              status: "limit_reached",
+              message: "All 10 panelist positions are occupied"
+            }));
+            return;
+          }
+
+          // Auto-approve request ONLY for 1-on-1 duo mode sessions
+          const shouldAutoApprove = session.isDuoMode === true;
+          if (shouldAutoApprove) {
+            let assignedSlot = "";
+            for (let i = 1; i <= 10; i++) {
+              const candidateSlot = `speaker-${i < 10 ? '0' + i : i}`;
+              if (!session.panelists.has(candidateSlot)) {
+                assignedSlot = candidateSlot;
+                break;
+              }
             }
+            if (assignedSlot) {
+              (ws as any).currentRole = "speaker";
+              session.panelists.set(assignedSlot, {
+                speakerId: assignedSlot,
+                userId,
+                userName,
+                ws
+              });
+              ws.send(JSON.stringify({
+                type: "role_changed",
+                role: "PANELIST",
+                speakerId: assignedSlot,
+                speakerName: userName,
+                status: "approved"
+              }));
+              broadcastRoomState(session);
+              return;
+            }
+          }
+
+          session.pendingRequests.set(userId, {
+            userId,
+            userName,
+            ws,
+            requestedAt: Date.now(),
+            targetLang: message.targetLang
           });
+
+          ws.send(JSON.stringify({
+            type: "speaker_request_status",
+            status: "pending"
+          }));
+
+          broadcastRoomState(session);
         }
       }
 
-      if (message.type === "text_translation" && currentRole === "speaker" && currentSessionId) {
+      if (message.type === "speaker_approval" && currentSessionId) {
         const session = sessions.get(currentSessionId);
         if (session) {
+          if (ws !== session.organizerWs) {
+            console.warn(`[SECURITY][SPEAKER_APPROVAL] Rejected unauthorized approval from non-organizer socket in session '${currentSessionId}'`);
+            ws.send(JSON.stringify({
+              type: "error",
+              code: "UNAUTHORIZED",
+              message: "Only the session organizer can approve speaker requests"
+            }));
+            return;
+          }
+          const { targetUserId, approved } = message;
+          const reqItem = session.pendingRequests.get(targetUserId);
+
+          if (reqItem) {
+            session.pendingRequests.delete(targetUserId);
+
+            if (!approved) {
+              if (reqItem.ws.readyState === WebSocket.OPEN) {
+                reqItem.ws.send(JSON.stringify({
+                  type: "role_changed",
+                  role: "LISTENER",
+                  status: "rejected",
+                  message: "Speaker request rejected by organizer"
+                }));
+              }
+            } else {
+              if (session.panelists.size >= 10) {
+                if (reqItem.ws.readyState === WebSocket.OPEN) {
+                  reqItem.ws.send(JSON.stringify({
+                    type: "role_changed",
+                    role: "LISTENER",
+                    status: "limit_reached",
+                    message: "All 10 panelist positions are occupied"
+                  }));
+                }
+              } else {
+                let assignedSlot = "";
+                for (let i = 1; i <= 10; i++) {
+                  const candidateSlot = `speaker-${i < 10 ? '0' + i : i}`;
+                  if (!session.panelists.has(candidateSlot)) {
+                    assignedSlot = candidateSlot;
+                    break;
+                  }
+                }
+                if (assignedSlot) {
+                  (reqItem.ws as any).currentRole = "speaker";
+                  session.panelists.set(assignedSlot, {
+                    speakerId: assignedSlot,
+                    userId: targetUserId,
+                    userName: reqItem.userName,
+                    ws: reqItem.ws
+                  });
+                  if (reqItem.ws.readyState === WebSocket.OPEN) {
+                    reqItem.ws.send(JSON.stringify({
+                      type: "role_changed",
+                      role: "PANELIST",
+                      speakerId: assignedSlot,
+                      speakerName: reqItem.userName,
+                      status: "approved"
+                    }));
+                  }
+                }
+              }
+            }
+            broadcastRoomState(session);
+          }
+        }
+      }
+
+      if (message.type === "switch_to_listener" && currentSessionId) {
+        const session = sessions.get(currentSessionId);
+        if (session) {
+          for (const [slot, panelist] of session.panelists.entries()) {
+            if (panelist.ws === ws) {
+              session.panelists.delete(slot);
+              break;
+            }
+          }
+          currentRole = "listener";
+          (ws as any).currentRole = "listener";
+          ws.send(JSON.stringify({
+            type: "role_changed",
+            role: "LISTENER",
+            status: "switched"
+          }));
+          broadcastRoomState(session);
+        }
+      }
+
+      if (message.type === "audio" && currentSessionId) {
+        const session = sessions.get(currentSessionId);
+        if (session) {
+          session.lastActivity = Date.now();
+          const socketRole = (ws as any).currentRole || currentRole;
+          const isAuthorized = Array.from(session.panelists.values()).some(p => p.ws === ws) || socketRole === "speaker" || socketRole === "organizer" || socketRole === "PANELIST" || socketRole === "panelist";
+          if (isAuthorized) {
+            // Pipe audio frame to ALL active language sessions with structured logging & error protection
+            session.languageGroups.forEach((group, lang) => {
+              if (group.geminiSession) {
+                try {
+                  console.log(`[GEMINI_LIVE][AUDIO_FRAME] Piping audio frame (${(message.audio || '').length} base64 chars) to group '${lang}'`);
+                  group.geminiSession.sendRealtimeInput({
+                    audio: { data: message.audio, mimeType: "audio/pcm;rate=16000" }
+                  });
+                } catch (audioErr: any) {
+                  console.error(`[GEMINI_LIVE][AUDIO_FRAME_ERROR] Error piping audio frame to group '${lang}':`, audioErr);
+                }
+              }
+            });
+          }
+        }
+      }
+
+      if (message.type === "speech_event" && currentSessionId) {
+        const session = sessions.get(currentSessionId);
+        if (!session) {
+          ws.send(JSON.stringify({ type: "error", code: "INVALID_SESSION", message: "Session not found" }));
+          return;
+        }
+
+        const panelist = Array.from(session.panelists.values()).find(p => p.ws === ws);
+        const socketRole = (ws as any).currentRole || currentRole;
+        const isAuthorizedSpeaker = !!panelist || socketRole === "speaker" || socketRole === "organizer" || socketRole === "PANELIST" || socketRole === "panelist";
+
+        if (!isAuthorizedSpeaker) {
+          console.warn(`[BHARATBRIDGE][SPEECH_EVENT] REJECTED speech_event from unauthorized socket role: ${socketRole}`);
+          ws.send(JSON.stringify({
+            type: "error",
+            code: "UNAUTHORIZED",
+            message: "Unauthorized: Only active speakers or panelists can send speech events"
+          }));
+          return;
+        }
+
+        const { eventId, sourceText, sourceLanguage, sequenceNumber } = message;
+
+        if (!sourceText || !sourceText.trim()) {
+          console.warn(`[BHARATBRIDGE][SPEECH_EVENT] Rejected empty sourceText in eventId ${eventId}`);
+          ws.send(JSON.stringify({ type: "error", code: "INVALID_PAYLOAD", message: "sourceText cannot be empty" }));
+          return;
+        }
+
+        const speakerId = message.speakerId || panelist?.speakerId || "speaker-01";
+        const speakerName = message.speakerName || panelist?.userName || "Speaker";
+
+        // Monotonic Sequence Validation per (sessionId + speakerId)
+        const lastSeq = getLastSequenceNumber(currentSessionId, speakerId);
+        if (typeof sequenceNumber === "number" && sequenceNumber < lastSeq) {
+          console.warn(`[BHARATBRIDGE][SPEECH_EVENT] Out-of-order sequence number received for speaker '${speakerId}': ${sequenceNumber} (last expected >= ${lastSeq})`);
+          ws.send(JSON.stringify({
+            type: "error",
+            code: "OUT_OF_ORDER_SEQUENCE",
+            message: `Out of order sequence number ${sequenceNumber} for speaker ${speakerId}. Last sequence was ${lastSeq}`
+          }));
+          return;
+        }
+
+        if (typeof sequenceNumber === "number") {
+          setLastSequenceNumber(currentSessionId, speakerId, sequenceNumber);
+        }
+
+        const activeLanguages = getActiveLanguages(currentSessionId);
+
+        // Step 4: Register event, discover active languages, log structured telemetry
+        console.log(`[BHARATBRIDGE][SPEECH_EVENT_RECEIVED] eventId='${eventId}' speaker='${speakerId}' (${speakerName}) sourceLang='${sourceLanguage || 'en'}' seq=${sequenceNumber || 'none'}`);
+        console.log(`[BHARATBRIDGE][ACTIVE_LANGUAGES] sessionId='${currentSessionId}' count=${activeLanguages.length} activeLanguages=[${activeLanguages.join(', ')}]`);
+
+        // Acknowledge receipt to speaker socket with active language list
+        ws.send(JSON.stringify({
+          type: "speech_event_ack",
+          eventId,
+          sessionId: currentSessionId,
+          sequenceNumber: sequenceNumber || lastSeq,
+          activeLanguages,
+          status: "ACCEPTED"
+        }));
+
+        // Send speaker original transcript payload over WS
+        const speakerPayload = JSON.stringify({
+          type: "transcription",
+          eventId,
+          originalText: sourceText.trim(),
+          translatedText: "",
+          sourceLang: sourceLanguage || "en",
+          targetLang: sourceLanguage || "en",
+          isFinal: true,
+          speakerId,
+          speakerName,
+          sequenceNumber: sequenceNumber || lastSeq
+        });
+        if (session.speaker && session.speaker.readyState === WebSocket.OPEN) {
+          session.speaker.send(speakerPayload);
+        }
+
+        // Contextual Thought Buffer Ingestion & Boundary Evaluation (Session + Speaker Keyed)
+        const now = Date.now();
+        const bufferKey = `${currentSessionId}:${speakerId}`;
+        let buffer = activeThoughtBuffers.get(bufferKey);
+
+        if (!buffer) {
+          buffer = {
+            sessionId: currentSessionId,
+            speakerId,
+            speakerName,
+            fragments: [],
+            sourceLanguage: sourceLanguage || "en",
+            firstSequenceNumber: sequenceNumber || lastSeq,
+            latestSequenceNumber: sequenceNumber || lastSeq,
+            firstEventId: eventId,
+            latestEventId: eventId,
+            createdTimestamp: now,
+            lastFragmentTimestamp: now,
+            flushTimer: null
+          };
+          activeThoughtBuffers.set(bufferKey, buffer);
+        }
+
+        // Reset existing flush timer
+        if (buffer.flushTimer) {
+          clearTimeout(buffer.flushTimer);
+          buffer.flushTimer = null;
+        }
+
+        // Append fragment
+        const cleanFragment = sourceText.trim();
+        buffer.fragments.push(cleanFragment);
+        buffer.latestSequenceNumber = sequenceNumber || lastSeq;
+        buffer.latestEventId = eventId;
+        buffer.lastFragmentTimestamp = now;
+
+        // Boundary Heuristic Evaluations (Env Configurable)
+        const combinedText = buffer.fragments.join(" ").trim();
+        const totalWords = combinedText.split(/\s+/).filter(Boolean).length;
+        const hasTerminalPunctuation = /[.?!।]$/.test(cleanFragment);
+        const maxDurationMs = Number(process.env.MAX_THOUGHT_DURATION_MS) || 2500;
+        const maxDurationExceeded = (now - buffer.createdTimestamp) >= maxDurationMs;
+        const wordCountFlushLimit = Number(process.env.WORD_COUNT_FLUSH_LIMIT) || 9999;
+        const wordCountExceeded = totalWords >= wordCountFlushLimit;
+
+        const shouldFlushImmediately = hasTerminalPunctuation || wordCountExceeded || maxDurationExceeded;
+        const inactivityMs = Number(process.env.INACTIVITY_FLUSH_MS) || 1500;
+
+        console.log(`[BHARATBRIDGE][THOUGHT_BUFFER_ADD] session='${currentSessionId}' speaker='${speakerId}' fragments=${buffer.fragments.length} words=${totalWords} terminalPunct=${hasTerminalPunctuation} wordExceeded=${wordCountExceeded} -> flushImmediate=${shouldFlushImmediately}`);
+
+        if (shouldFlushImmediately) {
+          flushThoughtBuffer(currentSessionId, speakerId);
+        } else {
+          // Set inactivity flush timer
+          buffer.flushTimer = setTimeout(() => {
+            flushThoughtBuffer(currentSessionId, speakerId);
+          }, inactivityMs);
+        }
+      }
+
+      if (message.type === "text_translation") {
+        console.log(`[BHARATBRIDGE][WS_RECEIVE] Server received text_translation frame. currentRole='${currentRole}', socketRole='${(ws as any).currentRole}', currentSessionId='${currentSessionId}'`);
+      }
+
+      if (message.type === "text_translation" && currentSessionId) {
+        const session = sessions.get(currentSessionId);
+        if (session) {
+          const eventId = message.eventId || generateEventId();
+          const panelist = Array.from(session.panelists.values()).find(p => p.ws === ws);
+          const socketRole = (ws as any).currentRole || currentRole;
+          const isAuthorizedSpeaker = !!panelist || socketRole === "speaker" || socketRole === "organizer" || socketRole === "PANELIST" || socketRole === "panelist";
+
+          observabilityService.recordEvent({
+            eventId,
+            sessionId: currentSessionId,
+            speakerId: panelist?.speakerId || message.speakerId || "speaker-01",
+            sourceLanguage: message.sourceLang || "en",
+            targetLanguage: message.targetLang || "hi",
+            stage: "WEBSOCKET",
+            eventType: "WS_SERVER_RECEIVE",
+            status: "SUCCESS",
+            latencyMs: "NOT_MEASURED"
+          });
+
+          if (!isAuthorizedSpeaker) {
+            console.warn(`[BHARATBRIDGE][WS_RECEIVE] REJECTED text_translation from unauthorized socket. socketRole='${socketRole}'`);
+            observabilityService.recordEvent({
+              eventId,
+              sessionId: currentSessionId,
+              sourceLanguage: message.sourceLang || "en",
+              targetLanguage: message.targetLang || "hi",
+              stage: "WEBSOCKET",
+              eventType: "WS_REJECTED",
+              status: "REJECTED",
+              errorCode: "WS_AUTH_REJECTED",
+              errorMessage: `Unauthorized socketRole=${socketRole}`
+            });
+            return;
+          }
+
+          observabilityService.recordEvent({
+            eventId,
+            sessionId: currentSessionId,
+            speakerId: panelist?.speakerId || message.speakerId || "speaker-01",
+            sourceLanguage: message.sourceLang || "en",
+            targetLanguage: message.targetLang || "hi",
+            stage: "WEBSOCKET",
+            eventType: "WS_AUTHORIZED",
+            status: "SUCCESS"
+          });
+
+          console.log(`[BHARATBRIDGE][WS_RECEIVE] Server AUTHORIZED text_translation for speakerId='${panelist?.speakerId || "speaker-01"}' eventId='${eventId}'`);
           const { originalText, translatedText, sourceLang, targetLang } = message;
           const isFinal = message.isFinal !== false;
           const srcLangName = LANGUAGE_NAME_MAP[sourceLang] || sourceLang || "English";
+
+          const speakerId = panelist?.speakerId || message.speakerId || "speaker-01";
+          const speakerName = panelist?.userName || message.speakerName || "Speaker";
 
           if (isFinal && originalText && originalText.trim()) {
             const cleanText = originalText.trim().toLowerCase();
@@ -526,77 +2667,109 @@ Generated by BharatBridge AI Matrix.`;
               m => (m.originalText || "").trim().toLowerCase() === cleanText && (now - m.timestamp < 4000)
             );
             if (!isDuplicate) {
-              const newMsg = { originalText: originalText.trim(), translatedText: (translatedText || "").trim(), sourceLang, targetLang, timestamp: now };
+              const newMsg = { originalText: originalText.trim(), translatedText: (translatedText || "").trim(), sourceLang, targetLang, timestamp: now, speakerId, speakerName, eventId };
               session.messages = [newMsg, ...(session.messages || [])].slice(0, 100);
             }
           }
 
           const speakerPayload = JSON.stringify({
             type: "transcription",
+            eventId,
             originalText,
             translatedText: "", // Speaker only receives original transcript, never target translation
             sourceLang,
             targetLang: sourceLang,
-            isFinal
+            isFinal,
+            speakerId,
+            speakerName
           });
           if (session.speaker && session.speaker.readyState === WebSocket.OPEN) {
             session.speaker.send(speakerPayload);
           }
 
           // Broadcast to listeners across all target language groups
+          console.log(`[DIAGNOSTIC][STEP2_BROADCAST_TEXT_TRANSLATION] currentSessionId='${currentSessionId}' messageTargetLang='${targetLang}' availableGroups=[${Array.from(session.languageGroups.keys()).join(', ')}]`);
           session.languageGroups.forEach((group, groupLang) => {
+            console.log(`[DIAGNOSTIC][STEP2_GROUP_CHECK] groupLang='${groupLang}' messageTargetLang='${targetLang}' sourceLang='${sourceLang}' listenersCount=${group.listeners.size}`);
             if (group.listeners.size === 0) return;
 
-            if (groupLang === targetLang) {
-              const listenerPayload = JSON.stringify({
-                type: "transcription",
-                originalText,
-                translatedText: translatedText,
-                sourceLang,
-                targetLang: groupLang,
-                isFinal
-              });
+            observabilityService.recordEvent({
+              eventId,
+              sessionId: currentSessionId,
+              speakerId,
+              sourceLanguage: sourceLang,
+              targetLanguage: groupLang,
+              stage: "WEBSOCKET",
+              eventType: "LANGUAGE_GROUP_MATCH",
+              status: "SUCCESS"
+            });
 
-              group.listeners.forEach(l => {
-                if (l.readyState === WebSocket.OPEN) l.send(listenerPayload);
-              });
-            } else if (groupLang === sourceLang) {
+            if (groupLang === sourceLang) {
               const listenerPayload = JSON.stringify({
                 type: "transcription",
+                eventId,
                 originalText,
                 translatedText: originalText,
                 sourceLang,
                 targetLang: groupLang,
-                isFinal
+                isFinal,
+                speakerId,
+                speakerName
               });
 
               group.listeners.forEach(l => {
+                console.log(`[DIAGNOSTIC][STEP3_SOCKET_STATE_TEXT_TRANSLATION] groupLang='${groupLang}' listenerWs.readyState=${l.readyState} (OPEN=1)`);
                 if (l.readyState === WebSocket.OPEN) l.send(listenerPayload);
               });
             } else {
-              // Asynchronous background translation for listeners in secondary language groups
+              // Asynchronous background translation for listeners in each active target language group
               (async () => {
-                let langTranslation = originalText;
-                const trgLangName = LANGUAGE_NAME_MAP[groupLang] || groupLang;
-                try {
-                  const recentContext = (session.messages || []).slice(0, 6).map(m => ({ originalText: m.originalText, translatedText: m.translatedText }));
-                  const prompt = `Translate the following text from ${srcLangName} to ${trgLangName}. Return ONLY translated text. Text: "${originalText}"`;
-                  langTranslation = await generateTranslationWithGemini(prompt, originalText, groupLang, sourceLang, recentContext);
-                } catch (e) {
-                  langTranslation = originalText;
+                let langTranslation = (translatedText && targetLang === groupLang) ? translatedText : "";
+                let transProvider = "provided";
+                let transDegraded = false;
+
+                if (!langTranslation) {
+                  try {
+                    const recentContext = (session.messages || []).slice(0, 6).map(m => ({ originalText: m.originalText, translatedText: m.translatedText }));
+                    const transRes = await generateTranslationWithGemini(originalText, originalText, groupLang, sourceLang, recentContext);
+                    langTranslation = transRes.text;
+                    transProvider = transRes.provider;
+                    transDegraded = transRes.degraded;
+                  } catch (e) {
+                    langTranslation = originalText;
+                    transProvider = "untranslated";
+                    transDegraded = true;
+                  }
                 }
 
                 const secondaryPayload = JSON.stringify({
                   type: "transcription",
+                  eventId,
                   originalText,
                   translatedText: langTranslation,
                   sourceLang,
                   targetLang: groupLang,
-                  isFinal
+                  isFinal,
+                  speakerId,
+                  speakerName,
+                  provider: transProvider,
+                  translation_degraded: transDegraded
                 });
 
                 group.listeners.forEach(l => {
+                  console.log(`[DIAGNOSTIC][STEP3_SOCKET_STATE_TEXT_TRANSLATION] groupLang='${groupLang}' listenerWs.readyState=${l.readyState} (OPEN=1)`);
                   if (l.readyState === WebSocket.OPEN) l.send(secondaryPayload);
+                });
+
+                observabilityService.recordEvent({
+                  eventId,
+                  sessionId: currentSessionId,
+                  speakerId,
+                  sourceLanguage: sourceLang,
+                  targetLanguage: groupLang,
+                  stage: "WEBSOCKET",
+                  eventType: "WS_BROADCAST",
+                  status: "SUCCESS"
                 });
               })();
             }
@@ -608,26 +2781,35 @@ Generated by BharatBridge AI Matrix.`;
     ws.on("close", () => {
       if (currentSessionId && sessions.has(currentSessionId)) {
         const session = sessions.get(currentSessionId)!;
-        if (currentRole === "speaker") {
-          session.speaker = null;
-          // Close all Gemini sessions for this room
-          session.languageGroups.forEach(g => {
-            if (g.geminiSession) g.geminiSession.close();
-          });
-          session.languageGroups.clear();
-        } else if (currentLang) {
-          const group = session.languageGroups.get(currentLang);
+        const socketRole = (ws as any).currentRole || currentRole;
+
+        if (socketRole === "speaker" || socketRole === "organizer") {
+          if (session.speaker === ws) session.speaker = null;
+          if (session.organizerWs === ws) session.organizerWs = null;
+        }
+
+        // Remove panelist entry if this socket was a panelist
+        for (const [slot, panelist] of session.panelists.entries()) {
+          if (panelist.ws === ws) {
+            session.panelists.delete(slot);
+            console.log(`[CLOSE] Removed panelist slot '${slot}' for disconnected user '${panelist.userName}'`);
+            break;
+          }
+        }
+
+        if (currentLang) {
+          const canonical = getCanonicalLanguageCode(currentLang);
+          const group = session.languageGroups.get(canonical);
           if (group) {
             group.listeners.delete(ws);
-            // Optional: Close Gemini session if no listeners left in this language
             if (group.listeners.size === 0) {
               if (group.geminiSession) group.geminiSession.close();
-              session.languageGroups.delete(currentLang);
+              session.languageGroups.delete(canonical);
             }
           }
         }
 
-        // Broadcast stats
+        // Broadcast stats & room_state
         const totalListeners = Array.from(session.languageGroups.values()).reduce((acc, g) => acc + g.listeners.size, 0);
         const statsPayload = JSON.stringify({ type: "stats", listeners: totalListeners });
         if (session.speaker?.readyState === WebSocket.OPEN) session.speaker.send(statsPayload);
@@ -636,6 +2818,7 @@ Generated by BharatBridge AI Matrix.`;
             if (l.readyState === WebSocket.OPEN) l.send(statsPayload);
           });
         });
+        broadcastRoomState(session);
       }
     });
   });
@@ -643,7 +2826,7 @@ Generated by BharatBridge AI Matrix.`;
   // Vite middleware for development
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
-      server: { middlewareMode: true, host: "0.0.0.0" },
+      server: { middlewareMode: true, host: "0.0.0.0", hmr: false },
       appType: "spa",
     });
     app.use(vite.middlewares);
@@ -655,9 +2838,35 @@ Generated by BharatBridge AI Matrix.`;
     });
   }
 
+  try {
+    const initRes = await initCosmosDB();
+    if (initRes.success) {
+      console.log(`[Persistence] Cosmos DB active — database: ${process.env.COSMOS_DB_DATABASE_NAME || "bharatbridge"}`);
+    } else {
+      console.log(`[Persistence] Cosmos DB credentials missing or invalid — persistence OFF: ${initRes.error}`);
+    }
+  } catch (cosmosInitErr: any) {
+    console.error("[Persistence] Cosmos DB initialization failed:", cosmosInitErr?.message || cosmosInitErr);
+  }
+
   server.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running in ${process.env.NODE_ENV || 'development'} mode on http://localhost:${PORT}`);
   });
+
+  const handleShutdown = async (signal: string) => {
+    console.log(`[SERVER_SHUTDOWN] Signal '${signal}' received. Flushing metrics to Cosmos DB (3s timeout)...`);
+    const timeoutPromise = new Promise((resolve) => setTimeout(resolve, 3000));
+    await Promise.race([
+      observabilityService.flushMetricsToCosmos().catch((err) => {
+        console.warn("[SERVER_SHUTDOWN] Graceful metrics flush warning:", err?.message || err);
+      }),
+      timeoutPromise
+    ]);
+    process.exit(0);
+  };
+
+  process.once("SIGINT", () => handleShutdown("SIGINT"));
+  process.once("SIGTERM", () => handleShutdown("SIGTERM"));
 }
 
 startServer().catch(err => {

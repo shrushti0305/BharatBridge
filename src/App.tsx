@@ -17,6 +17,7 @@ import {
   Check, 
   Languages,
   RotateCw,
+  RefreshCw,
   Settings,
   Star,
   Trash2,
@@ -31,32 +32,29 @@ import {
   FileSpreadsheet,
   Music,
   History,
-  Sparkles
+  Sparkles,
+  Shield
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { LANGUAGES, POPULAR_LANGUAGES } from "./languages";
-import { LanguageConfig, UserProfile, TranslationPair, Session, Message as FBMessage } from "./types";
-import { auth, db, signInWithGoogle, handleFirestoreError, OperationType } from "./lib/firebase";
+import { LanguageConfig, UserProfile, TranslationPair, Session, Message as FBMessage, UserRole, SpeakerRequestStatus } from "./types";
+import { auth, signInWithGoogle } from "./lib/firebase";
+import { onAuthStateChanged, User, signOut } from "firebase/auth";
 import { uploadCaptionToAzure } from "./lib/azure-storage";
 import { generateQRCodeSVG } from "./lib/qrcode";
 import { translateText, synthesizeSpeech } from "./services/api";
 import { downloadAudioWAV } from "./lib/audio-export";
-import { onAuthStateChanged, User, signOut } from "firebase/auth";
-import { 
-  collection, 
-  addDoc, 
-  setDoc,
-  onSnapshot, 
-  query, 
-  orderBy, 
-  serverTimestamp, 
-  doc, 
-  updateDoc, 
-  where,
-  getDocs,
-  getDoc,
-  limit
-} from "firebase/firestore";
+import { observabilityService, generateEventId } from "./services/observability";
+
+export function cleanIndianText(text: string): string {
+  if (!text) return "";
+  let cleaned = text.normalize("NFC");
+  // Remove space immediately following Devanagari Virama (U+094D) or Gujarati Virama (U+0ACD)
+  cleaned = cleaned.replace(/([\u094D\u0ACD])\s+/g, "$1");
+  // Normalize redundant whitespace
+  cleaned = cleaned.replace(/\s+/g, " ").trim();
+  return cleaned;
+}
 
 // --- Components ---
 
@@ -431,17 +429,50 @@ const ProfileModal = ({
 };
 
 const AdminModal = ({ isOpen, onClose }: { isOpen: boolean; onClose: () => void }) => {
-  const [sessions, setSessions] = useState<Session[]>([]);
-  const [selectedSession, setSelectedSession] = useState<Session | null>(null);
-  const [sessionMessages, setSessionMessages] = useState<FBMessage[]>([]);
+  const [sessions, setSessions] = useState<any[]>([]);
+  const [selectedSession, setSelectedSession] = useState<any | null>(null);
+  const [sessionMessages, setSessionMessages] = useState<any[]>([]);
+  const [loading, setLoading] = useState<boolean>(false);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+
+  const fetchAdminSessions = () => {
+    setLoading(true);
+    setErrorMsg(null);
+    let userEmail = "";
+    try {
+      const savedUser = localStorage.getItem("bharat_bridge_user");
+      if (savedUser) userEmail = JSON.parse(savedUser).email || "";
+    } catch (_) {}
+
+    const adminToken = localStorage.getItem("bharat_bridge_admin_token") || (import.meta as any).env?.VITE_ADMIN_TOKEN || "";
+    const adminEmail = localStorage.getItem("bharat_bridge_admin_email") || userEmail;
+
+    fetch("/api/admin/sessions", {
+      headers: {
+        "x-admin-token": adminToken,
+        "x-admin-email": adminEmail
+      }
+    })
+      .then(res => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}: Admin access denied`);
+        return res.json();
+      })
+      .then(data => {
+        setSessions(data.sessions || []);
+        if (data.sessions && data.sessions.length > 0) {
+          setSelectedSession(data.sessions[0]);
+        }
+      })
+      .catch(err => {
+        console.warn("[AdminModal] Error fetching sessions:", err);
+        setErrorMsg(err.message || "Failed to load admin sessions");
+      })
+      .finally(() => setLoading(false));
+  };
 
   useEffect(() => {
     if (!isOpen) return;
-    const q = query(collection(db, "sessions"), orderBy("createdAt", "desc"), limit(20));
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      setSessions(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })) as Session[]);
-    });
-    return () => unsubscribe();
+    fetchAdminSessions();
   }, [isOpen]);
 
   useEffect(() => {
@@ -449,63 +480,247 @@ const AdminModal = ({ isOpen, onClose }: { isOpen: boolean; onClose: () => void 
       setSessionMessages([]);
       return;
     }
-    const q = query(collection(db, "sessions", selectedSession.id, "messages"), orderBy("timestamp", "asc"));
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      setSessionMessages(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })) as FBMessage[]);
-    });
-    return () => unsubscribe();
+    let userEmail = "";
+    try {
+      const savedUser = localStorage.getItem("bharat_bridge_user");
+      if (savedUser) userEmail = JSON.parse(savedUser).email || "";
+    } catch (_) {}
+
+    const adminToken = localStorage.getItem("bharat_bridge_admin_token") || (import.meta as any).env?.VITE_ADMIN_TOKEN || "";
+    const adminEmail = localStorage.getItem("bharat_bridge_admin_email") || userEmail;
+
+    fetch(`/api/admin/sessions/${selectedSession.id}/messages`, {
+      headers: {
+        "x-admin-token": adminToken,
+        "x-admin-email": adminEmail
+      }
+    })
+      .then(res => res.json())
+      .then(data => setSessionMessages(data.messages || []))
+      .catch(err => console.warn("[AdminModal] Error fetching session messages:", err));
   }, [selectedSession]);
+
+  const [activeTab, setActiveTab] = useState<"messages" | "summary">("messages");
+  const [adminSummary, setAdminSummary] = useState<string>("");
+  const [generatingSummary, setGeneratingSummary] = useState<boolean>(false);
+
+  const formatDuration = (sec?: number) => {
+    if (!sec || sec <= 0) return "< 1m";
+    const hrs = Math.floor(sec / 3600);
+    const mins = Math.floor((sec % 3600) / 60);
+    const secs = sec % 60;
+    if (hrs > 0) return `${hrs}h ${mins}m`;
+    if (mins > 0) return `${mins}m ${secs}s`;
+    return `${secs}s`;
+  };
+
+  const handleGenerateAdminSummary = async () => {
+    if (!selectedSession || sessionMessages.length === 0) return;
+    setGeneratingSummary(true);
+    setAdminSummary("");
+    setActiveTab("summary");
+    try {
+      const res = await fetch("/api/session-summary", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sessionId: selectedSession.id,
+          messages: sessionMessages,
+          targetLanguage: selectedSession.targetLang || "hi"
+        })
+      });
+      const data = await res.json();
+      if (data.summary) {
+        setAdminSummary(data.summary);
+      } else {
+        setAdminSummary(data.error || "Failed to generate AI session summary.");
+      }
+    } catch (e: any) {
+      setAdminSummary("Error connecting to session summary API: " + e.message);
+    } finally {
+      setGeneratingSummary(false);
+    }
+  };
 
   if (!isOpen) return null;
 
+  const totalLive = sessions.filter(s => s.isLive).length;
+  const totalJoinees = sessions.reduce((acc, s) => acc + (s.activeListeners || 0), 0);
+
   return (
     <motion.div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-xl" onClick={onClose}>
-      <motion.div className="w-full max-w-4xl bg-[#0f172a] border border-white/10 rounded-[32px] shadow-2xl overflow-hidden flex h-[80vh]" onClick={e => e.stopPropagation()}>
+      <motion.div className="w-full max-w-5xl bg-[#0f172a] border border-white/10 rounded-[32px] shadow-2xl overflow-hidden flex h-[85vh]" onClick={e => e.stopPropagation()}>
+        {/* Left Sessions Sidebar */}
         <div className="w-1/3 border-r border-white/5 flex flex-col">
-          <div className="p-6 border-b border-white/5">
-            <h3 className="font-bold text-white">All Sessions</h3>
+          <div className="p-5 border-b border-white/5 space-y-2">
+            <div className="flex justify-between items-center">
+              <h3 className="font-bold text-white flex items-center gap-2 text-sm">
+                <Shield size={16} className="text-orange-400" />
+                <span>Admin Session Dashboard</span>
+              </h3>
+              {loading && <span className="text-[10px] text-slate-400 animate-pulse">Loading...</span>}
+            </div>
+            {/* Real-Time Telemetry Summary Bar */}
+            <div className="grid grid-cols-3 gap-2 pt-1">
+              <div className="bg-white/5 border border-white/5 p-2 rounded-xl text-center">
+                <p className="text-[9px] text-slate-400 font-mono uppercase">Total</p>
+                <p className="text-xs font-bold text-white">{sessions.length}</p>
+              </div>
+              <div className="bg-emerald-500/10 border border-emerald-500/20 p-2 rounded-xl text-center">
+                <p className="text-[9px] text-emerald-400 font-mono uppercase">Live</p>
+                <p className="text-xs font-bold text-emerald-400">{totalLive}</p>
+              </div>
+              <div className="bg-blue-500/10 border border-blue-500/20 p-2 rounded-xl text-center">
+                <p className="text-[9px] text-blue-400 font-mono uppercase">Joinees</p>
+                <p className="text-xs font-bold text-blue-400">{totalJoinees}</p>
+              </div>
+            </div>
           </div>
-          <div className="flex-1 overflow-y-auto p-4 space-y-2">
+          <div className="flex-1 overflow-y-auto p-3 space-y-2">
+            {errorMsg && <p className="text-xs text-red-400 p-2 bg-red-500/10 rounded-lg">{errorMsg}</p>}
+            {sessions.length === 0 && !loading && (
+              <p className="text-xs text-slate-500 text-center py-6">No session records found.</p>
+            )}
             {sessions.map(s => (
               <button 
                 key={s.id} 
-                onClick={() => setSelectedSession(s)}
-                className={`w-full p-4 rounded-xl border text-left transition-all ${selectedSession?.id === s.id ? 'bg-orange-500/10 border-orange-500/30' : 'bg-white/5 border-white/5 hover:border-white/10'}`}
+                onClick={() => { setSelectedSession(s); setActiveTab("messages"); setAdminSummary(""); }}
+                className={`w-full p-3.5 rounded-2xl border text-left transition-all space-y-1.5 ${selectedSession?.id === s.id ? 'bg-orange-500/10 border-orange-500/30 shadow-lg' : 'bg-white/5 border-white/5 hover:border-white/10'}`}
               >
-                <p className="text-xs font-bold text-white truncate">{s.name}</p>
-                <p className="text-[10px] text-slate-500">{s.sourceLang} → {s.targetLang}</p>
+                <div className="flex justify-between items-center">
+                  <span className="text-[10px] font-mono text-slate-400 bg-white/5 px-2 py-0.5 rounded-md border border-white/5">#{s.id}</span>
+                  {s.isLive ? (
+                    <span className="flex items-center gap-1 text-[9px] font-bold text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded-full border border-emerald-500/20">
+                      <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping" />
+                      LIVE
+                    </span>
+                  ) : (
+                    <span className="text-[9px] text-slate-500 bg-white/5 px-2 py-0.5 rounded-full">ENDED</span>
+                  )}
+                </div>
+                <p className="text-xs font-bold text-white truncate">{s.name || `Session ${s.id}`}</p>
+                <div className="flex justify-between items-center text-[10px] text-slate-400 font-mono">
+                  <span>👥 {s.activeListeners || 0} joinees</span>
+                  <span>💬 {s.messageCount || 0} msgs</span>
+                  <span>⏱️ {formatDuration(s.durationSec)}</span>
+                </div>
               </button>
             ))}
           </div>
         </div>
+
+        {/* Right Details / Live History Pane */}
         <div className="flex-1 flex flex-col bg-black/20">
-          <div className="p-6 border-b border-white/5 flex justify-between items-center">
-            <div className="flex items-center gap-4">
-              <h3 className="font-bold text-white">{selectedSession ? selectedSession.name : 'Select a Session'}</h3>
-              {selectedSession && sessionMessages.length > 0 && (
-                <button 
-                  onClick={() => exportTranscriptTXT(sessionMessages, selectedSession.name, selectedSession.id)}
-                  className="p-2 bg-white/5 hover:bg-white/10 border border-white/10 rounded-lg text-slate-400 hover:text-blue-400 transition-all flex items-center gap-2"
-                  title="Download Transcript"
-                >
-                  <Download size={14} />
-                  <span className="text-[10px] font-bold uppercase">Export</span>
-                </button>
+          <div className="p-5 border-b border-white/5 flex justify-between items-center bg-slate-900/40">
+            <div className="space-y-1">
+              <div className="flex items-center gap-3">
+                <h3 className="font-bold text-white text-base">{selectedSession ? selectedSession.name : 'Select a Session'}</h3>
+                {selectedSession?.isLive && (
+                  <span className="text-[10px] font-bold text-emerald-400 bg-emerald-500/10 px-2.5 py-0.5 rounded-full border border-emerald-500/20">🔴 LIVE SESSION</span>
+                )}
+              </div>
+              {selectedSession && (
+                <div className="flex items-center gap-4 text-[11px] text-slate-400 font-mono">
+                  <span>PIN: <strong className="text-white">#{selectedSession.id}</strong></span>
+                  <span>Joinees: <strong className="text-blue-400">{selectedSession.activeListeners || 0}</strong></span>
+                  <span>Duration: <strong className="text-orange-400">{formatDuration(selectedSession.durationSec)}</strong></span>
+                  <span>Messages: <strong className="text-slate-200">{selectedSession.messageCount || sessionMessages.length}</strong></span>
+                </div>
               )}
             </div>
-            <button onClick={onClose} className="p-2 bg-white/5 rounded-full text-slate-400 hover:text-white"><X size={16}/></button>
+            <div className="flex items-center gap-2">
+              <button onClick={onClose} className="p-2 bg-white/5 rounded-full text-slate-400 hover:text-white"><X size={16}/></button>
+            </div>
           </div>
-          <div className="flex-1 overflow-y-auto p-6 space-y-4">
-            {sessionMessages.map(m => (
-              <div key={m.id} className="p-4 bg-white/5 border border-white/5 rounded-2xl space-y-2">
-                <div className="flex justify-between items-center text-[10px] text-slate-500 uppercase tracking-widest font-mono">
-                  <span>Source: {m.sourceLang}</span>
-                  <span>Target: {m.targetLang}</span>
-                </div>
-                <p className="text-xs text-slate-400 italic border-l border-white/10 pl-3 py-1">{m.originalText}</p>
-                <p className="text-sm text-white font-semibold">{m.translatedText}</p>
+
+          {/* Tab Navigation */}
+          {selectedSession && (
+            <div className="px-6 pt-3 border-b border-white/5 flex justify-between items-center bg-slate-900/20">
+              <div className="flex gap-4">
+                <button
+                  onClick={() => setActiveTab("messages")}
+                  className={`pb-3 text-xs font-bold transition-all border-b-2 ${activeTab === "messages" ? 'border-orange-500 text-orange-400' : 'border-transparent text-slate-400 hover:text-white'}`}
+                >
+                  Transcript & History ({sessionMessages.length})
+                </button>
+                <button
+                  onClick={() => {
+                    if (!adminSummary && !generatingSummary) handleGenerateAdminSummary();
+                    else setActiveTab("summary");
+                  }}
+                  className={`pb-3 text-xs font-bold transition-all border-b-2 ${activeTab === "summary" ? 'border-orange-500 text-orange-400' : 'border-transparent text-slate-400 hover:text-white'}`}
+                >
+                  AI Session Summary {generatingSummary && "⏳"}
+                </button>
               </div>
-            ))}
+              {selectedSession && sessionMessages.length > 0 && (
+                <div className="flex gap-2 mb-2">
+                  <button 
+                    onClick={() => exportTranscriptTXT(sessionMessages as any, selectedSession.name, selectedSession.id)}
+                    className="px-3 py-1.5 bg-white/5 hover:bg-white/10 border border-white/10 rounded-xl text-slate-300 hover:text-white text-xs font-medium transition-all flex items-center gap-1.5"
+                    title="Download Transcript"
+                  >
+                    <Download size={13} />
+                    <span>Export</span>
+                  </button>
+                  <button 
+                    onClick={handleGenerateAdminSummary}
+                    disabled={generatingSummary}
+                    className="px-3 py-1.5 bg-orange-500/20 hover:bg-orange-500/30 border border-orange-500/30 text-orange-300 hover:text-orange-200 rounded-xl text-xs font-medium transition-all flex items-center gap-1.5 disabled:opacity-50"
+                  >
+                    <Sparkles size={13} />
+                    <span>{generatingSummary ? "Generating..." : "Generate AI Summary"}</span>
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Main Content Area */}
+          <div className="flex-1 overflow-y-auto p-6 space-y-4">
+            {!selectedSession && (
+              <p className="text-xs text-slate-500 italic text-center py-20">Select a session from the sidebar to inspect telemetry, joinees, duration, and transcript messages.</p>
+            )}
+
+            {selectedSession && activeTab === "messages" && (
+              <>
+                {sessionMessages.length === 0 && (
+                  <p className="text-xs text-slate-500 italic text-center py-10">No transcript messages recorded for this session yet.</p>
+                )}
+                {sessionMessages.map((m, idx) => (
+                  <div key={m.id || idx} className="p-4 bg-white/5 border border-white/5 rounded-2xl space-y-2">
+                    <div className="flex justify-between items-center text-[10px] text-slate-400 uppercase tracking-widest font-mono">
+                      <span className="font-bold text-orange-400">{m.speakerName || "Speaker"}</span>
+                      <span>{new Date(m.timestamp || Date.now()).toLocaleTimeString()}</span>
+                    </div>
+                    <p className="text-xs text-slate-400 italic border-l-2 border-white/10 pl-3 py-1">{m.originalText}</p>
+                    <p className="text-sm text-white font-medium">{m.translatedText}</p>
+                  </div>
+                ))}
+              </>
+            )}
+
+            {selectedSession && activeTab === "summary" && (
+              <div className="p-6 bg-white/5 border border-white/5 rounded-2xl space-y-4">
+                <div className="flex justify-between items-center border-b border-white/5 pb-3">
+                  <h4 className="font-bold text-white text-sm flex items-center gap-2">
+                    <Sparkles size={16} className="text-orange-400" />
+                    <span>AI Session Summary Matrix</span>
+                  </h4>
+                  {generatingSummary && <span className="text-xs text-orange-400 animate-pulse">Generating summary with Gemini AI...</span>}
+                </div>
+                {generatingSummary ? (
+                  <div className="py-12 text-center space-y-3">
+                    <div className="w-6 h-6 border-2 border-orange-500 border-t-transparent rounded-full animate-spin mx-auto" />
+                    <p className="text-xs text-slate-400">Analyzing live transcript lines and key points...</p>
+                  </div>
+                ) : (
+                  <pre className="whitespace-pre-wrap font-sans text-xs text-slate-300 leading-relaxed">
+                    {adminSummary || "Click 'Generate AI Summary' above to generate an executive overview and key takeaways."}
+                  </pre>
+                )}
+              </div>
+            )}
           </div>
         </div>
       </motion.div>
@@ -941,6 +1156,52 @@ const exportTranscriptCSV = (messages: FBMessage[], sessionName?: string, sessio
   URL.revokeObjectURL(url);
 };
 
+const SwitchConfirmModal = ({
+  isOpen,
+  onClose,
+  onConfirm
+}: {
+  isOpen: boolean;
+  onClose: () => void;
+  onConfirm: () => void;
+}) => {
+  if (!isOpen) return null;
+  return (
+    <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-xl" onClick={onClose} role="dialog" aria-modal="true">
+      <motion.div initial={{ scale: 0.9, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.9, opacity: 0 }} className="w-full max-w-md bg-[#0f172a] border border-white/10 rounded-[32px] p-8 shadow-2xl space-y-6" onClick={(e) => e.stopPropagation()}>
+        <div className="flex justify-between items-center border-b border-white/5 pb-4">
+          <div>
+            <h3 className="font-bold text-xl text-white">Switch to Listener Mode</h3>
+            <p className="text-xs text-slate-400 mt-0.5">Role transition confirmation</p>
+          </div>
+          <button onClick={onClose} className="w-8 h-8 bg-white/5 hover:bg-white/10 border border-white/10 rounded-full flex items-center justify-center text-slate-400">
+            <X size={16} />
+          </button>
+        </div>
+
+        <p className="text-sm text-slate-300 leading-relaxed">
+          Stop broadcasting microphone speech and switch to Listener mode? Your active speaker position will be released.
+        </p>
+
+        <div className="flex items-center gap-3 pt-2">
+          <button
+            onClick={onClose}
+            className="w-1/2 py-3 bg-white/5 hover:bg-white/10 text-slate-300 text-xs font-bold rounded-xl transition-all border border-white/10"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={onConfirm}
+            className="w-1/2 py-3 bg-blue-500 hover:bg-blue-600 text-white text-xs font-bold rounded-xl transition-all shadow-md shadow-blue-500/20"
+          >
+            Switch to Listener
+          </button>
+        </div>
+      </motion.div>
+    </motion.div>
+  );
+};
+
 export default function App() {
   const [user, setUser] = useState<any>(() => {
     try {
@@ -965,18 +1226,50 @@ export default function App() {
   const [messages, setMessages] = useState<FBMessage[]>([]);
   const [isLive, setIsLive] = useState(false);
   const [sessionRole, setSessionRole] = useState<'speaker' | 'listener' | null>(null);
+  const [userRole, setUserRole] = useState<UserRole>('LISTENER');
+  const [speakerSlot, setSpeakerSlot] = useState<string>('');
+  const [speakerRequestStatus, setSpeakerRequestStatus] = useState<SpeakerRequestStatus>('idle');
+  const [activePanelistCount, setActivePanelistCount] = useState<number>(1);
+  const [pendingSpeakerRequests, setPendingSpeakerRequests] = useState<Array<{ userId: string; userName: string; requestedAt: number; targetLang?: string }>>([]);
+  const [panelistRoster, setPanelistRoster] = useState<Array<{ speakerId: string; userId: string; userName: string; active: boolean; sourceLang?: string }>>([]);
+  const [showSwitchConfirmModal, setShowSwitchConfirmModal] = useState<boolean>(false);
   const [ws, setWs] = useState<WebSocket | null>(null);
+  const [connectionStatus, setConnectionStatus] = useState<'connected' | 'reconnecting' | 'disconnected' | 'connecting'>('disconnected');
+  const [wsConnectFailed, setWsConnectFailed] = useState<boolean>(false);
+  const wsConnectTimerRef = useRef<any>(null);
+  const wsHasJoinedRef = useRef<boolean>(false);
   const [listenerCount, setListenerCount] = useState(0);
   const [copiedId, setCopiedId] = useState(false);
 
-  const [playbackRate, setPlaybackRate] = useState<number>(1.0);
+  const [playbackRate, setPlaybackRate] = useState<number | string>(1.0);
+  const [sessionTopic, setSessionTopic] = useState<string>("");
   const [azureSyncStatus, setAzureSyncStatus] = useState<{ syncing: boolean; success?: boolean; message?: string }>({ syncing: false });
+  const [hostToken, setHostToken] = useState<string>("");
+  const hostTokenRef = useRef<string>("");
 
   const inputAudioCtxRef = useRef<AudioContext | null>(null);
   const outputAudioCtxRef = useRef<AudioContext | null>(null);
   const nextStartTimeRef = useRef<number>(0);
   const wsRef = useRef<WebSocket | null>(null);
+  const wsReconnectAttemptsRef = useRef<number>(0);
+  const wsPingIntervalRef = useRef<any>(null);
   const isLiveRef = useRef<boolean>(false);
+  const sessionRoleRef = useRef<'speaker' | 'listener' | null>(null);
+  const sessionTopicRef = useRef<string>("");
+  const activeSessionIdRef = useRef<string>("");
+  const sttBackoffMsRef = useRef<number>(200);
+
+  useEffect(() => {
+    sessionTopicRef.current = sessionTopic;
+  }, [sessionTopic]);
+
+  useEffect(() => {
+    isLiveRef.current = isLive;
+  }, [isLive]);
+
+  useEffect(() => {
+    sessionRoleRef.current = sessionRole;
+  }, [sessionRole]);
 
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, (u) => {
@@ -1012,8 +1305,10 @@ export default function App() {
   const [summaryContent, setSummaryContent] = useState<string>('');
   const [isGeneratingSummary, setIsGeneratingSummary] = useState<boolean>(false);
 
-  const handleGenerateSummary = async () => {
-    if (messages.length === 0) {
+  const handleGenerateSummary = async (sessionToSummarize?: Session | null, messagesToSummarize?: FBMessage[]) => {
+    const msgs = (messagesToSummarize && messagesToSummarize.length > 0) ? messagesToSummarize : messages;
+    const sess = sessionToSummarize !== undefined ? sessionToSummarize : currentSession;
+    if (msgs.length === 0) {
       alert("No session transcript messages available to summarize yet.");
       return;
     }
@@ -1024,14 +1319,30 @@ export default function App() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          sessionId: currentSession?.id,
-          messages,
+          sessionId: sess?.id || 'session-demo',
+          messages: msgs,
           targetLanguage: targetLang.name
         })
       });
       if (res.ok) {
         const data = await res.json();
-        setSummaryContent(data.summary || "Summary generated.");
+        const genSummary = data.summary || "Summary generated.";
+        setSummaryContent(genSummary);
+
+        // Store summary persistently in local storage history
+        if (sess?.id || currentSession?.id) {
+          const sid = sess?.id || currentSession?.id || 'demo';
+          try {
+            const savedSummaries = JSON.parse(localStorage.getItem("bharat_bridge_saved_summaries") || "{}");
+            savedSummaries[sid] = {
+              sessionId: sid,
+              summary: genSummary,
+              storedCloud: data.stored || false,
+              timestamp: new Date().toISOString()
+            };
+            localStorage.setItem("bharat_bridge_saved_summaries", JSON.stringify(savedSummaries));
+          } catch (storageErr) {}
+        }
       } else {
         setSummaryContent("Failed to generate AI summary.");
       }
@@ -1120,7 +1431,9 @@ export default function App() {
     };
   }, []);
 
-  const isAdminUser = user?.email === 'shrushti.cyda@gmail.com';
+  const [userRoleState, setUserRoleState] = useState<string | null>(null);
+  const adminEmails = ((import.meta as any).env?.VITE_ADMIN_EMAILS || "admin@bharatbridge.com").split(",").map((e: string) => e.trim().toLowerCase());
+  const isAdminUser = userRoleState === 'admin' || (user?.email && adminEmails.includes(user.email.toLowerCase())) || !!localStorage.getItem("bharat_bridge_admin_token") || process.env.NODE_ENV === "development";
 
   useEffect(() => {
     localStorage.setItem("bharat_bridge_profile", JSON.stringify(profile));
@@ -1129,26 +1442,7 @@ export default function App() {
   useEffect(() => {
     if (!currentSession) {
       setMessages([]);
-      return;
     }
-
-    const q = query(
-      collection(db, "sessions", currentSession.id, "messages"),
-      orderBy("timestamp", "desc"),
-      limit(50)
-    );
-
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      const newMessages = snapshot.docs.map(doc => ({
-        id: doc.id,
-        ...doc.data()
-      })) as FBMessage[];
-      setMessages(newMessages);
-    }, (error) => {
-      handleFirestoreError(error, OperationType.LIST, `sessions/${currentSession.id}/messages`);
-    });
-
-    return () => unsubscribe();
   }, [currentSession]);
 
   const syncToAzure = async () => {
@@ -1167,12 +1461,80 @@ export default function App() {
     setTimeout(() => setAzureSyncStatus({ syncing: false }), 4000);
   };
 
-  const ttsQueueRef = useRef<Array<{ base64?: string; text?: string; lang?: LanguageConfig; format?: string }>>([]);
+  const ttsQueueRef = useRef<Array<{ base64?: string; text?: string; lang?: LanguageConfig; targetLangCode?: string; format?: string; eventId?: string; sequenceNumber?: number }>>([]);
   const isPlayingTtsRef = useRef<boolean>(false);
   const activeAudioElRef = useRef<HTMLAudioElement | null>(null);
 
-  const enqueueTtsPlayback = (item: { base64?: string; text?: string; lang?: LanguageConfig; format?: string }) => {
-    ttsQueueRef.current.push(item);
+  const nextExpectedSeqRef = useRef<number>(1);
+  const holdBackMapRef = useRef<Map<number, { item: any; receivedAt: number }>>(new Map());
+  const holdBackTimeoutRef = useRef<any>(null);
+
+  const resetHoldBackBuffer = () => {
+    console.log("[BHARATBRIDGE][AUDIO_ORDERING] Resetting sequence counter and hold-back buffer for new session/reconnect");
+    nextExpectedSeqRef.current = 1;
+    holdBackMapRef.current.clear();
+    if (holdBackTimeoutRef.current) {
+      clearTimeout(holdBackTimeoutRef.current);
+      holdBackTimeoutRef.current = null;
+    }
+    ttsQueueRef.current = [];
+    isPlayingTtsRef.current = false;
+  };
+
+  const drainHoldBackQueue = () => {
+    while (holdBackMapRef.current.has(nextExpectedSeqRef.current)) {
+      const nextObj = holdBackMapRef.current.get(nextExpectedSeqRef.current)!;
+      holdBackMapRef.current.delete(nextExpectedSeqRef.current);
+      console.log(`[BHARATBRIDGE][AUDIO_ORDERING] Releasing sequenceNumber #${nextExpectedSeqRef.current} from hold-back buffer`);
+      ttsQueueRef.current.push(nextObj.item);
+      nextExpectedSeqRef.current++;
+    }
+  };
+
+  const enqueueTtsPlayback = (item: { base64?: string; text?: string; lang?: LanguageConfig; targetLangCode?: string; format?: string; eventId?: string; sequenceNumber?: number }) => {
+    const activeTargetCode = item.targetLangCode || item.lang?.code || targetLang.code;
+    if (item.eventId) {
+      observabilityService.recordEvent({
+        eventId: item.eventId,
+        sessionId: currentSession?.id || '582941',
+        sourceLanguage: sourceLang.code,
+        targetLanguage: activeTargetCode,
+        stage: 'AUDIO',
+        eventType: 'AUDIO_QUEUE_ADD',
+        status: 'SUCCESS'
+      });
+    }
+
+    const itemToPush = { ...item, targetLangCode: activeTargetCode };
+
+    if (item.sequenceNumber !== undefined) {
+      if (item.sequenceNumber === nextExpectedSeqRef.current) {
+        ttsQueueRef.current.push(itemToPush);
+        nextExpectedSeqRef.current++;
+        drainHoldBackQueue();
+      } else if (item.sequenceNumber > nextExpectedSeqRef.current) {
+        console.log(`[BHARATBRIDGE][AUDIO_ORDERING] Holding back sequenceNumber #${item.sequenceNumber} (expected #${nextExpectedSeqRef.current})`);
+        holdBackMapRef.current.set(item.sequenceNumber, { item: itemToPush, receivedAt: Date.now() });
+
+        if (!holdBackTimeoutRef.current) {
+          holdBackTimeoutRef.current = setTimeout(() => {
+            holdBackTimeoutRef.current = null;
+            if (holdBackMapRef.current.size > 0) {
+              const sortedSeqs = Array.from(holdBackMapRef.current.keys()).sort((a: number, b: number) => a - b);
+              console.warn(`[BHARATBRIDGE][AUDIO_ORDERING] 4s timeout waiting for seq #${nextExpectedSeqRef.current}. Skipping to #${sortedSeqs[0]}`);
+              nextExpectedSeqRef.current = sortedSeqs[0];
+              drainHoldBackQueue();
+              processTtsQueue();
+            }
+          }, 4000);
+        }
+      } else {
+        ttsQueueRef.current.push(itemToPush);
+      }
+    } else {
+      ttsQueueRef.current.push(itemToPush);
+    }
+
     processTtsQueue();
   };
 
@@ -1183,9 +1545,9 @@ export default function App() {
     const item = ttsQueueRef.current.shift()!;
     try {
       if (item.base64) {
-        await playSingleAudioChunk(item.base64, item.format);
+        await playSingleAudioChunk(item.base64, item.format, item.eventId, item.targetLangCode);
       } else if (item.text && item.lang) {
-        await playSingleWebSpeech(item.text, item.lang);
+        await playSingleWebSpeech(item.text, item.lang, item.eventId);
       }
     } catch (e) {
       console.warn("TTS Queue playback error:", e);
@@ -1197,11 +1559,13 @@ export default function App() {
     }
   };
 
-  const playSingleAudioChunk = (base64: string, format?: string): Promise<void> => {
+  const playSingleAudioChunk = (base64: string, format?: string, eventId?: string, targetLangCode?: string): Promise<void> => {
     return new Promise((resolve) => {
       if (!base64) return resolve();
       unmuteAudio();
 
+      const activeTargetCode = targetLangCode || targetLang.code;
+      console.log("[BHARATBRIDGE][AUDIO_PLAY] Starting playSingleAudioChunk, base64 length:", base64.length, "eventId:", eventId, "targetLangCode:", activeTargetCode);
       if (activeAudioElRef.current) {
         try { activeAudioElRef.current.pause(); } catch (_) {}
         activeAudioElRef.current = null;
@@ -1209,38 +1573,121 @@ export default function App() {
 
       const audioUrl = `data:${format || "audio/mp3"};base64,${base64}`;
       const audioEl = new Audio(audioUrl);
-      audioEl.playbackRate = playbackRate;
+
+      const queueLen = ttsQueueRef.current.length;
+      const targetRate = (playbackRate as any) === "auto" 
+        ? (queueLen > 1 ? 1.25 : 1.0)
+        : (typeof playbackRate === "number" ? playbackRate : parseFloat(playbackRate as any) || 1.0);
+
+      audioEl.playbackRate = targetRate;
+
+      const hasPreservesPitch = 'preservesPitch' in audioEl;
+      const hasWebkitPreservesPitch = 'webkitPreservesPitch' in audioEl;
+      const hasMozPreservesPitch = 'mozPreservesPitch' in audioEl;
+
+      if (hasPreservesPitch) (audioEl as any).preservesPitch = true;
+      if (hasWebkitPreservesPitch) (audioEl as any).webkitPreservesPitch = true;
+      if (hasMozPreservesPitch) (audioEl as any).mozPreservesPitch = true;
+
+      const activePreservesPitch = (audioEl as any).preservesPitch ?? (audioEl as any).webkitPreservesPitch ?? (audioEl as any).mozPreservesPitch;
+
+      console.log(`[BHARATBRIDGE][AUDIO_PITCH_DIAGNOSTIC] playbackRate: ${playbackRate}, preservesPitch: ${activePreservesPitch}, supportedProps: { standard: ${hasPreservesPitch}, webkit: ${hasWebkitPreservesPitch}, moz: ${hasMozPreservesPitch} }`);
+
       activeAudioElRef.current = audioEl;
 
       audioEl.onended = () => {
+        console.log("[BHARATBRIDGE][AUDIO_PLAY] Audio playback ended successfully.");
+        if (eventId) {
+          observabilityService.recordEvent({
+            eventId,
+            sessionId: currentSession?.id || '582941',
+            sourceLanguage: sourceLang.code,
+            targetLanguage: activeTargetCode,
+            stage: 'AUDIO',
+            eventType: 'AUDIO_PLAY_SUCCESS',
+            status: 'SUCCESS'
+          });
+        }
         activeAudioElRef.current = null;
         resolve();
       };
-      audioEl.onerror = () => {
+      audioEl.onerror = (e) => {
+        console.error("[BHARATBRIDGE][AUDIO_PLAY] Audio element error:", e);
+        if (eventId) {
+          observabilityService.recordEvent({
+            eventId,
+            sessionId: currentSession?.id || '582941',
+            sourceLanguage: sourceLang.code,
+            targetLanguage: activeTargetCode,
+            stage: 'AUDIO',
+            eventType: 'AUDIO_PLAY_FAILURE',
+            status: 'FAILURE',
+            errorCode: 'AUDIO_PLAYBACK_ERROR'
+          });
+        }
         activeAudioElRef.current = null;
         resolve();
       };
 
-      audioEl.play().catch(() => {
+      audioEl.play().then(() => {
+        console.log("[BHARATBRIDGE][AUDIO_PLAY] Audio playback STARTED successfully.");
+
+        setTimeout(() => {
+          console.log(`[BHARATBRIDGE][AUDIO_PLAY_1S_DIAGNOSTIC] muted=${audioEl.muted}, volume=${audioEl.volume}, duration=${audioEl.duration}s, currentTime=${audioEl.currentTime}s, paused=${audioEl.paused}, ended=${audioEl.ended}`);
+        }, 1000);
+
+        if (eventId) {
+          observabilityService.recordEvent({
+            eventId,
+            sessionId: currentSession?.id || '582941',
+            sourceLanguage: sourceLang.code,
+            targetLanguage: activeTargetCode,
+            stage: 'AUDIO',
+            eventType: 'AUDIO_PLAY_START',
+            status: 'SUCCESS'
+          });
+        }
+      }).catch((err) => {
+        console.error("[BHARATBRIDGE][AUDIO_PLAY] Audio play() promise rejected:", err);
+        const isAutoplay = err?.name === 'NotAllowedError' || err?.message?.includes('user gesture');
+        if (eventId) {
+          observabilityService.recordEvent({
+            eventId,
+            sessionId: currentSession?.id || '582941',
+            sourceLanguage: sourceLang.code,
+            targetLanguage: activeTargetCode,
+            stage: 'AUDIO',
+            eventType: 'AUDIO_PLAY_FAILURE',
+            status: 'FAILURE',
+            errorCode: isAutoplay ? 'MOBILE_BROWSER_AUDIO_AUTOPLAY' : 'AUDIO_PLAYBACK_ERROR',
+            errorMessage: err?.message || 'Audio playback rejected by browser autoplay policy'
+          });
+        }
         activeAudioElRef.current = null;
         resolve();
       });
     });
   };
 
-  const playSingleWebSpeech = (text: string, lang: LanguageConfig): Promise<void> => {
+  const playSingleWebSpeech = (text: string, lang: LanguageConfig, eventId?: string): Promise<void> => {
     return new Promise((resolve) => {
       if (!text || typeof window === "undefined" || !window.speechSynthesis) return resolve();
       try {
         window.speechSynthesis.cancel();
         window.speechSynthesis.resume();
         const voices = window.speechSynthesis.getVoices();
-        const exactVoice = voices.find(v => 
+        const matchingVoices = voices.filter(v => 
           v.lang.toLowerCase() === `${lang.code}-in` || 
           v.lang.toLowerCase().startsWith(lang.code)
         );
+        const naturalVoice = matchingVoices.find(v => 
+          v.name.toLowerCase().includes("natural") || 
+          v.name.toLowerCase().includes("google") || 
+          v.name.toLowerCase().includes("neural")
+        ) || matchingVoices[0];
+
         const utterance = new SpeechSynthesisUtterance(text);
-        if (exactVoice) utterance.voice = exactVoice;
+        if (naturalVoice) utterance.voice = naturalVoice;
         utterance.lang = lang.code === "en" ? "en-IN" : `${lang.code}-IN`;
         utterance.rate = playbackRate;
 
@@ -1283,13 +1730,320 @@ export default function App() {
     }
   };
 
+  const initWebSocket = (sessionId: string, initialRole: 'organizer' | 'listener', isReconnect = false) => {
+    if (sessionId) activeSessionIdRef.current = sessionId;
+    if (wsRef.current) {
+      try {
+        wsRef.current.onopen = null;
+        wsRef.current.onmessage = null;
+        wsRef.current.onerror = null;
+        wsRef.current.onclose = null;
+        wsRef.current.close();
+      } catch (_) {}
+      wsRef.current = null;
+    }
+
+    if (!isReconnect) {
+      wsHasJoinedRef.current = false;
+      setWsConnectFailed(false);
+    }
+
+    if (wsConnectTimerRef.current) {
+      clearTimeout(wsConnectTimerRef.current);
+      wsConnectTimerRef.current = null;
+    }
+
+    wsConnectTimerRef.current = setTimeout(() => {
+      if (!wsHasJoinedRef.current) {
+        setWsConnectFailed(true);
+      }
+    }, 3000);
+
+    setConnectionStatus(isReconnect ? 'reconnecting' : 'connecting');
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const socket = new WebSocket(`${protocol}//${window.location.host}`);
+    wsRef.current = socket;
+    setWs(socket);
+
+    socket.onopen = () => {
+      console.log(`[BHARATBRIDGE][WS_RESILIENCE] Main WebSocket connected successfully (isReconnect=${isReconnect})`);
+      wsReconnectAttemptsRef.current = 0;
+      wsHasJoinedRef.current = true;
+      setWsConnectFailed(false);
+      if (wsConnectTimerRef.current) {
+        clearTimeout(wsConnectTimerRef.current);
+        wsConnectTimerRef.current = null;
+      }
+      setConnectionStatus('connected');
+      unmuteAudio();
+
+      const storedHostToken = hostTokenRef.current || (sessionId ? sessionStorage.getItem(`bharat_bridge_host_token_${sessionId}`) : "") || "";
+      const currentEffectiveRole = sessionRoleRef.current || (initialRole === 'organizer' ? 'speaker' : 'listener');
+      const joinRole = currentEffectiveRole === 'speaker' ? 'organizer' : 'listener';
+
+      socket.send(JSON.stringify({ 
+        type: "join", 
+        sessionId, 
+        role: joinRole,
+        hostToken: storedHostToken || undefined,
+        userId: user?.uid || `usr_${Date.now()}`,
+        userName: user?.displayName || (joinRole === 'organizer' ? "Host Speaker" : "Guest Listener"),
+        gender: profile.gender,
+        targetLang: targetLang.code,
+        topic: sessionTopicRef.current
+      }));
+
+      if (wsPingIntervalRef.current) clearInterval(wsPingIntervalRef.current);
+      wsPingIntervalRef.current = setInterval(() => {
+        if (socket.readyState === WebSocket.OPEN) {
+          socket.send(JSON.stringify({ type: "ping", timestamp: Date.now() }));
+        }
+      }, 25000);
+    };
+
+    socket.onmessage = (event) => {
+      try {
+        const msg = JSON.parse(event.data);
+        if (msg.type === "pong") return;
+        if (msg.type === "host_token" && msg.hostToken) {
+          console.log(`[BHARATBRIDGE][HOST_TOKEN] Stored hostToken for session '${msg.sessionId || sessionId}'`);
+          setHostToken(msg.hostToken);
+          hostTokenRef.current = msg.hostToken;
+          if (sessionId || msg.sessionId) {
+            sessionStorage.setItem(`bharat_bridge_host_token_${msg.sessionId || sessionId}`, msg.hostToken);
+          }
+        }
+        if (msg.type === "audio") playAudioChunk(msg.audio, msg.format);
+        if (msg.type === "stats") setListenerCount(msg.listeners);
+        if (msg.type === "speaker_request_status") {
+          setSpeakerRequestStatus(msg.status || "pending");
+        }
+        if (msg.type === "role_changed") {
+          if (msg.status === "takeover_prevented") {
+            console.warn(`[SECURITY][TAKEOVER_PREVENTED] Host takeover prevented by server: ${msg.message}`);
+            setUserRole("LISTENER");
+            setSessionRole("listener");
+            sessionRoleRef.current = "listener";
+            setSpeakerSlot("");
+            setSpeakerRequestStatus("idle");
+          } else if (msg.role === "PANELIST") {
+            setUserRole("PANELIST");
+            setSessionRole("speaker");
+            sessionRoleRef.current = "speaker";
+            setSpeakerSlot(msg.speakerId || "speaker-01");
+            setSpeakerRequestStatus("approved");
+            setSourceLang(targetLang);
+            unmuteAudio();
+            toggleListening(true);
+          } else if (msg.role === "LISTENER") {
+            setUserRole("LISTENER");
+            setSessionRole("listener");
+            sessionRoleRef.current = "listener";
+            setSpeakerSlot("");
+            if (msg.status === "rejected") setSpeakerRequestStatus("rejected");
+            else if (msg.status === "limit_reached") setSpeakerRequestStatus("limit_reached");
+            else setSpeakerRequestStatus("idle");
+          }
+        }
+        if (msg.type === "room_state" || msg.type === "history") {
+          if (msg.name || msg.topic || msg.sourceLang) {
+            const sCode = msg.sourceLang || "en";
+            const matchedSource = LANGUAGES.find(l => l.code === sCode);
+            if (matchedSource) setSourceLang(matchedSource);
+
+            setCurrentSession(prev => ({
+              id: msg.sessionId || prev?.id || activeSessionIdRef.current,
+              name: msg.name || msg.topic || prev?.name || `Live Session #${msg.sessionId || activeSessionIdRef.current}`,
+              sourceLang: sCode,
+              targetLang: prev?.targetLang || targetLang.code || 'hi',
+              status: 'active'
+            }));
+          }
+        }
+        if (msg.type === "room_state") {
+          if (typeof msg.activePanelistCount === "number") setActivePanelistCount(msg.activePanelistCount);
+          if (Array.isArray(msg.pendingRequests)) setPendingSpeakerRequests(msg.pendingRequests);
+          if (Array.isArray(msg.panelists)) setPanelistRoster(msg.panelists);
+        }
+        if (msg.type === "history" && Array.isArray(msg.messages)) {
+          const uniqueHistory: FBMessage[] = [];
+          const seenIds = new Set<string>();
+
+          for (let idx = 0; idx < msg.messages.length; idx++) {
+            const m = msg.messages[idx];
+            const itemKey = m.eventId || m.id || `hist-${m.timestamp || idx}`;
+            if (!seenIds.has(itemKey)) {
+              seenIds.add(itemKey);
+              uniqueHistory.push({
+                id: itemKey,
+                originalText: m.originalText,
+                translatedText: m.translatedText,
+                timestamp: { seconds: Math.floor((m.timestamp || Date.now()) / 1000) } as any,
+                senderId: "system",
+                sourceLang: m.sourceLang,
+                targetLang: m.targetLang
+              } as FBMessage);
+            }
+          }
+          setMessages(uniqueHistory);
+          if (uniqueHistory.length > 0) {
+            setTranslatedText(uniqueHistory[0].translatedText);
+          }
+        }
+        if (msg.type === "transcription") {
+          const eventId = msg.eventId || generateEventId();
+          observabilityService.recordEvent({
+            eventId,
+            sessionId: currentSession?.id || "unknown",
+            sourceLanguage: msg.sourceLang || sourceLang.code,
+            targetLanguage: msg.targetLang || targetLang.code,
+            stage: "WEBSOCKET",
+            eventType: "LISTENER_RECEIVE",
+            status: "SUCCESS"
+          });
+          console.log("[BHARATBRIDGE][WS_RECEIVE] Client received transcription message:", msg);
+          if (msg.translatedText) {
+            setTranslatedText(msg.translatedText);
+          }
+          if (!msg.isFinal) {
+            setLiveInterimText(msg.translatedText || msg.originalText || "");
+          } else {
+            setLiveInterimText("");
+          }
+          if (msg.isFinal && (msg.translatedText || msg.originalText)) {
+            const finalTranslatedText = (msg.translatedText || msg.originalText || "").trim();
+            observabilityService.recordEvent({
+              eventId,
+              sessionId: currentSession?.id || "unknown",
+              sourceLanguage: msg.sourceLang || sourceLang.code,
+              targetLanguage: msg.targetLang || targetLang.code,
+              stage: "LISTENER",
+              eventType: "LISTENER_RENDER",
+              status: "SUCCESS"
+            });
+
+            const activeTargetLang = LANGUAGES.find(l => l.code === msg.targetLang) || targetLang;
+            const msgEventId = msg.eventId || `live-${Date.now()}`;
+
+            setMessages(prev => {
+              const existingIdx = prev.findIndex(m => m.id === msgEventId || (m as any).eventId === msgEventId);
+              const newMsgRecord: FBMessage = {
+                id: msgEventId,
+                originalText: msg.originalText,
+                translatedText: finalTranslatedText,
+                timestamp: { seconds: Math.floor(Date.now() / 1000) } as any,
+                sourceLang: sourceLang.code,
+                targetLang: activeTargetLang.code,
+                speakerId: msg.speakerId,
+                speakerName: msg.speakerName
+              } as any;
+
+              if (existingIdx >= 0) {
+                const updated = [...prev];
+                updated[existingIdx] = newMsgRecord;
+                return updated;
+              }
+              return [newMsgRecord, ...prev];
+            });
+
+            const now = Date.now();
+            const cleanText = msg.translatedText.trim();
+            const isDuplicateTts = (lastListenerSpokenRef.current.text === cleanText) && (now - lastListenerSpokenRef.current.time < 4000);
+            const isMyOwnSpeech = (msg.speakerId && msg.speakerId === speakerSlot) || (msg.speakerName && msg.speakerName === user?.displayName);
+
+            if (isMyOwnSpeech) {
+              console.log("[BHARATBRIDGE][TTS_REQUEST] Suppressed self-TTS playback for originating speaker to prevent audio feedback loop:", cleanText);
+            } else if (isDuplicateTts) {
+              console.log("[BHARATBRIDGE][TTS_REQUEST] Suppressed duplicate audio playback due to 4s window:", cleanText);
+            } else {
+              lastListenerSpokenRef.current = { text: cleanText, time: now };
+              const msgSessionId = msg.sessionId || activeSessionIdRef.current || currentSession?.id;
+              speak(msg.translatedText, activeTargetLang, eventId, msg.sequenceNumber, msgSessionId);
+            }
+          }
+        }
+      } catch (err) {
+        console.warn("[BHARATBRIDGE][WS_RECEIVE] Error processing websocket message:", err);
+      }
+    };
+
+    const handleDisconnect = (source: string, evt: any) => {
+      console.warn(`[BHARATBRIDGE][WS_RESILIENCE] Main WebSocket ${source} fired (readyState=${socket.readyState}).`, evt);
+      if (!wsHasJoinedRef.current) {
+        setWsConnectFailed(true);
+      }
+      if (wsPingIntervalRef.current) {
+        clearInterval(wsPingIntervalRef.current);
+        wsPingIntervalRef.current = null;
+      }
+
+      if (!isLiveRef.current) {
+        setConnectionStatus('disconnected');
+        return;
+      }
+
+      setConnectionStatus('reconnecting');
+      wsReconnectAttemptsRef.current += 1;
+      const attempts = wsReconnectAttemptsRef.current;
+      const delay = Math.min(1000 * Math.pow(1.5, attempts - 1), 10000);
+
+      console.log(`[BHARATBRIDGE][WS_RESILIENCE] Auto-reconnecting in ${Math.round(delay)}ms (attempt #${attempts})...`);
+      setTimeout(() => {
+        if (isLiveRef.current) {
+          initWebSocket(sessionId, initialRole, true);
+        }
+      }, delay);
+    };
+
+    socket.onerror = (e) => handleDisconnect("onerror", e);
+    socket.onclose = (e) => handleDisconnect("onclose", e);
+  };
+
+  const [sessionToken, setSessionToken] = useState<string | null>(null);
+  const sessionTokenRef = useRef<string | null>(null);
+
   const startLiveSession = async () => {
+    let pinCode = "";
+    let hostTok = "";
+    let sessionTok = "";
+
+    try {
+      const res = await fetch("/api/sessions/create", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sourceLang: sourceLang.code,
+          targetLang: targetLang.code,
+          speakerGender: profile.gender,
+          userId: user?.uid
+        })
+      });
+      const data = await res.json();
+      if (data.success && data.sessionId) {
+        pinCode = data.sessionId;
+        hostTok = data.hostToken;
+        sessionTok = data.sessionToken;
+        setHostToken(hostTok);
+        hostTokenRef.current = hostTok;
+        setSessionToken(sessionTok);
+        sessionTokenRef.current = sessionTok;
+        sessionStorage.setItem(`bharat_bridge_host_token_${pinCode}`, hostTok);
+        sessionStorage.setItem(`bharat_bridge_session_token_${pinCode}`, sessionTok);
+      }
+    } catch (createErr) {
+      console.warn("[SESSION_CREATE_FALLBACK]", createErr);
+    }
+
+    if (!pinCode) {
+      alert("Failed to create live session. Please check your network connection and try again.");
+      return;
+    }
+
     const activeUserId = user?.uid || `guest-${Math.random().toString(36).substring(2, 9)}`;
-    const pinCode = Math.floor(100000 + Math.random() * 900000).toString(); // Memorable 6-digit PIN (e.g. 582941)
     const sessionData = {
       id: pinCode,
       name: `Live Session #${pinCode} - ${sourceLang.name} to ${targetLang.name}`,
-      createdAt: serverTimestamp(),
+      createdAt: Date.now(),
       speakerId: activeUserId,
       speakerGender: profile.gender,
       sourceLang: sourceLang.code,
@@ -1298,17 +2052,15 @@ export default function App() {
     };
 
     const sessionId = pinCode;
-    
-    // Save to Firestore asynchronously (non-blocking so room creation is instant)
-    setDoc(doc(db, "sessions", pinCode), sessionData).catch((error) => {
-      console.warn("Firestore save fallback to local session ID:", error);
-    });
-
+    resetHoldBackBuffer();
     audioBufferRef.current = [];
     setCurrentSession(sessionData as any);
     isLiveRef.current = true;
     setIsLive(true);
+    setUserRole('ORGANIZER');
+    setSpeakerSlot('speaker-01');
     setSessionRole('speaker');
+    sessionRoleRef.current = 'speaker';
     setAutoDetect(true);
     setModalOpen({ open: true, type: "qr" });
 
@@ -1316,47 +2068,88 @@ export default function App() {
     unmuteAudio();
     toggleListening(true);
 
-    // Setup WebSocket immediately
-    const socket = new WebSocket(`${window.location.protocol === "https:" ? "wss:" : "ws:"}//${window.location.host}`);
-    wsRef.current = socket;
-    setWs(socket);
+    // Setup WebSocket immediately with auto-reconnect resilience
+    initWebSocket(sessionId, "organizer");
+  };
 
-    socket.onopen = () => {
-      socket.send(JSON.stringify({ 
-        type: "join", 
-        sessionId, 
-        role: "speaker", 
-        gender: profile.gender,
+  const handleRequestToSpeak = () => {
+    const activeWs = wsRef.current || ws;
+    if (activeWs && activeWs.readyState === WebSocket.OPEN && currentSession) {
+      setSpeakerRequestStatus('pending');
+      activeWs.send(JSON.stringify({
+        type: "speaker_request",
+        sessionId: currentSession.id,
+        userId: user?.uid || `usr_${Date.now()}`,
+        userName: user?.displayName || "Guest Listener",
         targetLang: targetLang.code
       }));
-    };
-    socket.onmessage = (event) => {
-      const msg = JSON.parse(event.data);
-      if (msg.type === "audio") playAudioChunk(msg.audio, msg.format);
-      if (msg.type === "stats") setListenerCount(msg.listeners);
-      if (msg.type === "transcription") {
-        if (msg.isFinal) {
-          pushMessageToLive(msg.originalText, msg.translatedText);
-        }
-      }
-      if (msg.type === "interrupted") {
-        nextStartTimeRef.current = 0;
-      }
-    };
+    }
+  };
+
+  const handleSpeakerApproval = (targetUserId: string, approved: boolean) => {
+    const activeWs = wsRef.current || ws;
+    if (activeWs && activeWs.readyState === WebSocket.OPEN && currentSession) {
+      activeWs.send(JSON.stringify({
+        type: "speaker_approval",
+        sessionId: currentSession.id,
+        targetUserId,
+        approved
+      }));
+    }
+  };
+
+  const handleConfirmSwitchToListener = () => {
+    shouldBeListeningRef.current = false;
+    try { recognitionRef.current?.stop(); } catch (_) {}
+    if (inputAudioCtxRef.current) {
+      inputAudioCtxRef.current.close();
+      inputAudioCtxRef.current = null;
+    }
+    setIsListening(false);
+    setShowSwitchConfirmModal(false);
+
+    const activeWs = wsRef.current || ws;
+    if (activeWs && activeWs.readyState === WebSocket.OPEN && currentSession) {
+      activeWs.send(JSON.stringify({
+        type: "switch_to_listener",
+        sessionId: currentSession.id
+      }));
+    }
   };
 
   const endLiveSession = async () => {
-    if (!currentSession || sessionRole !== 'speaker') return;
+    console.log("[BHARATBRIDGE][END_SESSION] Ending live session...", { currentSession, sessionRole, userRole });
+    if (!currentSession && !isLive) return;
     shouldBeListeningRef.current = false;
     isLiveRef.current = false;
+
+    const activeSession = currentSession;
+    const activeMessages = [...messages];
+
+    // 1. Sync & save session captions (Azure Storage / local history)
+    syncToAzure();
+
+    // 2. Generate & display AI Session Summary if messages exist
+    if (activeMessages.length > 0) {
+      handleGenerateSummary(activeSession, activeMessages);
+    }
+
     try {
-      await updateDoc(doc(db, "sessions", currentSession.id), {
-        status: 'finished'
-      }).catch(() => {});
+      // Clean shutdown
     } finally {
+      resetHoldBackBuffer();
       setIsLive(false);
+      isLiveRef.current = false;
       setSessionRole(null);
-      setCurrentSession(null);
+      sessionRoleRef.current = null;
+      setUserRole('LISTENER');
+      setSpeakerSlot('');
+      setSpeakerRequestStatus('idle');
+      setConnectionStatus('disconnected');
+      if (wsPingIntervalRef.current) {
+        clearInterval(wsPingIntervalRef.current);
+        wsPingIntervalRef.current = null;
+      }
       if (wsRef.current) wsRef.current.close();
       wsRef.current = null;
       setWs(null);
@@ -1390,105 +2183,28 @@ export default function App() {
 
   const joinLiveSession = async (rawSessionId: string) => {
     const sessionId = rawSessionId.trim();
-    let sessionData = {
+    const sessionData = {
+      id: sessionId,
       sourceLang: sourceLang.code,
       targetLang: targetLang.code,
       name: `Live Session #${sessionId}`
     };
 
-    let targetLangConfig: LanguageConfig | undefined = undefined;
-    try {
-      const docRef = doc(db, "sessions", sessionId);
-      const docSnap = await getDoc(docRef);
-      if (docSnap.exists()) {
-        const data = docSnap.data();
-        sessionData = { ...sessionData, ...data };
-        const s = LANGUAGES.find(l => l.code === data.sourceLang);
-        if (s) setSourceLang(s);
-      }
-    } catch (error) {
-      console.warn("Firestore lookup fallback:", error);
-    }
-
+    resetHoldBackBuffer();
     audioBufferRef.current = [];
-    setCurrentSession({ id: sessionId, ...sessionData } as Session);
+    setCurrentSession(sessionData as Session);
     isLiveRef.current = true;
     setIsLive(true);
     setSessionRole('listener');
+    sessionRoleRef.current = 'listener';
+    setUserRole('LISTENER');
     setModalOpen({ open: true, type: "target" });
 
-    // Setup WebSocket
-    const socket = new WebSocket(`${window.location.protocol === "https:" ? "wss:" : "ws:"}//${window.location.host}`);
-    wsRef.current = socket;
-    setWs(socket);
+    // Synchronously unlock audio on user gesture
+    unmuteAudio();
 
-    socket.onopen = () => {
-      unmuteAudio();
-      socket.send(JSON.stringify({ 
-        type: "join", 
-        sessionId, 
-        role: "listener",
-        targetLang: targetLang.code
-      }));
-    };
-    socket.onmessage = (event) => {
-      const msg = JSON.parse(event.data);
-      if (msg.type === "audio") playAudioChunk(msg.audio, msg.format);
-      if (msg.type === "stats") setListenerCount(msg.listeners);
-      if (msg.type === "history" && Array.isArray(msg.messages)) {
-        const uniqueHistory: FBMessage[] = [];
-        const seenTexts = new Set<string>();
-
-        for (let idx = 0; idx < msg.messages.length; idx++) {
-          const m = msg.messages[idx];
-          const key = (m.originalText || "").trim().toLowerCase();
-          if (key && !seenTexts.has(key)) {
-            seenTexts.add(key);
-            uniqueHistory.push({
-              id: `hist-${m.timestamp || idx}`,
-              originalText: m.originalText,
-              translatedText: m.translatedText,
-              timestamp: { seconds: Math.floor((m.timestamp || Date.now()) / 1000) } as any,
-              senderId: "system",
-              sourceLang: m.sourceLang,
-              targetLang: m.targetLang
-            } as FBMessage);
-          }
-        }
-        setMessages(uniqueHistory);
-        if (uniqueHistory.length > 0) {
-          setTranslatedText(uniqueHistory[0].translatedText);
-        }
-      }
-      if (msg.type === "transcription") {
-        if (msg.translatedText) {
-          setTranslatedText(msg.translatedText);
-        }
-        if (msg.isFinal && msg.translatedText && msg.translatedText.trim()) {
-          const now = Date.now();
-          const cleanText = msg.translatedText.trim();
-          if (lastListenerSpokenRef.current.text === cleanText && (now - lastListenerSpokenRef.current.time < 4000)) {
-            return;
-          }
-          lastListenerSpokenRef.current = { text: cleanText, time: now };
-
-          setMessages(prev => {
-            const cleanOriginal = (msg.originalText || "").trim().toLowerCase();
-            const exists = prev.some(m => (m.originalText || "").trim().toLowerCase() === cleanOriginal);
-            if (exists) return prev;
-            return [{
-              id: `live-${Date.now()}`,
-              originalText: msg.originalText,
-              translatedText: msg.translatedText,
-              timestamp: { seconds: Math.floor(Date.now() / 1000) } as any,
-              sourceLang: sourceLang.code,
-              targetLang: targetLang.code
-            } as FBMessage, ...prev];
-          });
-          speak(msg.translatedText, targetLang);
-        }
-      }
-    };
+    // Setup WebSocket immediately with auto-reconnect resilience
+    initWebSocket(sessionId, "listener");
   };
 
   const pushMessageToLive = async (original: string, translated: string) => {
@@ -1503,26 +2219,12 @@ export default function App() {
       targetLang: targetLang.code
     };
 
+    // Instant local UI state rendering (Server is authoritative Firestore writer)
     setMessages(prev => {
       const exists = prev.some(m => m.originalText === original && m.translatedText === translated);
       if (exists) return prev;
       return [newMessage, ...prev];
     });
-
-    if (user) {
-      try {
-        await addDoc(collection(db, "sessions", currentSession.id, "messages"), {
-          originalText: original,
-          translatedText: translated,
-          timestamp: serverTimestamp(),
-          senderId: user.uid,
-          sourceLang: sourceLang.code,
-          targetLang: targetLang.code
-        });
-      } catch (error) {
-        handleFirestoreError(error, OperationType.CREATE, `sessions/${currentSession.id}/messages`);
-      }
-    }
   };
 
   const saveCurrentPair = () => {
@@ -1550,29 +2252,50 @@ export default function App() {
 
   const recognitionRef = useRef<any>(null);
   const shouldBeListeningRef = useRef(false);
-  const sentenceQueueRef = useRef<string[]>([]);
+  const sttRestartTimerRef = useRef<any>(null);
+  const sentenceQueueRef = useRef<Array<{ sentence: string; eventId: string }>>([]);
   const isProcessingQueueRef = useRef<boolean>(false);
   const lastProcessedSentenceRef = useRef<{ text: string; time: number }>({ text: "", time: 0 });
   const lastListenerSpokenRef = useRef<{ text: string; time: number }>({ text: "", time: 0 });
 
-  const enqueueSpokenSentence = (sentence: string) => {
-    const clean = sentence.trim();
-    if (!clean) return;
+  const speechSeqRef = useRef<number>(1);
+  const enqueueSpokenSentence = (sentenceBlock: string) => {
+    const cleanBlock = sentenceBlock.trim();
+    if (!cleanBlock) return;
 
-    // Prevent duplicate STT invocations for building or partial sentences within 4000ms
-    const now = Date.now();
-    const prevText = lastProcessedSentenceRef.current.text.toLowerCase();
-    const cleanLower = clean.toLowerCase();
+    // Split finalized block into individual sentences on punctuation boundaries (. ! ? ।)
+    const sentences = cleanBlock
+      .match(/[^.?!।]+[.?!।]?/g)
+      ?.map(s => s.trim())
+      .filter(Boolean) || [cleanBlock];
 
-    if ((prevText === cleanLower || (prevText.length > 5 && cleanLower.includes(prevText)) || (cleanLower.length > 5 && prevText.includes(cleanLower))) && (now - lastProcessedSentenceRef.current.time < 4000)) {
-      if (cleanLower.length > prevText.length) {
-        lastProcessedSentenceRef.current.text = clean;
+    sentences.forEach((sentence) => {
+      const clean = sentence.trim();
+      if (!clean) return;
+
+      const now = Date.now();
+      if (lastProcessedSentenceRef.current.text === clean && (now - lastProcessedSentenceRef.current.time < 1000)) {
+        console.log("[BHARATBRIDGE][STT] Deduplicator dropped duplicate sentence:", clean);
+        return;
       }
-      return;
-    }
-    lastProcessedSentenceRef.current = { text: clean, time: now };
+      lastProcessedSentenceRef.current = { text: clean, time: now };
 
-    sentenceQueueRef.current.push(clean);
+      const eventId = generateEventId();
+      observabilityService.recordEvent({
+        eventId,
+        sessionId: currentSession?.id || '582941',
+        speakerId: speakerSlot || 'speaker-01',
+        sourceLanguage: sourceLang.code,
+        targetLanguage: targetLang.code,
+        stage: 'STT',
+        eventType: 'STT_FINAL',
+        status: 'SUCCESS'
+      });
+
+      console.log("[BHARATBRIDGE][STT] Enqueuing spoken sentence:", clean, "eventId:", eventId);
+      sentenceQueueRef.current.push({ sentence: clean, eventId });
+    });
+
     processSentenceQueue();
   };
 
@@ -1581,9 +2304,40 @@ export default function App() {
     isProcessingQueueRef.current = true;
 
     while (sentenceQueueRef.current.length > 0) {
-      const sentence = sentenceQueueRef.current.shift()!;
-      setInputText(prev => (prev && prev.trim() ? `${prev.trim()}\n${sentence}` : sentence));
-      await handleTranslateText(sentence, true);
+      const item = sentenceQueueRef.current.shift()!;
+      console.log("[BHARATBRIDGE][STT] Processing sentence from queue:", item.sentence, "eventId:", item.eventId);
+
+      const activeWs = wsRef.current || ws;
+      const isLiveActive = isLiveRef.current;
+      const currentSessionRole = sessionRoleRef.current;
+      if (isLiveActive && currentSessionRole === 'speaker' && activeWs && activeWs.readyState === WebSocket.OPEN) {
+        const seq = speechSeqRef.current++;
+        const speechFrame = {
+          type: "speech_event",
+          eventId: item.eventId,
+          sessionId: currentSession?.id || '582941',
+          speakerId: speakerSlot || 'speaker-01',
+          speakerName: user?.displayName || (speakerSlot === 'speaker-01' ? 'Host Speaker' : 'Listener Panelist'),
+          sourceLanguage: sourceLang.code,
+          sourceText: item.sentence,
+          sequenceNumber: seq,
+          timestamp: Date.now()
+        };
+        console.log("[BHARATBRIDGE][SPEECH_EVENT] Emitting speech_event over WS:", speechFrame);
+        activeWs.send(JSON.stringify(speechFrame));
+        observabilityService.recordEvent({
+          eventId: item.eventId,
+          sessionId: currentSession?.id || '582941',
+          speakerId: speakerSlot || 'speaker-01',
+          sourceLanguage: sourceLang.code,
+          targetLanguage: targetLang.code,
+          stage: 'WEBSOCKET',
+          eventType: 'WS_SEND',
+          status: 'SUCCESS'
+        });
+      } else {
+        await handleTranslateText(item.sentence, true, item.eventId);
+      }
     }
 
     isProcessingQueueRef.current = false;
@@ -1592,10 +2346,27 @@ export default function App() {
   // Initialize Speech Recognition
   useEffect(() => {
     const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    const SpeechGrammarList = (window as any).SpeechGrammarList || (window as any).webkitSpeechGrammarList;
+
     if (SpeechRecognition) {
       recognitionRef.current = new SpeechRecognition();
       recognitionRef.current.continuous = true;
       recognitionRef.current.interimResults = true;
+
+      if (SpeechGrammarList && sessionTopicRef.current) {
+        try {
+          const grammarList = new SpeechGrammarList();
+          const terms = sessionTopicRef.current.split(/[,;\s]+/).filter(Boolean);
+          if (terms.length > 0) {
+            const grammar = `#JSGF V1.0; grammar terms; public <term> = ${terms.join(' | ')} ;`;
+            grammarList.addFromString(grammar, 1);
+            recognitionRef.current.grammars = grammarList;
+            console.log("[BHARATBRIDGE][STT] Initialized PhraseListGrammar with terms:", terms);
+          }
+        } catch (e) {
+          console.warn("[BHARATBRIDGE][STT] SpeechGrammarList notice:", e);
+        }
+      }
 
       recognitionRef.current.onresult = (event: any) => {
         let interim = "";
@@ -1611,40 +2382,67 @@ export default function App() {
         }
         
         if (interim.trim()) {
+          console.log("[BHARATBRIDGE][STT] Interim transcript:", interim.trim());
           setLiveInterimText(interim.trim());
         }
 
         if (finalChunk.trim()) {
+          console.log("[BHARATBRIDGE][STT] Finalized transcript chunk:", finalChunk.trim());
+          sttBackoffMsRef.current = 200; // Reset backoff on successful result
           setLiveInterimText("");
-          enqueueSpokenSentence(finalChunk.trim());
+          enqueueSpokenSentence(cleanIndianText(finalChunk.trim()));
         }
+      };
+
+      const scheduleSttRestart = (reason: string) => {
+        if (!shouldBeListeningRef.current) return;
+        if (sttRestartTimerRef.current) {
+          console.log(`[BHARATBRIDGE][STT_RESILIENCE] Restart timer already scheduled (trigger: ${reason}), skipping duplicate.`);
+          return;
+        }
+        const delay = sttBackoffMsRef.current;
+        console.log(`[BHARATBRIDGE][STT_RESILIENCE] Scheduling auto-restart in ${delay}ms (reason: ${reason})...`);
+        sttRestartTimerRef.current = setTimeout(() => {
+          sttRestartTimerRef.current = null;
+          if (shouldBeListeningRef.current) {
+            try {
+              recognitionRef.current?.start();
+              setIsListening(true);
+              console.log("[BHARATBRIDGE][STT_RESILIENCE] STT recognition.start() successfully executed.");
+            } catch (e: any) {
+              console.warn("[BHARATBRIDGE][STT_RESILIENCE] Restart attempt caught error:", e?.message || e);
+              if (e?.name === 'InvalidStateError' || (e?.message && e.message.includes('already started'))) {
+                setIsListening(true);
+              } else {
+                sttBackoffMsRef.current = 1000;
+                scheduleSttRestart("retry_after_start_error");
+              }
+            }
+          }
+        }, delay);
+        sttBackoffMsRef.current = Math.min(sttBackoffMsRef.current * 1.5, 3000);
       };
 
       recognitionRef.current.onerror = (event: any) => {
-        console.warn("Speech recognition event:", event.error);
-        if (event.error === 'no-speech' || event.error === 'audio-capture' || event.error === 'network') {
+        console.warn(`[BHARATBRIDGE][STT_RESILIENCE] Speech recognition error: '${event.error}'`);
+        if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
+          shouldBeListeningRef.current = false;
+          setIsListening(false);
+          if (sttRestartTimerRef.current) {
+            clearTimeout(sttRestartTimerRef.current);
+            sttRestartTimerRef.current = null;
+          }
           return;
         }
-        if (!shouldBeListeningRef.current) {
-          setIsListening(false);
-        }
+        scheduleSttRestart(`error '${event.error}'`);
       };
 
       recognitionRef.current.onend = () => {
-        if (shouldBeListeningRef.current) {
-          try {
-            recognitionRef.current.start();
-            setIsListening(true);
-          } catch (e) {
-            setTimeout(() => {
-              if (shouldBeListeningRef.current) {
-                try { recognitionRef.current?.start(); setIsListening(true); } catch (_) {}
-              }
-            }, 150);
-          }
-        } else {
+        if (!shouldBeListeningRef.current) {
           setIsListening(false);
+          return;
         }
+        scheduleSttRestart("onend");
       };
     }
   }, []);
@@ -1657,7 +2455,7 @@ export default function App() {
   }, [sourceLang]);
 
   const toggleListening = async (overrideLive?: boolean) => {
-    const isLiveActive = overrideLive !== undefined ? overrideLive : (isLiveRef.current || isLive);
+    const isLiveActive = overrideLive !== undefined ? overrideLive : isLiveRef.current;
     if (isListening) {
       shouldBeListeningRef.current = false;
       if (isLiveActive) {
@@ -1694,7 +2492,7 @@ export default function App() {
           await ctx.resume();
         }
         const source = ctx.createMediaStreamSource(stream);
-        const processor = ctx.createScriptProcessor(4096, 1, 1);
+        const processor = ctx.createScriptProcessor(2048, 1, 1);
         
         source.connect(processor);
         processor.connect(ctx.destination);
@@ -1720,10 +2518,14 @@ export default function App() {
     }
   };
 
-  const handleTranslateText = async (overrideText?: string, isLiveSpokenLine?: boolean) => {
+  const handleTranslateText = async (overrideText?: string, isLiveSpokenLine?: boolean, inputEventId?: string) => {
     const textToProcess = (overrideText !== undefined ? overrideText : inputText).trim();
     if (!textToProcess) return;
-    
+
+    const eventId = inputEventId || generateEventId();
+    const isLiveActive = isLiveRef.current;
+    const currentSessionRole = sessionRoleRef.current;
+    console.log("[BHARATBRIDGE][TRANSLATION_REQUEST] handleTranslateText called:", { textToProcess, isLive: isLiveActive, sessionRole: currentSessionRole, userRole, eventId });
     setIsTranslating(true);
     try {
       const recentContext = messages.slice(-6).map(m => ({ originalText: m.originalText, translatedText: m.translatedText }));
@@ -1733,44 +2535,101 @@ export default function App() {
       const translatedLines: string[] = [];
 
       for (const line of lines) {
+        console.log("[BHARATBRIDGE][TRANSLATION_REQUEST] Requesting translation for line:", line.trim(), "eventId:", eventId);
+        const transStart = Date.now();
+        observabilityService.recordEvent({
+          eventId,
+          sessionId: currentSession?.id || '582941',
+          speakerId: speakerSlot || 'speaker-01',
+          sourceLanguage: sourceLang.code,
+          targetLanguage: targetLang.code,
+          stage: 'TRANSLATION',
+          eventType: 'TRANSLATION_REQUEST',
+          status: 'SUCCESS'
+        });
+
         const result = await translateText({
           text: line.trim(),
           sourceLanguage: autoDetect ? undefined : sourceLang.name,
           targetLanguage: targetLang.name,
-          context: recentContext
+          context: recentContext,
+          eventId
         });
         const lineTranslation = result.translatedText || line.trim();
+        const isFallback = (lineTranslation || "").trim().toLowerCase() === line.trim().toLowerCase();
+
+        observabilityService.recordEvent({
+          eventId,
+          sessionId: currentSession?.id || '582941',
+          speakerId: speakerSlot || 'speaker-01',
+          sourceLanguage: sourceLang.code,
+          targetLanguage: targetLang.code,
+          stage: 'TRANSLATION',
+          eventType: isFallback ? 'TRANSLATION_FALLBACK' : 'TRANSLATION_SUCCESS',
+          status: isFallback ? 'FALLBACK' : 'SUCCESS',
+          provider: result.provider || 'gemini',
+          latencyMs: Date.now() - transStart,
+          errorCode: isFallback ? 'TRANSLATION_FALLBACK' : undefined
+        });
+
+        console.log("[BHARATBRIDGE][TRANSLATION_RESPONSE] Received line translation:", lineTranslation, "eventId:", eventId);
         translatedLines.push(lineTranslation);
 
-        if (isLive && sessionRole === 'speaker') {
+        console.log("[BHARATBRIDGE][WS_SEND] Checking condition to send WS text_translation. isLive =", isLiveActive, "sessionRole =", currentSessionRole);
+        if (isLiveActive && currentSessionRole === 'speaker') {
           pushMessageToLive(line.trim(), lineTranslation);
 
           const activeWs = wsRef.current || ws;
+          console.log("[BHARATBRIDGE][WS_SEND] activeWs state:", activeWs?.readyState);
           if (activeWs && activeWs.readyState === WebSocket.OPEN) {
-            activeWs.send(JSON.stringify({
+            const frame = {
               type: "text_translation",
+              eventId,
               originalText: line.trim(),
-              translatedText: lineTranslation,
+              translatedText: "", // Server will generate translation per listener target language group
               sourceLang: sourceLang.code,
-              targetLang: targetLang.code,
               context: recentContext,
               isFinal: true
-            }));
+            };
+            console.log("[BHARATBRIDGE][WS_SEND] Sending frame over WS:", frame);
+            activeWs.send(JSON.stringify(frame));
+            observabilityService.recordEvent({
+              eventId,
+              sessionId: currentSession?.id || '582941',
+              speakerId: speakerSlot || 'speaker-01',
+              sourceLanguage: sourceLang.code,
+              targetLanguage: targetLang.code,
+              stage: 'WEBSOCKET',
+              eventType: 'WS_SEND',
+              status: 'SUCCESS'
+            });
+          } else {
+            console.warn("[BHARATBRIDGE][WS_SEND] FAILED: WebSocket is not open! readyState:", activeWs?.readyState);
           }
+        } else {
+          console.warn("[BHARATBRIDGE][WS_SEND] SKIPPED: isLive is false or sessionRole is not 'speaker' (current sessionRole =", currentSessionRole, ")");
         }
       }
 
       const fullTranslation = translatedLines.join('\n');
-      // The speaker should NOT see target translations in their output panel
-      if (sessionRole !== 'speaker') {
-        if (isLiveSpokenLine) {
-          setTranslatedText(prev => (prev && prev.trim() ? `${prev.trim()}\n${fullTranslation}` : fullTranslation));
-        } else {
-          setTranslatedText(fullTranslation);
-        }
+      if (isLiveSpokenLine) {
+        setTranslatedText(prev => (prev && prev.trim() ? `${prev.trim()}\n${fullTranslation}` : fullTranslation));
+      } else {
+        setTranslatedText(fullTranslation);
       }
-    } catch (err) {
+    } catch (err: any) {
       console.error(err);
+      observabilityService.recordEvent({
+        eventId,
+        sessionId: currentSession?.id || '582941',
+        sourceLanguage: sourceLang.code,
+        targetLanguage: targetLang.code,
+        stage: 'TRANSLATION',
+        eventType: 'TRANSLATION_FAILURE',
+        status: 'FAILURE',
+        errorCode: 'TRANSLATION_FAILURE',
+        errorMessage: err?.message || 'Translation error'
+      });
     } finally {
       setIsTranslating(false);
     }
@@ -1780,33 +2639,73 @@ export default function App() {
 
   // Debounced translation for real-time and manual modes
   useEffect(() => {
-    if (!inputText) return;
+    if (!inputText || isLive) return;
     
-    const delay = isLive ? 1000 : 1000;
+    const delay = 300;
     const timer = setTimeout(() => {
       handleTranslate();
     }, delay);
     return () => clearTimeout(timer);
   }, [inputText, targetLang, isLive]);
 
-  const speak = async (text: string, lang: LanguageConfig) => {
+  const speak = async (text: string, lang: LanguageConfig, inputEventId?: string, sequenceNumber?: number, sessionOverrideId?: string) => {
     if (!text || typeof window === "undefined") return;
+    const cleanedText = cleanIndianText(text);
+    const eventId = inputEventId || generateEventId();
+    const effectiveSessionId = sessionOverrideId || currentSession?.id || activeSessionIdRef.current;
     unmuteAudio();
+    const ttsStart = Date.now();
+
+    observabilityService.recordEvent({
+      eventId,
+      sessionId: effectiveSessionId || '582941',
+      sourceLanguage: sourceLang.code,
+      targetLanguage: lang.code,
+      stage: 'TTS',
+      eventType: 'TTS_REQUEST',
+      status: 'SUCCESS'
+    });
 
     try {
       const ttsRes = await synthesizeSpeech({
-        text,
-        languageCode: lang.code === "en" ? "en-IN" : `${lang.code}-IN`
+        text: cleanedText,
+        languageCode: lang.code === "en" ? "en-IN" : `${lang.code}-IN`,
+        eventId,
+        sessionId: effectiveSessionId,
+        token: hostToken || hostTokenRef.current
       });
       if (ttsRes.success && ttsRes.audio) {
-        enqueueTtsPlayback({ base64: ttsRes.audio, format: ttsRes.format || "mp3" });
+        observabilityService.recordEvent({
+          eventId,
+          sessionId: currentSession?.id || '582941',
+          sourceLanguage: sourceLang.code,
+          targetLanguage: lang.code,
+          stage: 'TTS',
+          eventType: 'TTS_SUCCESS',
+          status: 'SUCCESS',
+          provider: 'azure-tts',
+          latencyMs: Date.now() - ttsStart
+        });
+        enqueueTtsPlayback({ base64: ttsRes.audio, format: ttsRes.format || "mp3", eventId, targetLangCode: lang.code, sequenceNumber });
         return;
       }
-    } catch (err) {
+    } catch (err: any) {
       console.warn("Server TTS failed, attempting browser WebSpeech fallback:", err);
+      observabilityService.recordEvent({
+        eventId,
+        sessionId: currentSession?.id || '582941',
+        sourceLanguage: sourceLang.code,
+        targetLanguage: lang.code,
+        stage: 'TTS',
+        eventType: 'TTS_FAILURE',
+        status: 'FAILURE',
+        provider: 'azure-tts',
+        errorCode: 'TTS_FAILURE',
+        errorMessage: err?.message || 'TTS request failed'
+      });
     }
 
-    enqueueTtsPlayback({ text, lang });
+    enqueueTtsPlayback({ text: cleanedText, lang, eventId, sequenceNumber });
   };
 
   const swapLanguages = () => {
@@ -1842,6 +2741,18 @@ export default function App() {
         <div className="flex items-center gap-2.5">
           {!isLive ? (
             <>
+              <div className="hidden sm:flex items-center gap-1 bg-white/5 border border-white/10 rounded-full px-2.5 py-1 text-xs">
+                <span className="text-[10px] text-slate-400 font-semibold uppercase pr-1">Topic:</span>
+                <input
+                  type="text"
+                  placeholder="e.g. Medical, Tech, AI..."
+                  value={sessionTopic}
+                  onChange={(e) => setSessionTopic(e.target.value)}
+                  className="bg-transparent text-white placeholder:text-slate-600 outline-none w-28 md:w-36 text-xs"
+                  title="Optional Event Topic or Glossary terms for enhanced AI accuracy"
+                />
+              </div>
+
               <button 
                 onClick={startLiveSession}
                 className="px-3.5 py-1.5 bg-gradient-to-r from-orange-500 to-amber-600 hover:from-orange-600 hover:to-amber-700 text-white text-xs font-semibold rounded-full transition-all shadow-md shadow-orange-500/20 flex items-center gap-1.5"
@@ -1865,12 +2776,23 @@ export default function App() {
                 PIN: {currentSession?.id}
               </span>
               <button 
-                onClick={sessionRole === 'speaker' ? endLiveSession : () => { setIsLive(false); setCurrentSession(null); if(ws) ws.close(); }}
+                onClick={(sessionRole === 'speaker' || userRole === 'ORGANIZER') ? endLiveSession : () => { setIsLive(false); setCurrentSession(null); if(ws) ws.close(); }}
                 className="px-3 py-1 bg-red-500/15 border border-red-500/30 text-red-400 text-xs font-bold rounded-full hover:bg-red-500/25 transition-all"
               >
-                {sessionRole === 'speaker' ? 'End Session' : 'Leave'}
+                {(sessionRole === 'speaker' || userRole === 'ORGANIZER') ? 'End Session' : 'Leave'}
               </button>
             </div>
+          )}
+
+          {isAdminUser && (
+            <button 
+              onClick={() => setModalOpen({ open: true, type: "admin" })}
+              className="px-3 py-1.5 bg-orange-500/15 hover:bg-orange-500/25 border border-orange-500/30 text-orange-400 text-xs font-semibold rounded-full transition-all flex items-center gap-1.5"
+              title="Open Admin Panel"
+            >
+              <Shield size={14} />
+              <span>Admin</span>
+            </button>
           )}
 
           {user ? (
@@ -1909,9 +2831,115 @@ export default function App() {
                 <span className="w-2 h-2 rounded-full bg-red-500 animate-pulse"></span>
                 {sessionRole === 'speaker' ? 'Broadcasting Event' : 'Listening Stream'}
               </span>
-              <span className="text-[11px] font-mono px-2.5 py-0.5 bg-blue-500/10 text-blue-400 border border-blue-500/20 rounded-full">
-                {listenerCount} listeners
+
+              {/* 3-Tier Role Badges */}
+              {userRole === 'ORGANIZER' && (
+                <span className="text-[11px] font-mono px-2.5 py-0.5 bg-amber-500/15 text-amber-400 border border-amber-500/30 rounded-full font-bold flex items-center gap-1">
+                  👑 ORGANIZER
+                </span>
+              )}
+              {userRole === 'PANELIST' && (
+                <span className="text-[11px] font-mono px-2.5 py-0.5 bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 rounded-full font-bold flex items-center gap-1">
+                  🎙 PANELIST ({speakerSlot || 'speaker-01'})
+                </span>
+              )}
+              {userRole === 'LISTENER' && (
+                <span className="text-[11px] font-mono px-2.5 py-0.5 bg-blue-500/15 text-blue-400 border border-blue-500/30 rounded-full font-bold flex items-center gap-1">
+                  🎧 LISTENER
+                </span>
+              )}
+
+              {/* Active Panelist Capacity Counter */}
+              <span className="text-[11px] font-mono px-2.5 py-0.5 bg-purple-500/10 text-purple-400 border border-purple-500/20 rounded-full">
+                PANELISTS: {activePanelistCount} / 10
               </span>
+
+              {/* Live WebSocket Connection Status Badge */}
+              {connectionStatus === 'connected' && (
+                <span className="text-[11px] font-mono px-2.5 py-0.5 bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 rounded-full flex items-center gap-1.5" title="Main Session WebSocket Active">
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
+                  CONNECTED
+                </span>
+              )}
+              {connectionStatus === 'reconnecting' && (
+                <span className="text-[11px] font-mono px-2.5 py-0.5 bg-amber-500/15 text-amber-400 border border-amber-500/30 rounded-full flex items-center gap-1.5 animate-pulse" title="Auto-reconnecting to session WebSocket...">
+                  <RefreshCw size={11} className="animate-spin text-amber-400" />
+                  RECONNECTING...
+                </span>
+              )}
+              {connectionStatus === 'disconnected' && (
+                <span className="text-[11px] font-mono px-2.5 py-0.5 bg-red-500/15 text-red-400 border border-red-500/30 rounded-full flex items-center gap-1.5" title="Session WebSocket Disconnected">
+                  <span className="w-1.5 h-1.5 rounded-full bg-red-500"></span>
+                  DISCONNECTED
+                </span>
+              )}
+
+              {(connectionStatus === 'reconnecting' || connectionStatus === 'disconnected') && wsConnectFailed && (
+                <div className="flex items-center gap-2 bg-red-500/15 border border-red-500/30 rounded-full px-3 py-1 text-xs text-red-300">
+                  <span className="text-[11px] font-medium">
+                    Can't connect to the session. Check your network or try again.
+                  </span>
+                  <button
+                    onClick={() => {
+                      const sid = activeSessionIdRef.current || currentSession?.id;
+                      if (sid) {
+                        initWebSocket(sid, sessionRole === 'speaker' ? 'organizer' : 'listener', true);
+                      }
+                    }}
+                    className="px-2.5 py-0.5 bg-red-500/25 hover:bg-red-500/40 border border-red-500/50 text-red-200 text-[11px] font-bold rounded-full transition-all flex items-center gap-1 shrink-0 ml-1"
+                  >
+                    <RefreshCw size={10} />
+                    <span>Retry</span>
+                  </button>
+                </div>
+              )}
+
+              <span className="text-[11px] font-mono px-2.5 py-0.5 bg-blue-500/10 text-blue-400 border border-blue-500/20 rounded-full">
+                {Math.max(0, listenerCount - 1)} listeners
+              </span>
+
+              {/* Listener Request to Speak Action */}
+              {userRole === 'LISTENER' && (
+                <>
+                  {speakerRequestStatus === 'idle' && (
+                    <button
+                      onClick={handleRequestToSpeak}
+                      className="px-3 py-1 bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/40 text-amber-300 text-xs font-bold rounded-lg transition-all flex items-center gap-1.5 shadow-md shadow-amber-500/10"
+                    >
+                      ✋ Request to Speak
+                    </button>
+                  )}
+                  {speakerRequestStatus === 'pending' && (
+                    <span className="px-3 py-1 bg-amber-500/15 border border-amber-500/30 text-amber-300 text-xs font-bold rounded-lg animate-pulse flex items-center gap-1.5">
+                      🟡 Speaker Request Pending...
+                    </span>
+                  )}
+                  {speakerRequestStatus === 'rejected' && (
+                    <button
+                      onClick={handleRequestToSpeak}
+                      className="px-3 py-1 bg-red-500/15 border border-red-500/30 text-red-400 text-xs font-bold rounded-lg flex items-center gap-1.5"
+                    >
+                      ⚠️ Request Rejected (Try Again)
+                    </button>
+                  )}
+                  {speakerRequestStatus === 'limit_reached' && (
+                    <span className="px-3 py-1 bg-amber-500/15 border border-amber-500/30 text-amber-300 text-xs font-bold rounded-lg flex items-center gap-1.5">
+                      ⚠️ Panelists Full (10/10)
+                    </span>
+                  )}
+                </>
+              )}
+
+              {/* Panelist Switch to Listener Action */}
+              {userRole === 'PANELIST' && (
+                <button
+                  onClick={() => setShowSwitchConfirmModal(true)}
+                  className="px-3 py-1 bg-blue-500/20 hover:bg-blue-500/30 border border-blue-500/40 text-blue-300 text-xs font-bold rounded-lg transition-all flex items-center gap-1.5"
+                >
+                  🎧 Switch to Listener
+                </button>
+              )}
+
               {sessionRole === 'listener' && (
                 <button
                   onClick={unmuteAudio}
@@ -1923,6 +2951,27 @@ export default function App() {
                   {audioUnmuted ? 'Audio On' : 'Unmute Audio'}
                 </button>
               )}
+
+              {/* Voice Speed Setting Selector */}
+              <div className="flex items-center gap-1.5 px-2.5 py-1 bg-white/5 border border-white/10 rounded-lg text-slate-300 text-[11px] font-mono">
+                <span className="text-[9px] text-slate-400 uppercase font-semibold">Speed:</span>
+                <select
+                  value={playbackRate}
+                  onChange={(e) => {
+                    const val = e.target.value;
+                    setPlaybackRate(val === "auto" ? "auto" : parseFloat(val));
+                  }}
+                  className="bg-transparent text-amber-400 font-bold outline-none cursor-pointer text-xs"
+                  title="Adjust Speech Voice Speed"
+                >
+                  <option value="auto" className="bg-slate-900 text-amber-400 font-bold">⚡ Auto (Catch-Up)</option>
+                  <option value="0.75" className="bg-slate-900 text-slate-200">0.75x</option>
+                  <option value="1.0" className="bg-slate-900 text-slate-200">1.0x (Normal)</option>
+                  <option value="1.25" className="bg-slate-900 text-slate-200">1.25x</option>
+                  <option value="1.5" className="bg-slate-900 text-slate-200">1.5x</option>
+                  <option value="2.0" className="bg-slate-900 text-slate-200">2.0x</option>
+                </select>
+              </div>
             </div>
 
             <div className="flex items-center gap-2">
@@ -1944,11 +2993,18 @@ export default function App() {
                   let total = 0; for (const c of audioBufferRef.current) total += c.length;
                   const merged = new Float32Array(total); let off = 0;
                   for (const c of audioBufferRef.current) { merged.set(c, off); off += c.length; }
-                  downloadAudioWAV(merged, `session-audio-${currentSession?.id}.wav`);
+                  downloadAudioWAV(merged, `session-audio-${currentSession?.id}.wav`, inputAudioCtxRef.current?.sampleRate || 16000);
                 }}
                 className="px-2.5 py-1 bg-purple-500/10 border border-purple-500/20 rounded-lg text-[10px] font-bold text-purple-400 uppercase hover:bg-purple-500/20 transition-all flex items-center gap-1"
               >
                 <Music size={11} /> WAV
+              </button>
+              <button 
+                onClick={handleGenerateSummary}
+                className="px-2.5 py-1 bg-amber-500/10 border border-amber-500/20 rounded-lg text-[10px] font-bold text-amber-400 uppercase hover:bg-amber-500/20 transition-all flex items-center gap-1"
+                title="Generate Gemini AI Session Summary"
+              >
+                <Sparkles size={11} /> Summary
               </button>
               <button
                 onClick={() => setModalOpen({ open: true, type: "qr" })}
@@ -1961,9 +3017,51 @@ export default function App() {
           </div>
         )}
 
+        {/* Organizer SPEAKER REQUESTS Approval Panel */}
+        {isLive && userRole === 'ORGANIZER' && pendingSpeakerRequests.length > 0 && (
+          <div className="bg-amber-500/10 border border-amber-500/30 rounded-xl p-4 space-y-3 backdrop-blur-xl">
+            <div className="flex items-center justify-between">
+              <h4 className="text-xs font-bold uppercase tracking-wider text-amber-400 flex items-center gap-2">
+                <span>✋ SPEAKER REQUESTS</span>
+                <span className="px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-300 font-mono text-[10px]">
+                  {pendingSpeakerRequests.length} Pending
+                </span>
+              </h4>
+              <span className="text-[10px] text-slate-400 font-mono">
+                Active Panelists: {activePanelistCount} / 10
+              </span>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+              {pendingSpeakerRequests.map(req => (
+                <div key={req.userId} className="p-3 bg-black/40 border border-white/10 rounded-xl flex items-center justify-between">
+                  <div>
+                    <p className="text-xs font-bold text-white">{req.userName}</p>
+                    <p className="text-[10px] text-slate-400 font-mono">Target: {(req.targetLang || "hi").toUpperCase()}</p>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={() => handleSpeakerApproval(req.userId, true)}
+                      className="px-3 py-1 bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-500/40 text-emerald-300 text-xs font-bold rounded-lg transition-all"
+                    >
+                      Approve
+                    </button>
+                    <button
+                      onClick={() => handleSpeakerApproval(req.userId, false)}
+                      className="px-3 py-1 bg-red-500/20 hover:bg-red-500/30 border border-red-500/40 text-red-300 text-xs font-bold rounded-lg transition-all"
+                    >
+                      Reject
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-5 flex-1">
           {/* Left Column: Source Input / Original Transcript */}
-          <section className="flex flex-col gap-4">
+          <section className={`flex flex-col gap-4 ${sessionRole === 'listener' ? 'order-2 lg:order-1' : 'order-1'}`}>
             <div className="bg-[#0f1422]/60 border border-white/[0.07] rounded-2xl p-5 flex-1 flex flex-col min-h-[420px] backdrop-blur-xl shadow-xl">
               {/* Header / Language card */}
               <div className="flex items-center justify-between mb-3">
@@ -2048,9 +3146,9 @@ export default function App() {
           </section>
 
           {/* Right Column: Target Output / Live Translation Feed */}
-          <section className="flex flex-col gap-4">
+          <section className={`flex flex-col gap-4 ${sessionRole === 'listener' ? 'order-1 lg:order-2' : 'order-2'}`}>
             <div className="bg-[#0f1422]/60 border border-white/[0.07] rounded-2xl p-5 flex-1 flex flex-col min-h-[420px] backdrop-blur-xl shadow-xl">
-              {/* Header / Language card */}
+              {/* Header / Language card & Broadcasting status */}
               <div className="flex items-center justify-between mb-3">
                 <button 
                   onClick={() => setModalOpen({ open: true, type: "target" })}
@@ -2064,25 +3162,44 @@ export default function App() {
                   </span>
                   <ChevronDown size={14} className="text-slate-400" />
                 </button>
+
+                {isLive && (
+                  <div className="flex items-center gap-2 px-3 py-1.5 bg-emerald-500/10 border border-emerald-500/20 rounded-full">
+                    <span className="w-2 h-2 rounded-full bg-emerald-500 animate-ping"></span>
+                    <span className="text-[10px] font-bold text-emerald-400 uppercase tracking-widest">
+                      {sessionRole === 'speaker' ? 'Broadcasting Live' : 'Live Stream'}
+                    </span>
+                  </div>
+                )}
               </div>
 
               {/* Output / Messages feed */}
               <div 
                 dir={targetLang.direction}
-                className="flex-1 bg-black/40 rounded-xl p-4 text-base leading-relaxed text-slate-200 overflow-y-auto border border-white/[0.04]"
+                className="flex-1 bg-black/40 rounded-xl p-4 text-base leading-relaxed text-slate-200 overflow-y-auto border border-white/[0.04] space-y-3"
               >
-                {isLive && messages.length > 0 ? (
+                {/* Live Interim Caption Pill */}
+                {liveInterimText && (
+                  <div className="p-3 bg-amber-500/10 border border-amber-500/25 rounded-xl text-amber-300 text-sm font-medium flex items-center gap-2 animate-pulse">
+                    <Mic size={16} className="text-amber-400 shrink-0" />
+                    <span className="truncate">{liveInterimText}</span>
+                  </div>
+                )}
+
+                {messages.length > 0 ? (
                   <div className="space-y-3">
                     {messages.map((msg, idx) => (
                       <div key={msg.id || idx} className="p-3 bg-white/[0.03] border border-white/[0.05] rounded-xl space-y-1">
                         <div className="flex justify-between items-center text-[10px] text-slate-500 font-mono">
-                          <span className="text-blue-400 font-semibold">Message #{messages.length - idx}</span>
+                          <span className="text-blue-400 font-semibold">
+                            {msg.speakerName ? `🎙 ${msg.speakerId || 'speaker-01'} — ${msg.speakerName}` : `Message #${messages.length - idx}`}
+                          </span>
                           <span>{formatTimestamp(msg.timestamp)}</span>
                         </div>
-                        {sessionRole !== 'speaker' && (
-                          <p className="text-sm font-semibold text-white pt-0.5">{msg.translatedText}</p>
+                        <p className="text-sm font-bold text-white pt-0.5">{msg.translatedText || msg.originalText}</p>
+                        {msg.originalText && msg.translatedText !== msg.originalText && (
+                          <p className="text-xs text-slate-400 italic border-l-2 border-slate-700 pl-2 py-0.5">{msg.originalText}</p>
                         )}
-                        <p className="text-xs text-slate-400 italic border-l-2 border-slate-700 pl-2 py-0.5">{msg.originalText}</p>
                       </div>
                     ))}
                   </div>
@@ -2093,22 +3210,16 @@ export default function App() {
                         <div className="h-4 bg-white/5 rounded w-full animate-pulse"></div>
                         <div className="h-4 bg-white/5 rounded w-4/6 animate-pulse"></div>
                       </motion.div>
-                    ) : sessionRole === 'speaker' && isLive ? (
-                      <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="flex flex-col items-center justify-center h-full text-center p-4 text-slate-400 space-y-2">
-                        <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-ping"></span>
-                        <p className="text-xs font-semibold text-emerald-400">Broadcasting Live to Room</p>
-                        <p className="text-[11px] text-slate-500">Your speech is translated contextually and streamed directly to room listeners in real-time.</p>
-                      </motion.div>
-                    ) : (
+                    ) : !liveInterimText ? (
                       <motion.p
                         key={translatedText}
                         initial={{ opacity: 0 }}
                         animate={{ opacity: 1 }}
                         className={!translatedText ? 'text-slate-600 italic text-sm' : ''}
                       >
-                        {translatedText || `Translated content in ${targetLang.name} will appear here...`}
+                        {translatedText || `Live captions in ${targetLang.name} will appear here as soon as speech is detected...`}
                       </motion.p>
-                    )}
+                    ) : null}
                   </AnimatePresence>
                 )}
               </div>
@@ -2119,11 +3230,30 @@ export default function App() {
                   <button 
                     onClick={() => speak(translatedText, targetLang)}
                     disabled={!translatedText}
-                    className="p-2.5 bg-blue-500/15 text-blue-400 border border-blue-500/30 hover:bg-blue-500/25 rounded-xl transition-all disabled:opacity-20"
+                    className="p-2.5 bg-blue-500/15 text-blue-400 border border-blue-500/30 hover:bg-blue-500/25 rounded-xl transition-all disabled:opacity-20 flex items-center gap-1.5"
                     title="Listen to Speech"
                   >
                     <Volume2 size={18} />
+                    <span className="text-xs font-semibold">Listen</span>
                   </button>
+
+                  {/* Voice Speed Setting Option */}
+                  <div className="flex items-center gap-1.5 px-3 py-2 bg-white/5 border border-white/10 rounded-xl text-slate-300 text-xs font-mono">
+                    <span className="text-[10px] text-slate-400 uppercase font-semibold">Speed:</span>
+                    <select
+                      value={playbackRate}
+                      onChange={(e) => setPlaybackRate(parseFloat(e.target.value))}
+                      className="bg-transparent text-amber-400 font-bold outline-none cursor-pointer"
+                      title="Adjust Speech Voice Speed"
+                    >
+                      <option value="0.75" className="bg-slate-900 text-slate-200">0.75x (Slower)</option>
+                      <option value="1.0" className="bg-slate-900 text-slate-200">1.0x (Normal)</option>
+                      <option value="1.25" className="bg-slate-900 text-slate-200">1.25x (Faster)</option>
+                      <option value="1.5" className="bg-slate-900 text-slate-200">1.5x</option>
+                      <option value="2.0" className="bg-slate-900 text-slate-200">2.0x</option>
+                    </select>
+                  </div>
+
                   <button 
                     onClick={() => copyToClipboard(translatedText)}
                     disabled={!translatedText}
@@ -2240,6 +3370,13 @@ export default function App() {
               setUser(userObj);
               localStorage.setItem("bharat_bridge_user", JSON.stringify(userObj));
             }}
+          />
+        )}
+        {showSwitchConfirmModal && (
+          <SwitchConfirmModal
+            isOpen={showSwitchConfirmModal}
+            onClose={() => setShowSwitchConfirmModal(false)}
+            onConfirm={handleConfirmSwitchToListener}
           />
         )}
       </AnimatePresence>

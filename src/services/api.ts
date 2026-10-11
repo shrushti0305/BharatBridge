@@ -43,6 +43,8 @@ export interface AzureTTSOptions {
   languageCode: string;
   voiceName?: string;
   eventId?: string;
+  sessionId?: string;
+  token?: string;
 }
 
 export interface AzureTTSResult {
@@ -144,15 +146,18 @@ export async function detectLanguage(text: string): Promise<LanguageDetectionRes
  * Request Azure Neural Text-to-Speech audio synthesis
  */
 export async function synthesizeSpeech(options: AzureTTSOptions): Promise<AzureTTSResult> {
-  const { text, languageCode, voiceName, eventId } = options;
+  const { text, languageCode, voiceName, eventId, sessionId, token } = options;
   if (!text || !text.trim()) return { success: false, error: "Empty text" };
 
-  console.log("[BHARATBRIDGE][TTS_REQUEST] Client requesting /api/azure/tts:", { text: text.trim(), languageCode, voiceName, eventId });
+  console.log("[BHARATBRIDGE][TTS_REQUEST] Client requesting /api/azure/tts:", { text: text.trim(), languageCode, voiceName, eventId, sessionId });
   try {
     const res = await fetch("/api/azure/tts", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text: text.trim(), languageCode, voiceName, eventId })
+      headers: { 
+        "Content-Type": "application/json",
+        ...(sessionId ? { "x-session-id": sessionId } : {})
+      },
+      body: JSON.stringify({ text: text.trim(), languageCode, voiceName, eventId, sessionId, token })
     });
 
     if (res.ok) {

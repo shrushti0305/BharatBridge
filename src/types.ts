@@ -3,6 +3,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+export type UserRole = 'ORGANIZER' | 'PANELIST' | 'LISTENER';
+export type SpeakerRequestStatus = 'idle' | 'pending' | 'approved' | 'rejected' | 'limit_reached';
+
 export interface LanguageConfig {
   code: string;
   name: string;
@@ -61,4 +64,6 @@ export interface Message {
   senderId: string;
   sourceLang: string;
   targetLang: string;
+  speakerId?: string;
+  speakerName?: string;
 }

@@ -56,8 +56,8 @@ export const config: AppConfig = {
   sttProvider: (process.env.STT_PROVIDER as any) || 'webspeech',
 
   // Configurable LLM Models
-  geminiModelTranslation: process.env.GEMINI_MODEL_TRANSLATION || 'gemini-2.5-flash',
-  geminiModelSummary: process.env.GEMINI_MODEL_SUMMARY || 'gemini-2.5-flash',
+  geminiModelTranslation: process.env.GEMINI_MODEL_TRANSLATION || 'gemini-3.8-flash',
+  geminiModelSummary: process.env.GEMINI_MODEL_SUMMARY || 'gemini-3.8-flash',
 
   // API Keys
   geminiApiKey: process.env.GEMINI_API_KEY || '',
