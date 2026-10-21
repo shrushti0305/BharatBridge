@@ -10,7 +10,7 @@ import http from "http";
 import dns from "dns";
 import { observabilityService, generateEventId } from "./src/services/observability";
 import { resolveLanguageDefinition, getCanonicalLanguageCode, isLanguageSupported, getAllLanguages } from "./src/registry/languages.js";
-import { persistFinalizedConversationMessage } from "./src/lib/firebase-admin";
+import { persistFinalizedConversationMessage, getAdminAuth } from "./src/lib/firebase-admin";
 import {
   initCosmosDB,
   cosmosHealthState,
@@ -49,6 +49,13 @@ export function cleanIndianText(text: string): string {
   // Normalize redundant whitespace
   cleaned = cleaned.replace(/\s+/g, " ").trim();
   return cleaned;
+}
+
+export function timingSafeEqualToken(provided: string, expected: string): boolean {
+  if (!provided || !expected) return false;
+  const hashProvided = crypto.createHash("sha256").update(provided).digest();
+  const hashExpected = crypto.createHash("sha256").update(expected).digest();
+  return crypto.timingSafeEqual(hashProvided, hashExpected);
 }
 
 export function applyGenderAgreementFallback(text: string, targetLang: string, gender?: string): string {
@@ -90,11 +97,143 @@ const LANGUAGE_NAME_MAP: Record<string, string> = {
   sa: "Sanskrit", ks: "Kashmiri", sd: "Sindhi", doi: "Dogri", kok: "Konkani"
 };
 
-// In-Memory Dual-Layer Rate Limiter Middleware (Keyed per IP AND per Session ID)
-const rateLimitMapByIp = new Map<string, { count: number; resetTime: number }>();
-const rateLimitMapBySession = new Map<string, { count: number; resetTime: number }>();
+export interface TtsCacheResult {
+  audio: string;
+  format?: string;
+  byteSize?: number;
+  contentType?: string;
+  outputFormat?: string;
+  provider: string;
+  truncated?: boolean;
+}
 
-function createRateLimiter(maxRequestsPerIp: number, maxRequestsPerSession: number, windowMs: number) {
+interface TtsCacheEntry {
+  value: TtsCacheResult;
+  byteSize: number;
+  expiresAt: number;
+}
+
+export class TtsAudioCache {
+  private cache = new Map<string, TtsCacheEntry>();
+  private inFlight = new Map<string, Promise<TtsCacheResult>>();
+  private maxEntries: number;
+  private maxBytes: number;
+  private ttlMs: number;
+  private currentBytes = 0;
+
+  constructor(options?: { maxEntries?: number; maxBytes?: number; ttlMs?: number }) {
+    this.maxEntries = options?.maxEntries ?? 500;
+    this.maxBytes = options?.maxBytes ?? (50 * 1024 * 1024); // 50MB
+    this.ttlMs = options?.ttlMs ?? (10 * 60 * 1000); // 10 minutes
+  }
+
+  public getCacheKey(text: string, languageCode: string, voiceName?: string, gender?: string): string {
+    const cleanText = text.trim();
+    const cleanLang = (languageCode || "hi").split("-")[0].toLowerCase();
+    const cleanVoice = (voiceName || gender || "default").toLowerCase();
+    const hash = crypto.createHash("sha256").update(cleanText).digest("hex").slice(0, 16);
+    return `${cleanLang}:${cleanVoice}:${hash}`;
+  }
+
+  public get(key: string): TtsCacheResult | null {
+    const entry = this.cache.get(key);
+    if (!entry) return null;
+
+    if (Date.now() > entry.expiresAt) {
+      this.currentBytes -= entry.byteSize;
+      this.cache.delete(key);
+      return null;
+    }
+
+    // Refresh LRU order: delete and set at the end
+    this.cache.delete(key);
+    this.cache.set(key, entry);
+    return entry.value;
+  }
+
+  public set(key: string, value: TtsCacheResult): void {
+    if (!value || !value.audio) return;
+
+    const estimatedBytes = Buffer.byteLength(value.audio, "utf8") + 256;
+    if (estimatedBytes > this.maxBytes) {
+      return;
+    }
+
+    const existing = this.cache.get(key);
+    if (existing) {
+      this.currentBytes -= existing.byteSize;
+      this.cache.delete(key);
+    }
+
+    while (
+      (this.cache.size >= this.maxEntries || (this.currentBytes + estimatedBytes > this.maxBytes)) &&
+      this.cache.size > 0
+    ) {
+      const oldestKey = this.cache.keys().next().value;
+      if (!oldestKey) break;
+      const oldestEntry = this.cache.get(oldestKey);
+      if (oldestEntry) {
+        this.currentBytes -= oldestEntry.byteSize;
+      }
+      this.cache.delete(oldestKey);
+    }
+
+    this.cache.set(key, {
+      value,
+      byteSize: estimatedBytes,
+      expiresAt: Date.now() + this.ttlMs
+    });
+    this.currentBytes += estimatedBytes;
+  }
+
+  public async getOrSynthesize(key: string, synthesizeFn: () => Promise<TtsCacheResult>): Promise<TtsCacheResult> {
+    const cached = this.get(key);
+    if (cached) {
+      return cached;
+    }
+
+    if (this.inFlight.has(key)) {
+      return await this.inFlight.get(key)!;
+    }
+
+    const inFlightPromise = (async () => {
+      try {
+        const result = await synthesizeFn();
+        if (result && result.audio) {
+          this.set(key, result);
+        }
+        return result;
+      } finally {
+        this.inFlight.delete(key);
+      }
+    })();
+
+    this.inFlight.set(key, inFlightPromise);
+    return await inFlightPromise;
+  }
+
+  public clear(): void {
+    this.cache.clear();
+    this.inFlight.clear();
+    this.currentBytes = 0;
+  }
+
+  public getStats(): { size: number; currentBytes: number; inFlightCount: number } {
+    return {
+      size: this.cache.size,
+      currentBytes: this.currentBytes,
+      inFlightCount: this.inFlight.size
+    };
+  }
+}
+
+export const ttsAudioCache = new TtsAudioCache();
+
+// In-Memory Dual-Layer Rate Limiter Middleware (Keyed per IP AND per Session ID)
+export function createRateLimiter(maxRequestsPerIp: number, maxRequestsPerSession: number, windowMs: number) {
+  const rateLimitMapByIp = new Map<string, { count: number; resetTime: number }>();
+  const rateLimitMapBySession = new Map<string, { count: number; resetTime: number }>();
+
   return (req: express.Request, res: express.Response, next: express.NextFunction) => {
     if (req.path === "/health") return next();
 
@@ -144,7 +283,15 @@ async function startServer() {
   const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
 
   app.use(express.json({ limit: "10mb" }));
+  app.use((_req, res, next) => {
+    res.setHeader("Cross-Origin-Opener-Policy", "same-origin-allow-popups");
+    next();
+  });
   app.use("/api/", createRateLimiter(60, 30, 60 * 1000));
+
+  if (!process.env.ADMIN_TOKEN || !process.env.ADMIN_TOKEN.trim()) {
+    console.warn("[SECURITY][CONFIG_WARNING] ADMIN_TOKEN is unset or empty. All admin routes will deny access.");
+  }
 
   const SERVER_STARTED_AT = new Date().toISOString();
   observabilityService.startCosmosFlushTimer(60000);
@@ -382,17 +529,19 @@ Keep the formatting clean with standard Markdown headers and bullet points.`;
     const clientToken = (
       req.headers["x-session-token"] ||
       req.headers["x-host-token"] ||
+      (req.query?.sessionToken as string) ||
+      (req.query?.hostToken as string) ||
       req.body?.sessionToken ||
       req.body?.token ||
       req.body?.hostToken
     )?.toString().trim();
 
     if (!clientToken) return false;
-    if (session.sessionToken && clientToken === session.sessionToken) return true;
-    if (session.hostToken && clientToken === session.hostToken) return true;
+    if (session.sessionToken && timingSafeEqualToken(clientToken, session.sessionToken)) return true;
+    if (session.hostToken && timingSafeEqualToken(clientToken, session.hostToken)) return true;
     if (session.hostTokenHash) {
       const hash = crypto.createHash("sha256").update(clientToken).digest("hex");
-      if (hash === session.hostTokenHash) return true;
+      if (timingSafeEqualToken(hash, session.hostTokenHash)) return true;
     }
     return false;
   }
@@ -471,7 +620,8 @@ Keep the formatting clean with standard Markdown headers and bullet points.`;
   }
 
   // Resilient Text-to-Speech (TTS) API Endpoint with Azure + Google Neural Fallback
-  app.post(["/api/azure/tts", "/api/tts"], async (req, res) => {
+  const ttsRateLimiter = createRateLimiter(60, 120, 60 * 1000);
+  app.post(["/api/azure/tts", "/api/tts"], ttsRateLimiter, async (req, res) => {
     const { text, languageCode, voiceName, gender, eventId: inputEventId, sessionId, token } = req.body;
     const activeSessionId = (sessionId || req.headers["x-session-id"] || token || "").toString().trim();
     if (!activeSessionId) {
@@ -497,6 +647,8 @@ Keep the formatting clean with standard Markdown headers and bullet points.`;
     const key = process.env.AZURE_SPEECH_KEY;
     const region = process.env.AZURE_SPEECH_REGION || "centralindia";
     const cleanLang = (languageCode || "hi").split("-")[0];
+    const cleanedText = cleanIndianText(text);
+    const validatedVoice = (voiceName && ALLOWED_AZURE_VOICES.has(voiceName)) ? voiceName : getAzureVoiceForLanguage(cleanLang, gender);
 
     observabilityService.recordEvent({
       eventId,
@@ -510,136 +662,117 @@ Keep the formatting clean with standard Markdown headers and bullet points.`;
       latencyMs: "NOT_MEASURED"
     });
 
-    if (key) {
-      try {
-        const cleanedText = cleanIndianText(text);
-        const validatedVoice = (voiceName && ALLOWED_AZURE_VOICES.has(voiceName)) ? voiceName : getAzureVoiceForLanguage(cleanLang, gender);
-        const escapedText = escapeXml(cleanedText);
-        const ssml = `<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xmlns:mstts='http://www.w3.org/2001/mstts' xml:lang='${languageCode || 'hi-IN'}'><voice name='${validatedVoice}'><prosody rate='1.02' pitch='+0Hz'>${escapedText}</prosody></voice></speak>`;
-        const outputFormatHeader = "audio-24khz-96kbitrate-mono-mp3";
+    const cacheKey = ttsAudioCache.getCacheKey(cleanedText, cleanLang, validatedVoice, gender);
 
-        console.log(`[AZURE_TTS][REQUEST] FormatHeader='${outputFormatHeader}' Voice='${validatedVoice}' Gender='${gender || 'default'}' SSML="${ssml}"`);
-
-        const url = `https://${region}.tts.speech.microsoft.com/cognitiveservices/v1`;
-        const response = await fetch(url, {
-          method: "POST",
-          headers: {
-            "Ocp-Apim-Subscription-Key": key,
-            "Content-Type": "application/ssml+xml",
-            "X-Microsoft-OutputFormat": outputFormatHeader,
-            "User-Agent": "BharatBridge"
-          },
-          body: ssml
-        });
-
-        if (!response.ok) {
-          const errText = await response.text();
-          throw new Error(`Azure TTS HTTP ${response.status}: ${errText}`);
-        }
-
-        const audioBuffer = await response.arrayBuffer();
-        const contentType = response.headers.get("content-type") || "unknown";
-        const byteSize = audioBuffer.byteLength;
-        const headersMap: Record<string, string> = {};
-        response.headers.forEach((v, k) => { headersMap[k] = v; });
-
-        console.log(`[AZURE_TTS][RESPONSE] Status=${response.status} ContentType='${contentType}' ByteSize=${byteSize} bytes OutputFormatSent='${outputFormatHeader}' EventId='${eventId}' AzureHeaders=`, JSON.stringify(headersMap));
-
-        const base64Audio = Buffer.from(audioBuffer).toString("base64");
-        const executionTimeMs = Date.now() - startTime;
-        observabilityService.recordEvent({
-          eventId,
-          sessionId: "global",
-          sourceLanguage: "en",
-          targetLanguage: cleanLang,
-          stage: "TTS",
-          eventType: "TTS_SUCCESS",
-          status: "SUCCESS",
-          provider: "azure-tts",
-          latencyMs: executionTimeMs,
-          charCount: text.length
-        });
-        return res.json({ audio: base64Audio, format: "audio/mp3", eventId, byteSize, contentType, outputFormat: outputFormatHeader, provider: "azure-tts", truncated: false });
-      } catch (error: any) {
-        console.warn(`[TTS_PATH] Azure TTS failed (reason: '${error?.message || error}')`);
-        if (process.env.DISABLE_TTS_FALLBACK === "true") {
-          console.warn("[TTS_PATH] DISABLE_TTS_FALLBACK is enabled. Aborting TTS generation without fallback.");
-          observabilityService.recordEvent({
-            eventId,
-            sessionId: "global",
-            sourceLanguage: "en",
-            targetLanguage: cleanLang,
-            stage: "TTS",
-            eventType: "TTS_FAILURE",
-            status: "FAILURE",
-            provider: "azure-tts",
-            latencyMs: Date.now() - startTime,
-            errorCode: "AZURE_TTS_FAILED",
-            errorMessage: error?.message || "Azure TTS failed"
-          });
-          return res.status(500).json({ error: `Azure TTS Failed: ${error?.message || error}. (DISABLE_TTS_FALLBACK=true)`, provider: "azure-tts", truncated: false });
-        }
-      }
-    } else if (process.env.DISABLE_TTS_FALLBACK === "true") {
-      console.warn("[TTS_PATH] AZURE_SPEECH_KEY missing and DISABLE_TTS_FALLBACK=true.");
-      return res.status(500).json({ error: "AZURE_SPEECH_KEY not set and DISABLE_TTS_FALLBACK=true", provider: "azure-tts", truncated: false });
-    }
-
-    // High-availability Fallback: Universal Google Neural TTS Engine for Indian languages
     try {
-      const isTruncated = (text || "").length > 200;
-      const shortText = (text || "").slice(0, 200);
-      const googleTtsUrl = `https://translate.google.com/translate_tts?ie=UTF-8&q=${encodeURIComponent(shortText)}&tl=${cleanLang}&client=tw-ob`;
-      const response = await fetch(googleTtsUrl, {
-        headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" }
-      });
-      if (response.ok) {
-        const audioBuffer = await response.arrayBuffer();
-        const base64Audio = Buffer.from(audioBuffer).toString("base64");
-        const executionTimeMs = Date.now() - startTime;
-        observabilityService.recordEvent({
-          eventId,
-          sessionId: "global",
-          sourceLanguage: "en",
-          targetLanguage: cleanLang,
-          stage: "TTS",
-          eventType: "TTS_SUCCESS",
-          status: "SUCCESS",
-          provider: "google-tts-fallback",
-          latencyMs: executionTimeMs,
-          charCount: shortText.length
+      const cachedOrSynthesized = await ttsAudioCache.getOrSynthesize(cacheKey, async () => {
+        if (key) {
+          try {
+            const escapedText = escapeXml(cleanedText);
+            const ssml = `<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xmlns:mstts='http://www.w3.org/2001/mstts' xml:lang='${languageCode || 'hi-IN'}'><voice name='${validatedVoice}'><prosody rate='1.02' pitch='+0Hz'>${escapedText}</prosody></voice></speak>`;
+            const outputFormatHeader = "audio-24khz-96kbitrate-mono-mp3";
+
+            console.log(`[AZURE_TTS][REQUEST] FormatHeader='${outputFormatHeader}' Voice='${validatedVoice}' Gender='${gender || 'default'}' SSML="${ssml}"`);
+
+            const url = `https://${region}.tts.speech.microsoft.com/cognitiveservices/v1`;
+            const response = await fetch(url, {
+              method: "POST",
+              headers: {
+                "Ocp-Apim-Subscription-Key": key,
+                "Content-Type": "application/ssml+xml",
+                "X-Microsoft-OutputFormat": outputFormatHeader,
+                "User-Agent": "BharatBridge"
+              },
+              body: ssml
+            });
+
+            if (!response.ok) {
+              const errText = await response.text();
+              throw new Error(`Azure TTS HTTP ${response.status}: ${errText}`);
+            }
+
+            const audioBuffer = await response.arrayBuffer();
+            const contentType = response.headers.get("content-type") || "unknown";
+            const byteSize = audioBuffer.byteLength;
+            const headersMap: Record<string, string> = {};
+            response.headers.forEach((v, k) => { headersMap[k] = v; });
+
+            console.log(`[AZURE_TTS][RESPONSE] Status=${response.status} ContentType='${contentType}' ByteSize=${byteSize} bytes OutputFormatSent='${outputFormatHeader}' EventId='${eventId}' AzureHeaders=`, JSON.stringify(headersMap));
+
+            const base64Audio = Buffer.from(audioBuffer).toString("base64");
+            return {
+              audio: base64Audio,
+              format: "audio/mp3",
+              byteSize,
+              contentType,
+              outputFormat: outputFormatHeader,
+              provider: "azure-tts",
+              truncated: false
+            };
+          } catch (error: any) {
+            console.warn(`[TTS_PATH] Azure TTS failed (reason: '${error?.message || error}')`);
+            if (process.env.DISABLE_TTS_FALLBACK === "true") {
+              throw error;
+            }
+          }
+        } else if (process.env.DISABLE_TTS_FALLBACK === "true") {
+          throw new Error("AZURE_SPEECH_KEY not set and DISABLE_TTS_FALLBACK=true");
+        }
+
+        // High-availability Fallback: Universal Google Neural TTS Engine for Indian languages
+        const isTruncated = (cleanedText || "").length > 200;
+        const shortText = (cleanedText || "").slice(0, 200);
+        const googleTtsUrl = `https://translate.google.com/translate_tts?ie=UTF-8&q=${encodeURIComponent(shortText)}&tl=${cleanLang}&client=tw-ob`;
+        const response = await fetch(googleTtsUrl, {
+          headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" }
         });
-        return res.json({ audio: base64Audio, format: "audio/mp3", eventId, provider: "google-tts-fallback", truncated: isTruncated });
-      }
+        if (response.ok) {
+          const audioBuffer = await response.arrayBuffer();
+          const base64Audio = Buffer.from(audioBuffer).toString("base64");
+          return {
+            audio: base64Audio,
+            format: "audio/mp3",
+            provider: "google-tts-fallback",
+            truncated: isTruncated
+          };
+        }
+        throw new Error("TTS generation failed on both Azure and Google fallback");
+      });
+
+      const executionTimeMs = Date.now() - startTime;
       observabilityService.recordEvent({
         eventId,
-        sessionId: "global",
+        sessionId: activeSessionId || "global",
         sourceLanguage: "en",
         targetLanguage: cleanLang,
         stage: "TTS",
-        eventType: "TTS_FAILURE",
-        status: "FAILURE",
-        provider: "google-tts-fallback",
-        latencyMs: Date.now() - startTime,
-        errorCode: "TTS_FAILURE"
+        eventType: "TTS_SUCCESS",
+        status: "SUCCESS",
+        provider: cachedOrSynthesized.provider,
+        latencyMs: executionTimeMs,
+        charCount: cleanedText.length
       });
-      res.status(500).json({ error: "TTS generation failed", provider: "google-tts-fallback", truncated: isTruncated });
-    } catch (error: any) {
-      console.error("[TTS] Universal TTS Error:", error);
+
+      return res.json({
+        ...cachedOrSynthesized,
+        eventId
+      });
+    } catch (err: any) {
+      const executionTimeMs = Date.now() - startTime;
       observabilityService.recordEvent({
         eventId,
-        sessionId: "global",
+        sessionId: activeSessionId || "global",
         sourceLanguage: "en",
         targetLanguage: cleanLang,
         stage: "TTS",
         eventType: "TTS_FAILURE",
         status: "FAILURE",
         provider: "tts-error",
-        latencyMs: Date.now() - startTime,
+        latencyMs: executionTimeMs,
         errorCode: "TTS_FAILURE",
-        errorMessage: error.message || "TTS synthesis error"
+        errorMessage: err?.message || "TTS synthesis error"
       });
-      res.status(500).json({ error: error.message || "TTS synthesis error", provider: "tts-error", truncated: false });
+      return res.status(500).json({ error: `TTS synthesis error: ${err?.message || err}`, provider: "tts-error", truncated: false });
     }
   });
 
@@ -1220,7 +1353,8 @@ Keep the formatting clean with standard Markdown headers and bullet points.`;
     if (!cleanText) return { text: "", provider: "none", degraded: false };
     const cleanTargetCode = (targetLangCode || "hi").split("-")[0];
     const targetLangName = LANGUAGE_NAME_MAP[cleanTargetCode] || cleanTargetCode;
-    const sourceLangName = sourceLangCode ? (LANGUAGE_NAME_MAP[sourceLangCode.split("-")[0]] || sourceLangCode) : "auto-detected language";
+    const isAutoDetectSource = !sourceLangCode || sourceLangCode === 'auto' || sourceLangCode === 'auto-detect';
+    const sourceLangName = isAutoDetectSource ? "the original language (auto-detected)" : (LANGUAGE_NAME_MAP[sourceLangCode.split("-")[0]] || sourceLangCode);
 
     // 1. Primary Engine: Gemini AI Context-Aware Natural Translation
     const last3Context = context && context.length > 0 ? context.slice(-3) : [];
@@ -1500,41 +1634,71 @@ New Sentences: ${JSON.stringify(sentences.map(cleanIndianText))}`;
   }
 
   // Server-Side Admin Access Verification Guard
-  function verifyAdminAccess(req: any): boolean {
-    // 0. Development mode auto-grant for local non-production environments
-    if (process.env.NODE_ENV !== "production") return true;
-
+  async function verifyAdminAccess(req: any): Promise<boolean> {
     const adminTokenHeader = (req.headers["x-admin-token"] || "").toString().trim();
     const authHeader = (req.headers["authorization"] || "").toString().trim();
     const envAdminToken = (process.env.ADMIN_TOKEN || "").trim();
-    const envAdminEmails = (process.env.ADMIN_EMAILS || "").split(",").map((e: string) => e.trim().toLowerCase()).filter(Boolean);
-    const reqEmail = (req.headers["x-admin-email"] || "").toString().toLowerCase().trim();
+    const envAdminEmails = (process.env.ADMIN_EMAILS || "")
+      .split(",")
+      .map((e: string) => e.trim().toLowerCase())
+      .filter(Boolean);
 
-    // 1. Secret admin token validation (x-admin-token or Bearer header)
-    if (envAdminToken && envAdminToken.length > 0) {
-      if (adminTokenHeader === envAdminToken) return true;
-      if (authHeader.startsWith("Bearer ") && authHeader.substring(7).trim() === envAdminToken) return true;
-    }
-
-    // 2. Admin email allowlist validation (x-admin-email header)
-    if (reqEmail && envAdminEmails.length > 0 && envAdminEmails.includes(reqEmail)) {
-      return true;
-    }
-
-    // 3. Fallback: Host session token validation (active session host)
-    const hostToken = (req.headers["x-host-token"] || req.headers["x-session-token"] || "").toString().trim();
-    if (hostToken) {
-      for (const s of sessions.values()) {
-        if (s.hostToken === hostToken || s.sessionToken === hostToken) return true;
+    let clientSecretToken = adminTokenHeader;
+    let bearerToken = "";
+    if (authHeader.startsWith("Bearer ")) {
+      bearerToken = authHeader.substring(7).trim();
+      if (!clientSecretToken && envAdminToken && timingSafeEqualToken(bearerToken, envAdminToken)) {
+        clientSecretToken = bearerToken;
       }
     }
 
-    return false;
+    const isAllowedBySecretToken = Boolean(
+      envAdminToken &&
+      clientSecretToken &&
+      timingSafeEqualToken(clientSecretToken, envAdminToken)
+    );
+
+    let decodedToken: any = null;
+    let isAllowedByEmail = false;
+    let isAllowedByClaim = false;
+
+    if (bearerToken && !isAllowedBySecretToken) {
+      const adminAuth = getAdminAuth();
+      if (adminAuth) {
+        try {
+          decodedToken = await adminAuth.verifyIdToken(bearerToken);
+          if (decodedToken) {
+            const tokenEmail = (decodedToken.email || "").toLowerCase().trim();
+            if (tokenEmail && envAdminEmails.includes(tokenEmail)) {
+              isAllowedByEmail = true;
+            }
+            if (decodedToken.admin === true || decodedToken.role === "admin") {
+              isAllowedByClaim = true;
+            }
+          }
+        } catch (verifyErr: any) {
+          decodedToken = null;
+        }
+      }
+    }
+
+    // TODO: [TEMPORARY] Remove this admin diagnostic log after troubleshooting access
+    console.log("[ADMIN_AUTH_DEBUG]", {
+      hasAuthHeader: Boolean(authHeader),
+      email: decodedToken?.email || null,
+      uid: decodedToken?.uid || null,
+      adminClaim: decodedToken?.admin ?? null,
+      isAllowedByEmail,
+      isAllowedByClaim,
+      isAllowedBySecretToken
+    });
+
+    return isAllowedBySecretToken || isAllowedByEmail || isAllowedByClaim;
   }
 
   // Admin Sessions List Endpoint (GET /api/admin/sessions)
   app.get("/api/admin/sessions", async (req, res) => {
-    if (!verifyAdminAccess(req)) {
+    if (!(await verifyAdminAccess(req))) {
       return res.status(403).json({ error: "Forbidden: Admin authorization required" });
     }
 
@@ -1602,12 +1766,16 @@ New Sentences: ${JSON.stringify(sentences.map(cleanIndianText))}`;
 
   // Admin Session Messages Endpoint (GET /api/admin/sessions/:id/messages)
   app.get("/api/admin/sessions/:id/messages", async (req, res) => {
-    if (!verifyAdminAccess(req)) {
-      return res.status(403).json({ error: "Forbidden: Admin authorization required" });
-    }
-
     const { id } = req.params;
     if (!id) return res.status(400).json({ error: "Missing session id parameter" });
+
+    const isAdmin = await verifyAdminAccess(req);
+    const targetSession = sessions.get(id);
+    const isSessionHost = targetSession ? verifySessionToken(req, targetSession) : false;
+
+    if (!isAdmin && !isSessionHost) {
+      return res.status(403).json({ error: "Forbidden: Admin authorization or valid session host token required" });
+    }
 
     try {
       const memorySession = sessions.get(id);
@@ -1692,7 +1860,10 @@ New Sentences: ${JSON.stringify(sentences.map(cleanIndianText))}`;
     }
     try {
       const targetLangCode = (LANGUAGE_NAME_MAP[targetLanguage.toLowerCase()] ? targetLanguage.toLowerCase() : Object.keys(LANGUAGE_NAME_MAP).find(k => LANGUAGE_NAME_MAP[k].toLowerCase() === targetLanguage.toLowerCase())) || targetLanguage || 'hi';
-      const sourceLangCode = sourceLanguage ? ((LANGUAGE_NAME_MAP[sourceLanguage.toLowerCase()] ? sourceLanguage.toLowerCase() : Object.keys(LANGUAGE_NAME_MAP).find(k => LANGUAGE_NAME_MAP[k].toLowerCase() === sourceLanguage.toLowerCase())) || sourceLanguage || 'en') : 'en';
+      const cleanSource = (sourceLanguage || "").toString().trim().toLowerCase();
+      const sourceLangCode = (!cleanSource || cleanSource === "auto" || cleanSource === "auto-detect")
+        ? "auto"
+        : ((LANGUAGE_NAME_MAP[cleanSource] ? cleanSource : Object.keys(LANGUAGE_NAME_MAP).find(k => LANGUAGE_NAME_MAP[k].toLowerCase() === cleanSource)) || sourceLanguage || "auto");
       
       const transResult = await generateTranslationWithGemini(text, text, targetLangCode, sourceLangCode, context, undefined, speakerGender);
       const executionTimeMs = Date.now() - startTime;
@@ -2826,7 +2997,12 @@ Generated by BharatBridge AI Matrix.`;
   // Vite middleware for development
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
-      server: { middlewareMode: true, host: "0.0.0.0", hmr: false },
+      server: {
+        middlewareMode: true,
+        host: "0.0.0.0",
+        hmr: false,
+        headers: { "Cross-Origin-Opener-Policy": "same-origin-allow-popups" }
+      },
       appType: "spa",
     });
     app.use(vite.middlewares);
@@ -2869,7 +3045,16 @@ Generated by BharatBridge AI Matrix.`;
   process.once("SIGTERM", () => handleShutdown("SIGTERM"));
 }
 
-startServer().catch(err => {
-  console.error("CRITICAL: Failed to start server:", err);
-  process.exit(1);
-});
+const isDirectExecution = Boolean(process.argv[1] && (
+  fileURLToPath(import.meta.url) === path.resolve(process.argv[1]) ||
+  process.argv[1].endsWith("server.ts") ||
+  process.argv[1].endsWith("server.cjs") ||
+  process.argv[1].endsWith("server.js")
+));
+
+if (isDirectExecution) {
+  startServer().catch(err => {
+    console.error("CRITICAL: Failed to start server:", err);
+    process.exit(1);
+  });
+}

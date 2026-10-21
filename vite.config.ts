@@ -13,6 +13,9 @@ export default defineConfig(() => {
     },
     server: {
       host: '0.0.0.0',
+      headers: {
+        'Cross-Origin-Opener-Policy': 'same-origin-allow-popups',
+      },
       fs: {
         allow: ['..', 'D:/AI DS CYDA documents/bharatbridge/Bharat-Bridge', 'C:/Users/Admin/antigravity/Bharat-Bridge']
       },

@@ -10,6 +10,8 @@ export interface TranslationOptions {
   context?: Array<{ originalText: string; translatedText: string }>;
   timeoutMs?: number;
   eventId?: string;
+  sessionId?: string;
+  token?: string;
 }
 
 export interface TranslationResult {
@@ -58,27 +60,41 @@ export interface AzureTTSResult {
  * Perform contextual text translation with multi-stage fallback
  */
 export async function translateText(options: TranslationOptions): Promise<TranslationResult> {
-  const { text, sourceLanguage, targetLanguage, context, timeoutMs = 8000, eventId } = options;
+  const { text, sourceLanguage, targetLanguage, context, timeoutMs = 8000, eventId, sessionId, token } = options;
   const cleanText = text.trim();
   if (!cleanText) {
     return { success: true, translatedText: "" };
   }
 
+  const effectiveSessionId = (sessionId || "").trim() || "global_test";
+  const effectiveSourceLanguage = sourceLanguage && sourceLanguage.trim() ? sourceLanguage.trim() : "auto";
+
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
-  console.log("[BHARATBRIDGE][TRANSLATION_REQUEST] Client requesting /api/translate:", { cleanText, sourceLanguage, targetLanguage, eventId });
+  console.log("[BHARATBRIDGE][TRANSLATION_REQUEST] Client requesting /api/translate:", {
+    cleanText,
+    sourceLanguage: effectiveSourceLanguage,
+    targetLanguage,
+    eventId,
+    sessionId: effectiveSessionId
+  });
   try {
     const res = await fetch("/api/translate", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        "x-session-id": effectiveSessionId
+      },
       signal: controller.signal,
       body: JSON.stringify({
         text: cleanText,
-        sourceLanguage,
+        sourceLanguage: effectiveSourceLanguage,
         targetLanguage,
         context,
-        eventId
+        eventId,
+        sessionId: effectiveSessionId,
+        token
       })
     });
 

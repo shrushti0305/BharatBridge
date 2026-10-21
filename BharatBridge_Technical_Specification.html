@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>BharatBridge v4.2 - Technical & Architectural Specification</title>
+<style>
+  @page {
+    size: A4;
+    margin: 15mm;
+  }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    color: #1e293b;
+    line-height: 1.5;
+    padding: 0;
+    margin: 0;
+    background: #ffffff;
+  }
+  .header {
+    border-bottom: 3px solid #f97316;
+    padding-bottom: 12px;
+    margin-bottom: 20px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .title-group h1 {
+    font-size: 24px;
+    margin: 0;
+    color: #0f172a;
+    font-weight: 800;
+  }
+  .title-group p {
+    font-size: 12px;
+    color: #64748b;
+    margin: 3px 0 0 0;
+  }
+  .badge {
+    background: #fff7ed;
+    color: #ea580c;
+    border: 1px solid #ffedd5;
+    padding: 4px 10px;
+    border-radius: 6px;
+    font-size: 11px;
+    font-weight: 700;
+    font-family: monospace;
+  }
+  h2 {
+    font-size: 16px;
+    color: #0f172a;
+    border-bottom: 1px solid #e2e8f0;
+    padding-bottom: 4px;
+    margin-top: 22px;
+    margin-bottom: 10px;
+    page-break-after: avoid;
+  }
+  h3 {
+    font-size: 13px;
+    color: #334155;
+    margin-top: 14px;
+    margin-bottom: 5px;
+    page-break-after: avoid;
+  }
+  p, li {
+    font-size: 11px;
+    color: #334155;
+  }
+  ul {
+    padding-left: 18px;
+    margin-top: 4px;
+    margin-bottom: 10px;
+  }
+  li {
+    margin-bottom: 3px;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 10px 0;
+    font-size: 10px;
+  }
+  th, td {
+    border: 1px solid #cbd5e1;
+    padding: 6px 8px;
+    text-align: left;
+  }
+  th {
+    background: #f8fafc;
+    color: #0f172a;
+    font-weight: 700;
+  }
+  tr:nth-child(even) {
+    background: #f8fafc;
+  }
+  code {
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+    font-size: 10.5px;
+    background: #f1f5f9;
+    color: #0f172a;
+    padding: 1.5px 4px;
+    border-radius: 3px;
+  }
+  pre {
+    background: #0f172a;
+    color: #f8fafc;
+    padding: 10px 12px;
+    border-radius: 6px;
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+    font-size: 9.5px;
+    overflow-x: auto;
+    white-space: pre-wrap;
+    word-break: break-all;
+    line-height: 1.4;
+    margin: 8px 0;
+  }
+  .box {
+    background: #f8fafc;
+    border-left: 4px solid #f97316;
+    padding: 10px 12px;
+    margin: 10px 0;
+    border-radius: 0 6px 6px 0;
+  }
+  .box-title {
+    font-weight: 700;
+    font-size: 11px;
+    color: #0f172a;
+    margin-bottom: 3px;
+  }
+  .footer {
+    margin-top: 25px;
+    padding-top: 10px;
+    border-top: 1px solid #e2e8f0;
+    font-size: 9.5px;
+    color: #94a3b8;
+    text-align: center;
+  }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="title-group">
+    <h1>BharatBridge (v4.2) — Technical & Architectural Blueprint</h1>
+    <p>Real-Time Multilingual Conference Intelligence • Developer Handover Specification</p>
+  </div>
+  <div class="badge">VERSION 4.2</div>
+</div>
+
+<div class="box">
+  <div class="box-title">Executive Summary</div>
+  <p style="margin:0;">BharatBridge is a real-time multilingual event platform enabling instant live speech-to-text (STT), Gemini LLM context-aware neural translation, and sequential text-to-speech (TTS) synthesis across 22 official Indian languages + English.</p>
+</div>
+
+<h2>1. Key Technical Features & Value Proposition</h2>
+<ul>
+  <li><strong>Context-Aware Natural LLM Translation:</strong> Powered by Google Gemini AI (Gemini 2.5/2.0 Flash) with conversational context-window prompts. Never translates word-for-word literally; preserves natural grammar, idioms, and conversational tone.</li>
+  <li><strong>Strict Speaker vs. Listener Role Isolation:</strong> Speaker screen displays ONLY original spoken speech captions. Target translations and target audio TTS are suppressed for speakers to prevent confusion. Listeners receive real-time target translations and audio TTS.</li>
+  <li><strong>Non-Blocking Sentence Queue & STT Deduplication:</strong> Web Speech API inputs pass through a FIFO queue (<code>sentenceQueueRef</code>) with a 2.5-second deduplication lock window to prevent line bleeding or duplicate STT invocations. Speech recognition runs continuously in parallel.</li>
+  <li><strong>Zero-Overlapping Sequential TTS Audio Queue:</strong> Audio clips are managed by a single active player (<code>activeAudioElRef</code>). Incoming translated lines play strictly back-to-back in sequential order (<code>ttsQueueRef</code>) with zero voice overlapping.</li>
+  <li><strong>Instant Guest Mode & Sub-100ms Catch-Up:</strong> 100% Guest Mode compatibility without mandatory logins. Newly joined listeners automatically receive the entire translated session history upon entering room PIN.</li>
+  <li><strong>Complete Analytics & Export Options:</strong> Download transcripts as TXT, CSV (with UTF-8 BOM <code>\uFEFF</code> for native Excel Devanagari rendering), WAV audio recordings, and Gemini-generated AI Session Summaries.</li>
+</ul>
+
+<h2>2. System Architecture & Data Flow</h2>
+<table>
+  <thead>
+    <tr>
+      <th>Component</th>
+      <th>Technology Stack</th>
+      <th>Function & Architectural Guarantee</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>Real-Time Gateway</strong></td>
+      <td>Node.js <code>ws</code> + Express</td>
+      <td>Sub-100ms WebSocket subscription. Non-blocking room creation (<code>&lt;1ms</code>).</td>
+    </tr>
+    <tr>
+      <td><strong>Contextual AI Engine</strong></td>
+      <td>Gemini 2.5 Flash / 2.0 Flash</td>
+      <td>Context-aware translation pipeline using recent 4–6 sentence pairs.</td>
+    </tr>
+    <tr>
+      <td><strong>STT Engine</strong></td>
+      <td>Web Speech API + PCM 16kHz Stream</td>
+      <td>Continuous client speech-to-text with 2.5s deduplication lock.</td>
+    </tr>
+    <tr>
+      <td><strong>TTS Neural Engine</strong></td>
+      <td>Azure Speech / Google Neural TTS</td>
+      <td>Sequential audio synthesis across 22 Indian language neural voices.</td>
+    </tr>
+    <tr>
+      <td><strong>Storage & Exports</strong></td>
+      <td>Azure Blob Storage + Firebase</td>
+      <td>Dual-format JSON/CSV logging and WAV audio exports.</td>
+    </tr>
+    <tr>
+      <td><strong>DNS Guard</strong></td>
+      <td><code>dns.setDefaultResultOrder("ipv4first")</code></td>
+      <td>Fixes Windows IPv6 connection timeouts on Node fetch.</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2>3. API Endpoints Specification</h2>
+<table>
+  <thead>
+    <tr>
+      <th>Endpoint</th>
+      <th>Method</th>
+      <th>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>/api/health</code></td>
+      <td>GET</td>
+      <td>Checks system status, execution mode, and Azure storage connectivity.</td>
+    </tr>
+    <tr>
+      <td><code>/api/translate</code></td>
+      <td>POST</td>
+      <td>Context-aware translation API powered by Gemini AI.</td>
+    </tr>
+    <tr>
+      <td><code>/api/session-summary</code></td>
+      <td>POST</td>
+      <td>Generates structured AI summary (Overview, Key Points, Notes) from session transcript.</td>
+    </tr>
+    <tr>
+      <td><code>/api/azure/tts</code></td>
+      <td>POST</td>
+      <td>Synthesizes neural speech MP3 audio using Azure Speech / Google TTS.</td>
+    </tr>
+    <tr>
+      <td><code>/api/azure/upload-caption</code></td>
+      <td>POST</td>
+      <td>Uploads session captions to Azure Blob Storage in CSV + JSON format.</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2>4. WebSocket Message Schemas</h2>
+<pre>
+1. Join Session (Client -> Server):
+   { "type": "join", "sessionId": "582941", "role": "listener", "targetLang": "mr" }
+
+2. Spoken Text Translation (Speaker -> Server):
+   { "type": "text_translation", "originalText": "Hello", "sourceLang": "en", "targetLang": "mr", "isFinal": true }
+
+3. Live Transcription Stream (Server -> Listener):
+   { "type": "transcription", "originalText": "Hello", "translatedText": "नमस्कार", "targetLang": "mr" }
+
+4. Session History Broadcast (Server -> Listener):
+   { "type": "history", "messages": [ { "originalText": "...", "translatedText": "..." } ] }
+</pre>
+
+<h2>5. Master System Prompt Guidelines</h2>
+<div class="box">
+  <div class="box-title">System Prompt Configuration for Developers / AI Agents</div>
+  <p style="margin:0;">Always maintain: (1) Instant non-blocking WebSockets (&lt;1ms), (2) Gemini context-aware translation, (3) Speaker vs Listener role isolation, (4) Non-blocking sentence queueing with 2.5s STT deduplication lock, (5) Zero-overlap sequential TTS audio playback, (6) Clean 2-column UI layout.</p>
+</div>
+
+<h2>6. Launch & Deployment Guide</h2>
+<pre>
+# Install dependencies
+npm install
+
+# TypeScript Type Check
+npx tsc --noEmit
+
+# Start Production/Development Server
+npx tsx server.ts
+
+# Optional Public Localtunnel
+npx localtunnel --port 3000
+</pre>
+
+<div class="footer">
+  BharatBridge v4.2 Technical Specification • Generated for Developer Meeting Handover • © 2026 BharatBridge
+</div>
+
+</body>
+</html>

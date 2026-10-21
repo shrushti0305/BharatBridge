@@ -1,5 +1,6 @@
 import { initializeApp, cert, getApps, App } from "firebase-admin/app";
 import { getFirestore, Firestore, FieldValue } from "firebase-admin/firestore";
+import { getAuth, Auth } from "firebase-admin/auth";
 import fs from "fs";
 import path from "path";
 
@@ -22,6 +23,67 @@ let initializationAttempted = false;
 let isConfiguredAndReachable = false;
 
 /**
+ * Safely initializes or returns the Firebase Admin App instance.
+ */
+export function getAdminApp(): App | null {
+  if (getApps().length > 0) {
+    adminApp = getApps()[0];
+    return adminApp;
+  }
+
+  const configPath = path.resolve(process.cwd(), "firebase-applet-config.json");
+  let projectId = process.env.FIREBASE_PROJECT_ID || "reflecting-journey-d8gvj";
+  if (fs.existsSync(configPath)) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(configPath, "utf-8"));
+      if (parsed.projectId) projectId = parsed.projectId;
+    } catch (e) {}
+  }
+
+  const saPath = process.env.FIREBASE_SERVICE_ACCOUNT_KEY || process.env.GOOGLE_APPLICATION_CREDENTIALS;
+  const saJson = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+
+  try {
+    if (saPath && fs.existsSync(saPath)) {
+      adminApp = initializeApp({
+        credential: cert(saPath),
+        projectId
+      });
+      console.log("[FIREBASE_ADMIN] Initialized using Service Account path.");
+    } else if (saJson) {
+      adminApp = initializeApp({
+        credential: cert(JSON.parse(saJson)),
+        projectId
+      });
+      console.log("[FIREBASE_ADMIN] Initialized using FIREBASE_SERVICE_ACCOUNT_JSON.");
+    } else {
+      adminApp = initializeApp({ projectId });
+      console.log(`[FIREBASE_ADMIN] Initialized with projectId '${projectId}' for token verification.`);
+    }
+  } catch (err: any) {
+    console.warn("[FIREBASE_ADMIN] Initialization warning:", err.message || err);
+    if (getApps().length > 0) {
+      adminApp = getApps()[0];
+    }
+  }
+
+  return adminApp;
+}
+
+/**
+ * Safely initializes and returns Firebase Admin Auth instance for ID token verification.
+ */
+export function getAdminAuth(): Auth | null {
+  try {
+    const app = getAdminApp();
+    return app ? getAuth(app) : null;
+  } catch (err: any) {
+    console.warn("[FIREBASE_ADMIN] Failed to get Auth instance:", err.message || err);
+    return null;
+  }
+}
+
+/**
  * Safely initializes Firebase Admin SDK on the Node.js server.
  * Ensures credentials are never exposed and never printed to logs.
  */
@@ -32,58 +94,38 @@ export function getAdminFirestore(): Firestore | null {
   initializationAttempted = true;
 
   try {
+    const app = getAdminApp();
+    if (!app) return null;
+
     const configPath = path.resolve(process.cwd(), "firebase-applet-config.json");
-    let projectId = "reflecting-journey-d8gvj";
     let databaseId = "(default)";
     if (fs.existsSync(configPath)) {
       try {
         const parsed = JSON.parse(fs.readFileSync(configPath, "utf-8"));
-        if (parsed.projectId) projectId = parsed.projectId;
         if (parsed.firestoreDatabaseId) databaseId = parsed.firestoreDatabaseId;
       } catch (e) {}
-    }
-
-    if (getApps().length > 0) {
-      adminApp = getApps()[0];
-      firestoreDb = (databaseId && databaseId !== "(default)") ? getFirestore(adminApp, databaseId) : getFirestore(adminApp);
-      isConfiguredAndReachable = true;
-      return firestoreDb;
     }
 
     const saPath = process.env.FIREBASE_SERVICE_ACCOUNT_KEY || process.env.GOOGLE_APPLICATION_CREDENTIALS;
     const saJson = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
 
-    if (saPath && fs.existsSync(saPath)) {
-      adminApp = initializeApp({
-        credential: cert(saPath),
-        projectId
-      });
-      firestoreDb = (databaseId && databaseId !== "(default)") ? getFirestore(adminApp, databaseId) : getFirestore(adminApp);
-      isConfiguredAndReachable = true;
-      console.log("[FIRESTORE] Firebase Admin initialized using Service Account path.");
-    } else if (saJson) {
-      const parsedSa = JSON.parse(saJson);
-      adminApp = initializeApp({
-        credential: cert(parsedSa),
-        projectId
-      });
-      firestoreDb = (databaseId && databaseId !== "(default)") ? getFirestore(adminApp, databaseId) : getFirestore(adminApp);
-      isConfiguredAndReachable = true;
-      console.log("[FIRESTORE] Firebase Admin initialized using FIREBASE_SERVICE_ACCOUNT_JSON.");
-    } else {
+    if (!saPath && !saJson) {
       console.log("[FIRESTORE] Credential Notice: Server environment credentials (FIREBASE_SERVICE_ACCOUNT_KEY / GOOGLE_APPLICATION_CREDENTIALS / FIREBASE_SERVICE_ACCOUNT_JSON) not set.");
       console.log("[FIRESTORE] Server-side Firestore persistence is operating in NOT_VERIFIED mode (Credential Boundary).");
       firestoreDb = null;
       isConfiguredAndReachable = false;
       return null;
     }
+
+    firestoreDb = (databaseId && databaseId !== "(default)") ? getFirestore(app, databaseId) : getFirestore(app);
+    isConfiguredAndReachable = true;
+    return firestoreDb;
   } catch (error: any) {
     console.warn("[FIRESTORE] Firebase Admin initialization notice:", error.message || error);
     firestoreDb = null;
     isConfiguredAndReachable = false;
+    return null;
   }
-
-  return firestoreDb;
 }
 
 /**

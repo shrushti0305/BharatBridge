@@ -170,16 +170,21 @@ let hasLoggedSaltWarning = false;
 /**
  * Hashes a sessionId using SHA-256 with a server-side salt (ADMIN_METRICS_SALT)
  * for privacy-preserving metric aggregation.
- * If ADMIN_METRICS_SALT is missing, session IDs are omitted (null) and a warning is logged once.
+ * If running in the browser, session IDs are not hashed on the client and the secret salt
+ * is never exposed in the client bundle.
+ * If ADMIN_METRICS_SALT is missing on the server, session IDs are omitted (null) and a warning is logged once.
  */
 export function hashSessionId(sessionId: string): string | null {
   if (!sessionId) return null;
+  // Browser safety guard: secret salt and session-id hashing belong strictly on the server
+  if (typeof window !== "undefined") {
+    return null;
+  }
+
   let salt = "";
   try {
     if (typeof process !== "undefined" && process?.env) {
       salt = process.env.ADMIN_METRICS_SALT || "";
-    } else if (typeof import.meta !== "undefined" && (import.meta as any).env) {
-      salt = (import.meta as any).env.VITE_ADMIN_METRICS_SALT || "";
     }
   } catch (_) {}
 
@@ -193,6 +198,34 @@ export function hashSessionId(sessionId: string): string | null {
   try {
     if (typeof crypto !== "undefined" && (crypto as any).createHash) {
       return (crypto as any).createHash("sha256").update(`${sessionId}:${salt}`).digest("hex").substring(0, 16);
+    }
+  } catch (_) {}
+  return null;
+}
+
+function getGeminiDailyLimit(): number | null {
+  try {
+    if (typeof process !== "undefined" && process?.env?.GEMINI_DAILY_LIMIT) {
+      return Number(process.env.GEMINI_DAILY_LIMIT);
+    }
+  } catch (_) {}
+  try {
+    if (typeof import.meta !== "undefined" && (import.meta as any)?.env?.VITE_GEMINI_DAILY_LIMIT) {
+      return Number((import.meta as any).env.VITE_GEMINI_DAILY_LIMIT);
+    }
+  } catch (_) {}
+  return null;
+}
+
+function getTtsDailyCharLimit(): number | null {
+  try {
+    if (typeof process !== "undefined" && process?.env?.TTS_DAILY_CHAR_LIMIT) {
+      return Number(process.env.TTS_DAILY_CHAR_LIMIT);
+    }
+  } catch (_) {}
+  try {
+    if (typeof import.meta !== "undefined" && (import.meta as any)?.env?.VITE_TTS_DAILY_CHAR_LIMIT) {
+      return Number((import.meta as any).env.VITE_TTS_DAILY_CHAR_LIMIT);
     }
   } catch (_) {}
   return null;
@@ -400,9 +433,9 @@ export class ObservabilityService {
         geminiCalls: 0,
         geminiCallsPacificDay: 0,
         geminiCalls429Count: 0,
-        geminiDailyLimit: process.env.GEMINI_DAILY_LIMIT ? Number(process.env.GEMINI_DAILY_LIMIT) : null,
+        geminiDailyLimit: getGeminiDailyLimit(),
         ttsTotalChars: 0,
-        ttsDailyCharLimit: process.env.TTS_DAILY_CHAR_LIMIT ? Number(process.env.TTS_DAILY_CHAR_LIMIT) : null,
+        ttsDailyCharLimit: getTtsDailyCharLimit(),
         ttsCharsByProvider: {},
         languageDistribution: {},
         providerDistribution: {},

@@ -435,69 +435,94 @@ const AdminModal = ({ isOpen, onClose }: { isOpen: boolean; onClose: () => void 
   const [loading, setLoading] = useState<boolean>(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
-  const fetchAdminSessions = () => {
-    setLoading(true);
-    setErrorMsg(null);
-    let userEmail = "";
-    try {
-      const savedUser = localStorage.getItem("bharat_bridge_user");
-      if (savedUser) userEmail = JSON.parse(savedUser).email || "";
-    } catch (_) {}
-
-    const adminToken = localStorage.getItem("bharat_bridge_admin_token") || (import.meta as any).env?.VITE_ADMIN_TOKEN || "";
-    const adminEmail = localStorage.getItem("bharat_bridge_admin_email") || userEmail;
-
-    fetch("/api/admin/sessions", {
-      headers: {
-        "x-admin-token": adminToken,
-        "x-admin-email": adminEmail
-      }
-    })
-      .then(res => {
-        if (!res.ok) throw new Error(`HTTP ${res.status}: Admin access denied`);
-        return res.json();
-      })
-      .then(data => {
-        setSessions(data.sessions || []);
-        if (data.sessions && data.sessions.length > 0) {
-          setSelectedSession(data.sessions[0]);
-        }
-      })
-      .catch(err => {
-        console.warn("[AdminModal] Error fetching sessions:", err);
-        setErrorMsg(err.message || "Failed to load admin sessions");
-      })
-      .finally(() => setLoading(false));
-  };
-
   useEffect(() => {
     if (!isOpen) return;
-    fetchAdminSessions();
+
+    let isMounted = true;
+    const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
+      if (!isMounted) return;
+      if (!currentUser) {
+        // Do nothing before a user is signed in
+        return;
+      }
+
+      setLoading(true);
+      setErrorMsg(null);
+
+      try {
+        const token = await currentUser.getIdToken();
+        const headers: Record<string, string> = {
+          Authorization: `Bearer ${token}`
+        };
+
+        const adminToken = localStorage.getItem("bharat_bridge_admin_token") || (import.meta as any).env?.VITE_ADMIN_TOKEN || "";
+        if (adminToken) {
+          headers["x-admin-token"] = adminToken;
+        }
+
+        const res = await fetch("/api/admin/sessions", { headers });
+        if (!res.ok) {
+          throw new Error(`HTTP ${res.status}: Admin access denied`);
+        }
+        const data = await res.json();
+        if (isMounted) {
+          setSessions(data.sessions || []);
+          if (data.sessions && data.sessions.length > 0) {
+            setSelectedSession(data.sessions[0]);
+          }
+        }
+      } catch (err: any) {
+        if (isMounted) {
+          console.warn("[AdminModal] Error fetching sessions:", err);
+          setErrorMsg(err.message || "Failed to load admin sessions");
+        }
+      } finally {
+        if (isMounted) {
+          setLoading(false);
+        }
+      }
+    });
+
+    return () => {
+      isMounted = false;
+      unsubscribe();
+    };
   }, [isOpen]);
 
   useEffect(() => {
-    if (!selectedSession) {
+    if (!selectedSession || !auth.currentUser) {
       setSessionMessages([]);
       return;
     }
-    let userEmail = "";
-    try {
-      const savedUser = localStorage.getItem("bharat_bridge_user");
-      if (savedUser) userEmail = JSON.parse(savedUser).email || "";
-    } catch (_) {}
 
-    const adminToken = localStorage.getItem("bharat_bridge_admin_token") || (import.meta as any).env?.VITE_ADMIN_TOKEN || "";
-    const adminEmail = localStorage.getItem("bharat_bridge_admin_email") || userEmail;
+    let isMounted = true;
+    (async () => {
+      try {
+        const token = await auth.currentUser?.getIdToken();
+        const headers: Record<string, string> = {};
+        if (token) {
+          headers["Authorization"] = `Bearer ${token}`;
+        }
+        const adminToken = localStorage.getItem("bharat_bridge_admin_token") || (import.meta as any).env?.VITE_ADMIN_TOKEN || "";
+        if (adminToken) {
+          headers["x-admin-token"] = adminToken;
+        }
 
-    fetch(`/api/admin/sessions/${selectedSession.id}/messages`, {
-      headers: {
-        "x-admin-token": adminToken,
-        "x-admin-email": adminEmail
+        const res = await fetch(`/api/admin/sessions/${selectedSession.id}/messages`, { headers });
+        if (res.ok) {
+          const data = await res.json();
+          if (isMounted) {
+            setSessionMessages(data.messages || []);
+          }
+        }
+      } catch (err) {
+        console.warn("[AdminModal] Error fetching session messages:", err);
       }
-    })
-      .then(res => res.json())
-      .then(data => setSessionMessages(data.messages || []))
-      .catch(err => console.warn("[AdminModal] Error fetching session messages:", err));
+    })();
+
+    return () => {
+      isMounted = false;
+    };
   }, [selectedSession]);
 
   const [activeTab, setActiveTab] = useState<"messages" | "summary">("messages");
@@ -1432,8 +1457,8 @@ export default function App() {
   }, []);
 
   const [userRoleState, setUserRoleState] = useState<string | null>(null);
-  const adminEmails = ((import.meta as any).env?.VITE_ADMIN_EMAILS || "admin@bharatbridge.com").split(",").map((e: string) => e.trim().toLowerCase());
-  const isAdminUser = userRoleState === 'admin' || (user?.email && adminEmails.includes(user.email.toLowerCase())) || !!localStorage.getItem("bharat_bridge_admin_token") || process.env.NODE_ENV === "development";
+  const adminEmails = (import.meta.env.VITE_ADMIN_EMAILS || "admin@bharatbridge.com").split(",").map((e: string) => e.trim().toLowerCase());
+  const isAdminUser = userRoleState === 'admin' || (user?.email && adminEmails.includes(user.email.toLowerCase())) || !!localStorage.getItem("bharat_bridge_admin_token") || Boolean(import.meta.env.DEV);
 
   useEffect(() => {
     localStorage.setItem("bharat_bridge_profile", JSON.stringify(profile));
@@ -2123,6 +2148,20 @@ export default function App() {
     shouldBeListeningRef.current = false;
     isLiveRef.current = false;
 
+    // Immediately stop speech recognition, clear auto-restart timer, and clear sentence queue
+    if (recognitionRef.current) {
+      try {
+        recognitionRef.current.stop();
+      } catch (_) {}
+    }
+    if (sttRestartTimerRef.current) {
+      clearTimeout(sttRestartTimerRef.current);
+      sttRestartTimerRef.current = null;
+    }
+    sentenceQueueRef.current = [];
+    isProcessingQueueRef.current = false;
+    setIsListening(false);
+
     const activeSession = currentSession;
     const activeMessages = [...messages];
 
@@ -2137,6 +2176,17 @@ export default function App() {
     try {
       // Clean shutdown
     } finally {
+      if (recognitionRef.current) {
+        try {
+          recognitionRef.current.stop();
+        } catch (_) {}
+      }
+      if (sttRestartTimerRef.current) {
+        clearTimeout(sttRestartTimerRef.current);
+        sttRestartTimerRef.current = null;
+      }
+      sentenceQueueRef.current = [];
+      isProcessingQueueRef.current = false;
       resetHoldBackBuffer();
       setIsLive(false);
       isLiveRef.current = false;
@@ -2548,12 +2598,17 @@ export default function App() {
           status: 'SUCCESS'
         });
 
+        const effectiveSourceLanguage = autoDetect 
+          ? 'auto' 
+          : (sourceLang.name || sourceLang.code || 'en');
+
         const result = await translateText({
           text: line.trim(),
-          sourceLanguage: autoDetect ? undefined : sourceLang.name,
+          sourceLanguage: effectiveSourceLanguage,
           targetLanguage: targetLang.name,
           context: recentContext,
-          eventId
+          eventId,
+          sessionId: currentSession?.id || 'global_test'
         });
         const lineTranslation = result.translatedText || line.trim();
         const isFallback = (lineTranslation || "").trim().toLowerCase() === line.trim().toLowerCase();
@@ -2786,7 +2841,13 @@ export default function App() {
 
           {isAdminUser && (
             <button 
-              onClick={() => setModalOpen({ open: true, type: "admin" })}
+              onClick={() => {
+                if (!user && !auth.currentUser) {
+                  setModalOpen({ open: true, type: "auth" });
+                  return;
+                }
+                setModalOpen({ open: true, type: "admin" });
+              }}
               className="px-3 py-1.5 bg-orange-500/15 hover:bg-orange-500/25 border border-orange-500/30 text-orange-400 text-xs font-semibold rounded-full transition-all flex items-center gap-1.5"
               title="Open Admin Panel"
             >
@@ -3347,7 +3408,7 @@ export default function App() {
             }}
           />
         )}
-        {modalOpen.open && modalOpen.type === "admin" && (
+        {modalOpen.open && modalOpen.type === "admin" && (user || auth.currentUser) && (
           <AdminModal 
             isOpen={modalOpen.open}
             onClose={() => setModalOpen({ ...modalOpen, open: false })}
