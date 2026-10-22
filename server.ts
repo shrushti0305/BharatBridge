@@ -3,20 +3,19 @@ import express from "express";
 import path from "path";
 import { fileURLToPath } from "url";
 import { createServer as createViteServer } from "vite";
-import { GoogleGenAI, Type, Modality, LiveServerMessage } from "@google/genai";
+import { GoogleGenAI, Modality, LiveServerMessage } from "@google/genai";
 import dotenv from "dotenv";
 import { WebSocketServer, WebSocket } from "ws";
 import http from "http";
 import dns from "dns";
 import { observabilityService, generateEventId } from "./src/services/observability";
-import { resolveLanguageDefinition, getCanonicalLanguageCode, isLanguageSupported, getAllLanguages } from "./src/registry/languages.js";
+import { getCanonicalLanguageCode } from "./src/registry/languages.js";
 import { getAdminAuth } from "./src/lib/firebase-admin";
 import {
   initCosmosDB,
   cosmosHealthState,
   getCosmosClient,
   upsertFinalizedThoughtDocument,
-  patchTranslationDocument,
   upsertSessionDocument,
   loadSessionFromCosmos
 } from "./src/lib/cosmos-client.js";
@@ -965,14 +964,6 @@ Keep the formatting clean with standard Markdown headers and bullet points.`;
     return activeLangs;
   };
 
-  const getLanguageListenerCount = (sessionId: string, targetLang: string): number => {
-    const session = sessions.get(sessionId);
-    if (!session) return 0;
-    const canonical = getCanonicalLanguageCode(targetLang);
-    const group = session.languageGroups.get(canonical);
-    if (!group) return 0;
-    return Array.from(group.listeners).filter(ws => ws.readyState === WebSocket.OPEN).length;
-  };
 
   const addListenerToLanguageGroup = (sessionId: string, targetLang: string, ws: WebSocket): void => {
     const session = sessions.get(sessionId);
@@ -998,10 +989,6 @@ Keep the formatting clean with standard Markdown headers and bullet points.`;
     }
   };
 
-  const moveListenerLanguage = (sessionId: string, oldLang: string, newLang: string, ws: WebSocket): void => {
-    removeListenerFromLanguageGroup(sessionId, oldLang, ws);
-    addListenerToLanguageGroup(sessionId, newLang, ws);
-  };
 
   // Phase 1: Single-Flight In-Memory Deduplication Cache (Single-server development mode)
   // NOTE: THIS IS NOT YET A MULTI-INSTANCE DISTRIBUTED LOCK.
@@ -1493,130 +1480,6 @@ New Sentence: "${cleanText}"`;
     return { text: cleanIndianText(cleanText), provider: "untranslated", degraded: true };
   }
 
-  async function generateBatchTranslationWithGemini(
-    sentences: string[],
-    targetLangCode: string,
-    sourceLangCode?: string,
-    context?: Array<{ originalText: string; translatedText: string }>,
-    topicOrGlossary?: string,
-    speakerGender?: string
-  ): Promise<{ translations: string[]; latencyMs: number; promptTokens: number; provider: string; model: string }> {
-    const startTime = Date.now();
-    const cleanTargetCode = (targetLangCode || "hi").split("-")[0];
-    const targetLangName = LANGUAGE_NAME_MAP[cleanTargetCode] || cleanTargetCode;
-    const sourceLangName = sourceLangCode ? (LANGUAGE_NAME_MAP[sourceLangCode.split("-")[0]] || sourceLangCode) : "auto-detected language";
-
-    const last3Context = context && context.length > 0 ? context.slice(-3) : [];
-    const contextPrompt = last3Context.length > 0 
-      ? `previous context (do not re-translate):\n${last3Context.map((c, idx) => `[${idx + 1}] Original: "${c.originalText}" -> Translated: "${c.translatedText}"`).join("\n")}\n\n`
-      : "";
-
-    const topicPrompt = topicOrGlossary && topicOrGlossary.trim()
-      ? `Event Topic / Glossary:\n${topicOrGlossary.trim()}\n\n`
-      : "";
-
-    const genderPrompt = speakerGender && (speakerGender === 'male' || speakerGender === 'female')
-      ? `Speaker Gender: ${speakerGender}. Ensure all first-person verbs and agreement forms grammatically match a ${speakerGender} speaker in ${targetLangName} (e.g. रही हूँ vs रहा हूँ in Hindi, or રહી છું vs રહ્યો છું in Gujarati).\n`
-      : `Speaker Gender is unspecified. Use gender-neutral phrasing and forms in ${targetLangName} whenever possible, rather than defaulting to masculine forms.\n`;
-
-    console.log(`[GEMINI][TRANSLATION_CONTEXT] targetLang='${cleanTargetCode}' topic='${topicOrGlossary || ''}' speakerGender='${speakerGender || 'unspecified'}' contextSent=`, last3Context, "sentencesInput=", sentences);
-
-    const isTargetEnglish = cleanTargetCode === 'en';
-    const systemPrompt = isTargetEnglish
-      ? `You are an elite, culturally fluent human interpreter providing live simultaneous interpretation into natural spoken English.
-
-CORE INTERPRETATION MANDATES:
-1. IDIOMATIC & CONTEXTUAL MEANING (CRITICAL):
-   - When interpreting from Indian languages into English, translate the UNDERLYING INTENT into authentic, natural conversational English expressions. Re-express Indian idioms and colloquialisms into natural English equivalents.
-
-2. SCRIPT & LANGUAGE STRICTNESS:
-   - Output ONLY in standard English using Latin script.
-
-3. PROPER NOUNS & NAMES:
-   - Preserve proper nouns (people's names, place names, brand/project names) in standard English spelling.
-
-4. CONVERSATIONAL RHYTHM & GRAMMAR:
-   - Use standard English Subject-Verb-Object (SVO) word order.
-
-${topicPrompt}${genderPrompt}${contextPrompt}STRICT INSTRUCTIONS:
-1. Translate ONLY the array of new sentences below into natural, spoken English.
-2. Return ONLY a valid JSON array of strings containing the translations for each corresponding input sentence, in the exact same order and count.
-3. Example JSON output: ["Translation 1", "Translation 2"]
-
-New Sentences: ${JSON.stringify(sentences.map(cleanIndianText))}`
-      : `You are an elite, culturally fluent human interpreter providing live simultaneous interpretation into natural spoken ${targetLangName}.
-
-CORE INTERPRETATION MANDATES:
-1. IDIOMATIC & CONTEXTUAL MEANING (CRITICAL):
-   - Translate the UNDERLYING INTENT and CONTEXT of the speaker into authentic, culturally natural spoken expressions in ${targetLangName} that a native speaker would naturally use in conversation.
-   - For English idioms, metaphors, or figures of speech (e.g., "on the same page", "hit the nail on the head", "getting into the groove", "think outside the box", "circle back"), ALWAYS translate the true conversational meaning into ${targetLangName}. Do NOT perform literal dictionary translation.
-
-2. SCRIPT & LANGUAGE STRICTNESS:
-   - Output ONLY in the native script of ${targetLangName} (e.g. Gujarati script for Gujarati, Devanagari script for Hindi/Marathi). NEVER output Devanagari Hindi text when Gujarati is requested!
-
-3. PROPER NOUNS & NAMES:
-   - Preserve proper nouns as names and transliterate them phonetically into the native script of ${targetLangName}.
-
-${topicPrompt}${genderPrompt}${contextPrompt}STRICT INSTRUCTIONS:
-1. Translate ONLY the array of new sentences below into natural, spoken ${targetLangName} script.
-2. Return ONLY a valid JSON array of strings containing the translations for each corresponding input sentence, in the exact same order and count.
-3. Example JSON output: ["Translation 1", "Translation 2"]
-
-New Sentences: ${JSON.stringify(sentences.map(cleanIndianText))}`;
-
-    const primaryModel = process.env.GEMINI_MODEL_TRANSLATION || "gemini-3.8-flash";
-    try {
-      const geminiPromise = ai.models.generateContent({
-        model: primaryModel,
-        contents: systemPrompt,
-        config: { 
-          temperature: 0.1,
-          maxOutputTokens: 500,
-          responseMimeType: "application/json",
-          thinkingConfig: { thinkingBudget: 0 } as any
-        }
-      });
-
-      const timeoutPromise = new Promise<never>((_, reject) => 
-        setTimeout(() => reject(new Error(`Gemini ${primaryModel} timed out after 3000ms`)), 3000)
-      );
-
-      const result = await Promise.race([geminiPromise, timeoutPromise]);
-      const latencyMs = Date.now() - startTime;
-      const promptTokens = (result as any).usageMetadata?.promptTokenCount || 0;
-      const candidatesTokens = (result as any).usageMetadata?.candidatesTokenCount || 0;
-      const thoughtsTokens = (result as any).usageMetadata?.thoughtsTokenCount || 0;
-
-      let parsed: string[] = [];
-      if (result.text && result.text.trim()) {
-        try {
-          const rawParsed = JSON.parse(result.text.trim());
-          if (Array.isArray(rawParsed)) {
-            parsed = rawParsed.map(s => cleanIndianText(String(s)));
-          }
-        } catch (pErr) {
-          console.warn("[GEMINI][BATCH_JSON_PARSE_FALLBACK]", pErr);
-        }
-      }
-
-      if (parsed.length === sentences.length) {
-        console.log(`[BHARATBRIDGE][TRANSLATION_SUCCESS] provider='gemini-batch' model='${primaryModel}' latencyMs=${latencyMs}ms promptTokens=${promptTokens} candidatesTokens=${candidatesTokens} thoughtsTokenCount=${thoughtsTokens} fallbackFired=false thinkingBudget=0`);
-        return { translations: parsed, latencyMs, promptTokens, provider: "gemini-batch", model: primaryModel };
-      }
-    } catch (err: any) {
-      console.warn(`[GEMINI][BATCH_TRANSLATION_NOTICE] Model='${primaryModel}' fallback:`, err.message || err);
-    }
-
-    const fallbacks = await Promise.all(
-      sentences.map(async s => {
-        const res = await generateTranslationWithGemini(s, s, targetLangCode, sourceLangCode, context, topicOrGlossary);
-        return res.text;
-      })
-    );
-    const latencyMs = Date.now() - startTime;
-    return { translations: fallbacks.map(cleanIndianText), latencyMs, promptTokens: 0, provider: "gemini-fallback", model: primaryModel };
-  }
-
   // Server-Side Admin Access Verification Guard
   async function verifyAdminAccess(req: any): Promise<boolean> {
     const adminTokenHeader = (req.headers["x-admin-token"] || "").toString().trim();
@@ -1666,16 +1529,6 @@ New Sentences: ${JSON.stringify(sentences.map(cleanIndianText))}`;
       }
     }
 
-    // TODO: [TEMPORARY] Remove this admin diagnostic log after troubleshooting access
-    console.log("[ADMIN_AUTH_DEBUG]", {
-      hasAuthHeader: Boolean(authHeader),
-      email: decodedToken?.email || null,
-      uid: decodedToken?.uid || null,
-      adminClaim: decodedToken?.admin ?? null,
-      isAllowedByEmail,
-      isAllowedByClaim,
-      isAllowedBySecretToken
-    });
 
     return isAllowedBySecretToken || isAllowedByEmail || isAllowedByClaim;
   }
@@ -1963,70 +1816,6 @@ New Sentences: ${JSON.stringify(sentences.map(cleanIndianText))}`;
     }
   });
 
-  // AI Session Summary API Endpoint
-  app.post("/api/session-summary", async (req, res) => {
-    const { sessionId, messages, targetLanguage } = req.body;
-    if (!messages || !Array.isArray(messages) || messages.length === 0) {
-      return res.status(400).json({ error: "No transcript messages available to generate summary." });
-    }
-
-    try {
-      const fullTranscript = messages.map((m: any, i: number) => 
-        `[${i + 1}] Original: "${m.originalText}" | Translated (${targetLanguage || "Target"}): "${m.translatedText || m.originalText}"`
-      ).join("\n");
-
-      const prompt = `You are an expert AI summary generator. 
-Given the following session transcript, generate a structured session summary in ${targetLanguage || "English"}.
-
-Structure:
-# Session Summary (ID: ${sessionId || "Live Session"})
-## Executive Overview
-Brief 2-3 sentence overview of what was discussed.
-
-## Key Points & Highlights
-- List 3-5 main key takeaways or points discussed.
-
-## Detailed Summary Notes
-Chronological breakdown of key statements and topics.
-
-Transcript:
-${fullTranscript}
-
-Return ONLY clean markdown formatting without extra conversational intro or outro.`;
-
-      const primarySummaryModel = process.env.GEMINI_MODEL_SUMMARY || "gemini-2.5-flash";
-      const models = Array.from(new Set([primarySummaryModel, "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]));
-      for (const model of models) {
-        try {
-          const result = await ai.models.generateContent({
-            model,
-            contents: prompt,
-            config: { temperature: 0.2 }
-          });
-          if (result.text && result.text.trim()) {
-            return res.json({ success: true, summary: result.text.trim() });
-          }
-        } catch (err: any) {}
-      }
-
-      // Fallback summary generator
-      const fallbackSummary = `# Session Summary (ID: ${sessionId || "Live Session"})
-
-## Executive Overview
-Session record containing ${messages.length} transcript lines.
-
-## Key Transcript Highlights
-${messages.slice(0, 8).map((m: any) => `- ${m.translatedText || m.originalText}`).join('\n')}
-
----
-Generated by BharatBridge AI Matrix.`;
-
-      res.json({ success: true, summary: fallbackSummary });
-    } catch (error: any) {
-      console.error("Session Summary API Error:", error);
-      res.status(500).json({ error: error.message || "Failed to generate session summary" });
-    }
-  });
 
   // Global Express error handling middleware
   app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
