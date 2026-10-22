@@ -9,3 +9,5 @@ coverage/
 scratch/
 *service-account*.json
 firebase-adminsdk*.json
+yes summit/
+

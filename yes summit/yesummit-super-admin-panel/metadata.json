@@ -1,6 +1,0 @@
-{
-  "name": "YESummit Super Admin Panel",
-  "description": "Operations Command Centre prototype for YESummit 2027 super admin operations.",
-  "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
-}
