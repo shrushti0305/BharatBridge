@@ -316,7 +316,8 @@ async function startServer() {
   const app = express();
   app.set("trust proxy", process.env.TRUST_PROXY ? (Number(process.env.TRUST_PROXY) || process.env.TRUST_PROXY) : 1);
   const server = http.createServer(app);
-  const wss = new WebSocketServer({ noServer: true, maxPayload: 1024 * 1024 });
+  const WS_MAX_PAYLOAD = process.env.WS_MAX_PAYLOAD ? Number(process.env.WS_MAX_PAYLOAD) : 64 * 1024;
+  const wss = new WebSocketServer({ noServer: true, maxPayload: WS_MAX_PAYLOAD });
   const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
 
   app.use(express.json({ limit: "10mb" }));
@@ -400,6 +401,8 @@ async function startServer() {
     languageGroups: Map<string, LanguageGroup>;
     speakerGender: string;
     defaultTargetLang?: string;
+    costBudgetUsd?: number;
+    estimatedCostUsd?: number;
     topic?: string;
     isDuoMode?: boolean;
     messages: SessionMessage[];
@@ -463,6 +466,38 @@ async function startServer() {
       return { valid: false, expired: true };
     }
     return { valid: false };
+  }
+
+  // Cost Budget Tracking (Global Daily Cap & Per-Session Budget)
+  let globalEstimatedDailySpendUsd = 0;
+  let globalDailySpendReset = Date.now() + 24 * 3600 * 1000;
+
+  function checkSessionCostBudget(session: any, estimatedCallCostUsd: number = 0.0003): { allowed: boolean; code?: string; message?: string } {
+    const now = Date.now();
+    if (now > globalDailySpendReset) {
+      globalEstimatedDailySpendUsd = 0;
+      globalDailySpendReset = now + 24 * 3600 * 1000;
+    }
+    const globalCap = Number(process.env.GLOBAL_DAILY_BUDGET_USD) || 25.0;
+    if (globalEstimatedDailySpendUsd + estimatedCallCostUsd > globalCap) {
+      return { allowed: false, code: "GLOBAL_BUDGET_EXCEEDED", message: "Global daily translation budget cap reached." };
+    }
+
+    if (session) {
+      const budget = session.costBudgetUsd !== undefined ? session.costBudgetUsd : (Number(process.env.SESSION_COST_BUDGET_USD) || 5.0);
+      const currentSpend = session.estimatedCostUsd || 0;
+      if (currentSpend >= budget) {
+        return { allowed: false, code: "SESSION_BUDGET_EXCEEDED", message: "Session translation cost budget exceeded." };
+      }
+    }
+    return { allowed: true };
+  }
+
+  function recordSessionCost(session: any, costUsd: number = 0.0003): void {
+    globalEstimatedDailySpendUsd += costUsd;
+    if (session) {
+      session.estimatedCostUsd = (session.estimatedCostUsd || 0) + costUsd;
+    }
   }
 
   // Azure Blob Storage Upload for Captions (Dual-Format JSON + CSV)
@@ -654,6 +689,8 @@ Keep the formatting clean with standard Markdown headers and bullet points.`;
         languageGroups: new Map(),
         speakerGender: speakerGender || "female",
         defaultTargetLang: targetLang || "hi",
+        costBudgetUsd: req.body?.costBudgetUsd !== undefined ? Number(req.body.costBudgetUsd) : (Number(process.env.SESSION_COST_BUDGET_USD) || 5.0),
+        estimatedCostUsd: 0,
         topic: topic || "",
         isDuoMode: isDuoMode === true,
         messages: [],
@@ -712,6 +749,10 @@ Keep the formatting clean with standard Markdown headers and bullet points.`;
           }
           return res.status(403).json({ error: "Forbidden: Valid sessionToken or hostToken is required", code: "SESSION_TOKEN_REQUIRED" });
         }
+        const budgetCheck = checkSessionCostBudget(sessionObj, 0.0003);
+        if (!budgetCheck.allowed) {
+          return res.status(429).json({ error: budgetCheck.message, code: budgetCheck.code });
+        }
       }
     }
     const key = process.env.AZURE_TRANSLATOR_KEY;
@@ -740,6 +781,9 @@ Keep the formatting clean with standard Markdown headers and bullet points.`;
 
       const data = await response.json();
       const translatedText = data[0]?.translations[0]?.text || text;
+      if (activeSessionId && sessions.has(activeSessionId)) {
+        recordSessionCost(sessions.get(activeSessionId), 0.0003);
+      }
       res.json({ translatedText });
     } catch (error: any) {
       console.error("Azure Translator API Error:", error);
@@ -1817,6 +1861,10 @@ New Sentence: "${cleanText}"`;
         }
         return res.status(403).json({ error: "Forbidden: Valid sessionToken or hostToken is required", code: "SESSION_TOKEN_REQUIRED" });
       }
+      const budgetCheck = checkSessionCostBudget(sessionObj, 0.0003);
+      if (!budgetCheck.allowed) {
+        return res.status(429).json({ error: budgetCheck.message, code: budgetCheck.code });
+      }
       if (!text || typeof text !== "string" || !text.trim() || !targetLanguage) {
         return res.status(400).json({ error: "Missing text or targetLanguage" });
       }
@@ -1875,6 +1923,7 @@ New Sentence: "${cleanText}"`;
 
       if (sessions.has(activeSessionId)) {
         const session = sessions.get(activeSessionId)!;
+        recordSessionCost(session, 0.0003);
         const now = Date.now();
         const newMsg: SessionMessage = {
           originalText: text.trim(),
@@ -1977,7 +2026,8 @@ New Sentence: "${cleanText}"`;
 
     if (origin) {
       const isLocalhost = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin);
-      const isPrivateNetwork = process.env.NODE_ENV !== "production" &&
+      const isExplicitDev = process.env.NODE_ENV === "development" || process.env.NODE_ENV === "test";
+      const isPrivateNetwork = isExplicitDev &&
         /^https?:\/\/(10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3})(:\d+)?$/.test(origin);
 
       const isAllowed = allowedOrigins.includes(origin) || isLocalhost || isPrivateNetwork;
@@ -2125,6 +2175,13 @@ New Sentence: "${cleanText}"`;
   wss.on("connection", (ws, req) => {
     (ws as any).isAlive = true;
     (ws as any).remoteAddress = getWsClientIp(req);
+
+    // Per-socket token bucket rate limiter (refillRate: 20 msgs/s, burstCapacity: 40 msgs)
+    const burstCapacity = process.env.WS_RATE_LIMIT_BURST_CAPACITY ? Number(process.env.WS_RATE_LIMIT_BURST_CAPACITY) : 40;
+    const refillRate = process.env.WS_RATE_LIMIT_REFILL_PER_SEC ? Number(process.env.WS_RATE_LIMIT_REFILL_PER_SEC) : 20;
+    (ws as any).bucketTokens = burstCapacity;
+    (ws as any).lastBucketRefill = Date.now();
+
     ws.on("pong", () => {
       (ws as any).isAlive = true;
     });
@@ -2138,6 +2195,28 @@ New Sentence: "${cleanText}"`;
     let currentLang: string | null = null;
 
     ws.on("message", async (data) => {
+      // Token bucket check
+      const now = Date.now();
+      const elapsedMs = now - ((ws as any).lastBucketRefill || now);
+      (ws as any).bucketTokens = Math.min(burstCapacity, ((ws as any).bucketTokens ?? burstCapacity) + elapsedMs * (refillRate / 1000));
+      (ws as any).lastBucketRefill = now;
+
+      if ((ws as any).bucketTokens < 1) {
+        (ws as any).bucketTokens -= 1;
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({
+            type: "error",
+            code: "RATE_LIMITED",
+            message: "Message rate limit exceeded. Please slow down."
+          }));
+        }
+        if ((ws as any).bucketTokens < -10) {
+          ws.close(1008, "Rate limit exceeded");
+        }
+        return;
+      }
+      (ws as any).bucketTokens -= 1;
+
       let message: any;
       try {
         message = JSON.parse(data.toString());
