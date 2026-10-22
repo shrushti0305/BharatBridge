@@ -10,7 +10,7 @@ import http from "http";
 import dns from "dns";
 import { observabilityService, generateEventId } from "./src/services/observability";
 import { resolveLanguageDefinition, getCanonicalLanguageCode, isLanguageSupported, getAllLanguages } from "./src/registry/languages.js";
-import { persistFinalizedConversationMessage, getAdminAuth } from "./src/lib/firebase-admin";
+import { getAdminAuth } from "./src/lib/firebase-admin";
 import {
   initCosmosDB,
   cosmosHealthState,
@@ -1220,22 +1220,6 @@ Keep the formatting clean with standard Markdown headers and bullet points.`;
       });
     }
 
-    if (!cosmosHealthState.configured) {
-      persistFinalizedConversationMessage({
-        sessionId,
-        eventId: buffer.latestEventId,
-        sequenceNumber: buffer.latestSequenceNumber,
-        speakerId,
-        speakerName: buffer.speakerName,
-        originalText: accumulatedText,
-        sourceLanguage: canonicalSource,
-        targetLanguage: "multi",
-        translatedText: accumulatedText,
-        timestamp: Date.now()
-      }).catch((err) => {
-        console.warn("[FIRESTORE] Async persistence background notice:", err);
-      });
-    }
   };
 
   // Phase 1: Translation Orchestration Foundation Interface
