@@ -399,6 +399,7 @@ async function startServer() {
     pendingRequests: Map<string, PendingRequestItem>;
     languageGroups: Map<string, LanguageGroup>;
     speakerGender: string;
+    defaultTargetLang?: string;
     topic?: string;
     isDuoMode?: boolean;
     messages: SessionMessage[];
@@ -652,6 +653,7 @@ Keep the formatting clean with standard Markdown headers and bullet points.`;
         pendingRequests: new Map(),
         languageGroups: new Map(),
         speakerGender: speakerGender || "female",
+        defaultTargetLang: targetLang || "hi",
         topic: topic || "",
         isDuoMode: isDuoMode === true,
         messages: [],
@@ -1242,7 +1244,6 @@ Keep the formatting clean with standard Markdown headers and bullet points.`;
         };
 
         const group = session.languageGroups.get(canonicalTarget);
-        console.log(`[DIAGNOSTIC][STEP2_BROADCAST_SPEECH_EVENT] sessionId='${sessionId}' targetLang='${targetLang}' canonicalTarget='${canonicalTarget}' availableGroups=[${Array.from(session.languageGroups.keys()).join(', ')}] groupExists=${!!group} listenersCount=${group?.listeners.size || 0}`);
         if (group && group.listeners.size > 0) {
           const listenerPayload = JSON.stringify({
             type: "transcription",
@@ -1260,7 +1261,6 @@ Keep the formatting clean with standard Markdown headers and bullet points.`;
           });
 
           group.listeners.forEach((listenerWs) => {
-            console.log(`[DIAGNOSTIC][STEP3_SOCKET_STATE_SPEECH_EVENT] listenerWs.readyState=${listenerWs.readyState} (OPEN=1) targetLang='${canonicalTarget}'`);
             if (listenerWs.readyState === WebSocket.OPEN) {
               listenerWs.send(listenerPayload);
             }
@@ -2214,7 +2214,6 @@ New Sentence: "${cleanText}"`;
         }
 
         currentSessionId = sessionId;
-        currentLang = targetLang || "hi";
 
         let session = sessions.get(sessionId);
         if (!session && cosmosHealthState.configured) {
@@ -2235,6 +2234,7 @@ New Sentence: "${cleanText}"`;
                 pendingRequests: new Map(),
                 languageGroups: new Map(),
                 speakerGender: gender || "male",
+                defaultTargetLang: sessionDoc?.targetLang || "hi",
                 topic: sessionDoc?.topic || message.topic || message.glossary || "",
                 isDuoMode: sessionDoc?.isDuoMode ?? false,
                 messages: messages || [],
@@ -2262,13 +2262,27 @@ New Sentence: "${cleanText}"`;
           return;
         }
 
+        // Resolve target language: use explicit targetLang, session defaultTargetLang, or fallback with warning
+        if (targetLang && typeof targetLang === "string" && targetLang.trim()) {
+          currentLang = targetLang.trim();
+        } else if (session.defaultTargetLang) {
+          currentLang = session.defaultTargetLang;
+          if (role === "listener") {
+            console.warn(`[WARN][JOIN] Listener joined sessionId='${sessionId}' without explicit targetLang; resolving to session defaultTargetLang='${currentLang}'`);
+          }
+        } else if (role === "listener") {
+          currentLang = "hi";
+          console.warn(`[WARN][JOIN] Listener joined sessionId='${sessionId}' without targetLang and session has no default; fallback to 'hi'`);
+        } else {
+          currentLang = null;
+        }
+
         const isNewSession = false;
 
         session.lastActivity = Date.now();
         if (message.topic || message.glossary) {
           session.topic = message.topic || message.glossary;
         }
-        console.log(`[DIAGNOSTIC][STEP1_JOIN] sessionId='${sessionId}' role='${role}' isNewSession=${isNewSession} isDuoMode=${session!.isDuoMode} targetLang='${targetLang}'`);
 
         if (role === "speaker" || role === "organizer") {
           const isExistingHostSocket = session!.organizerWs === ws || session!.speaker === ws;
@@ -2385,7 +2399,6 @@ New Sentence: "${cleanText}"`;
           const group = getOrCreateLanguageGroup(sessionId, currentLang!, session.speakerGender);
           if (group) {
             group.listeners.add(ws);
-            console.log(`[DIAGNOSTIC][STEP1_LISTENER_REGISTERED] sessionId='${sessionId}' rawTargetLang='${targetLang}' canonicalCode='${getCanonicalLanguageCode(currentLang!)}' listenersCount=${group.listeners.size}`);
           }
 
           // Instantly send full message history (translated into listener's target language) over WebSocket
@@ -2889,9 +2902,7 @@ New Sentence: "${cleanText}"`;
           }
 
           // Broadcast to listeners across all target language groups
-          console.log(`[DIAGNOSTIC][STEP2_BROADCAST_TEXT_TRANSLATION] currentSessionId='${currentSessionId}' messageTargetLang='${targetLang}' availableGroups=[${Array.from(session.languageGroups.keys()).join(', ')}]`);
           session.languageGroups.forEach((group, groupLang) => {
-            console.log(`[DIAGNOSTIC][STEP2_GROUP_CHECK] groupLang='${groupLang}' messageTargetLang='${targetLang}' sourceLang='${sourceLang}' listenersCount=${group.listeners.size}`);
             if (group.listeners.size === 0) return;
 
             observabilityService.recordEvent({
@@ -2919,7 +2930,6 @@ New Sentence: "${cleanText}"`;
               });
 
               group.listeners.forEach(l => {
-                console.log(`[DIAGNOSTIC][STEP3_SOCKET_STATE_TEXT_TRANSLATION] groupLang='${groupLang}' listenerWs.readyState=${l.readyState} (OPEN=1)`);
                 if (l.readyState === WebSocket.OPEN) l.send(listenerPayload);
               });
             } else {
@@ -2958,7 +2968,6 @@ New Sentence: "${cleanText}"`;
                 });
 
                 group.listeners.forEach(l => {
-                  console.log(`[DIAGNOSTIC][STEP3_SOCKET_STATE_TEXT_TRANSLATION] groupLang='${groupLang}' listenerWs.readyState=${l.readyState} (OPEN=1)`);
                   if (l.readyState === WebSocket.OPEN) l.send(secondaryPayload);
                 });
 
