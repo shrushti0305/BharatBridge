@@ -1,0 +1,6 @@
+# Auto detect text files and perform LF normalization on checkin
+* text=auto eol=lf
+
+# Keep Windows scripts with CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
