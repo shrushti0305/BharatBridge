@@ -545,13 +545,18 @@ const AdminModal = ({ isOpen, onClose }: { isOpen: boolean; onClose: () => void 
     setAdminSummary("");
     setActiveTab("summary");
     try {
+      const hostTok = (selectedSession?.id ? sessionStorage.getItem(`bharat_bridge_host_token_${selectedSession.id}`) : null) || localStorage.getItem("bharat_bridge_admin_token");
       const res = await fetch("/api/session-summary", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { 
+          "Content-Type": "application/json",
+          ...(hostTok ? { "x-host-token": hostTok, "x-session-token": hostTok } : {})
+        },
         body: JSON.stringify({
           sessionId: selectedSession.id,
           messages: sessionMessages,
-          targetLanguage: selectedSession.targetLang || "hi"
+          targetLanguage: selectedSession.targetLang || "hi",
+          hostToken: hostTok
         })
       });
       const data = await res.json();
@@ -1340,13 +1345,18 @@ export default function App() {
     setIsGeneratingSummary(true);
     setModalOpen({ open: true, type: "summary" });
     try {
+      const hostTok = hostToken || hostTokenRef.current || (sess?.id ? sessionStorage.getItem(`bharat_bridge_host_token_${sess.id}`) : null);
       const res = await fetch("/api/session-summary", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { 
+          "Content-Type": "application/json",
+          ...(hostTok ? { "x-host-token": hostTok, "x-session-token": hostTok } : {})
+        },
         body: JSON.stringify({
           sessionId: sess?.id || 'session-demo',
           messages: msgs,
-          targetLanguage: targetLang.name
+          targetLanguage: targetLang.name,
+          hostToken: hostTok
         })
       });
       if (res.ok) {
@@ -1473,10 +1483,12 @@ export default function App() {
   const syncToAzure = async () => {
     if (messages.length === 0) return;
     setAzureSyncStatus({ syncing: true });
+    const hostTok = hostToken || hostTokenRef.current || (currentSession?.id ? sessionStorage.getItem(`bharat_bridge_host_token_${currentSession.id}`) : null);
     const result = await uploadCaptionToAzure(
       currentSession?.id || 'session-demo',
       currentSession?.name || 'Live Event',
-      messages
+      messages,
+      hostTok || undefined
     );
     if (result.success) {
       setAzureSyncStatus({ syncing: false, success: true, message: result.blobName ? `Uploaded: ${result.blobName}` : 'Synced to Azure Storage' });
@@ -1870,6 +1882,14 @@ export default function App() {
             else setSpeakerRequestStatus("idle");
           }
         }
+        if (msg.type === "join_ack") {
+          console.log("[BHARATBRIDGE][WS_JOIN_ACK] Received join_ack for session:", msg.sessionId);
+          if (msg.sessionToken) {
+            setSessionToken(msg.sessionToken);
+            sessionTokenRef.current = msg.sessionToken;
+            sessionStorage.setItem(`bharat_bridge_session_token_${msg.sessionId}`, msg.sessionToken);
+          }
+        }
         if (msg.type === "room_state" || msg.type === "history") {
           if (msg.name || msg.topic || msg.sourceLang) {
             const sCode = msg.sourceLang || "en";
@@ -2164,13 +2184,25 @@ export default function App() {
 
     const activeSession = currentSession;
     const activeMessages = [...messages];
+    const isHost = userRole === 'ORGANIZER' || sessionRole === 'speaker' || Boolean(hostToken || hostTokenRef.current);
 
-    // 1. Sync & save session captions (Azure Storage / local history)
-    syncToAzure();
+    if (isHost) {
+      // 1. Sync & save session captions (Azure Storage / local history)
+      syncToAzure();
 
-    // 2. Generate & display AI Session Summary if messages exist
-    if (activeMessages.length > 0) {
-      handleGenerateSummary(activeSession, activeMessages);
+      // 2. Generate & display AI Session Summary if messages exist
+      if (activeMessages.length > 0) {
+        handleGenerateSummary(activeSession, activeMessages);
+      }
+
+      // 3. Send end_session frame over WebSocket to invalidate tokens & notify listeners
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify({
+          type: "end_session",
+          sessionId: activeSession?.id,
+          token: hostToken || hostTokenRef.current
+        }));
+      }
     }
 
     try {
@@ -2608,7 +2640,8 @@ export default function App() {
           targetLanguage: targetLang.name,
           context: recentContext,
           eventId,
-          sessionId: currentSession?.id || 'global_test'
+          sessionId: currentSession?.id || undefined,
+          token: hostToken || hostTokenRef.current || sessionToken || sessionTokenRef.current || undefined
         });
         const lineTranslation = result.translatedText || line.trim();
         const isFallback = (lineTranslation || "").trim().toLowerCase() === line.trim().toLowerCase();
@@ -2727,7 +2760,7 @@ export default function App() {
         languageCode: lang.code === "en" ? "en-IN" : `${lang.code}-IN`,
         eventId,
         sessionId: effectiveSessionId,
-        token: hostToken || hostTokenRef.current
+        token: hostToken || hostTokenRef.current || sessionToken || sessionTokenRef.current || undefined
       });
       if (ttsRes.success && ttsRes.audio) {
         observabilityService.recordEvent({
@@ -3060,13 +3093,15 @@ export default function App() {
               >
                 <Music size={11} /> WAV
               </button>
-              <button 
-                onClick={handleGenerateSummary}
-                className="px-2.5 py-1 bg-amber-500/10 border border-amber-500/20 rounded-lg text-[10px] font-bold text-amber-400 uppercase hover:bg-amber-500/20 transition-all flex items-center gap-1"
-                title="Generate Gemini AI Session Summary"
-              >
-                <Sparkles size={11} /> Summary
-              </button>
+              {(userRole === 'ORGANIZER' || Boolean(hostToken || hostTokenRef.current)) && (
+                <button 
+                  onClick={handleGenerateSummary}
+                  className="px-2.5 py-1 bg-amber-500/10 border border-amber-500/20 rounded-lg text-[10px] font-bold text-amber-400 uppercase hover:bg-amber-500/20 transition-all flex items-center gap-1"
+                  title="Generate Gemini AI Session Summary"
+                >
+                  <Sparkles size={11} /> Summary
+                </button>
+              )}
               <button
                 onClick={() => setModalOpen({ open: true, type: "qr" })}
                 className="p-1 bg-orange-500/10 border border-orange-500/30 rounded-lg text-orange-400 hover:bg-orange-500/20"

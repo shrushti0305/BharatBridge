@@ -66,7 +66,7 @@ export async function translateText(options: TranslationOptions): Promise<Transl
     return { success: true, translatedText: "" };
   }
 
-  const effectiveSessionId = (sessionId || "").trim() || "global_test";
+  const effectiveSessionId = sessionId && sessionId.trim() ? sessionId.trim() : undefined;
   const effectiveSourceLanguage = sourceLanguage && sourceLanguage.trim() ? sourceLanguage.trim() : "auto";
 
   const controller = new AbortController();
@@ -80,12 +80,15 @@ export async function translateText(options: TranslationOptions): Promise<Transl
     sessionId: effectiveSessionId
   });
   try {
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json"
+    };
+    if (effectiveSessionId) headers["x-session-id"] = effectiveSessionId;
+    if (token) headers["x-session-token"] = token;
+
     const res = await fetch("/api/translate", {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-session-id": effectiveSessionId
-      },
+      headers,
       signal: controller.signal,
       body: JSON.stringify({
         text: cleanText,
@@ -167,12 +170,14 @@ export async function synthesizeSpeech(options: AzureTTSOptions): Promise<AzureT
 
   console.log("[BHARATBRIDGE][TTS_REQUEST] Client requesting /api/azure/tts:", { text: text.trim(), languageCode, voiceName, eventId, sessionId });
   try {
+    const headers: Record<string, string> = { 
+      "Content-Type": "application/json",
+      ...(sessionId ? { "x-session-id": sessionId } : {}),
+      ...(token ? { "x-session-token": token } : {})
+    };
     const res = await fetch("/api/azure/tts", {
       method: "POST",
-      headers: { 
-        "Content-Type": "application/json",
-        ...(sessionId ? { "x-session-id": sessionId } : {})
-      },
+      headers,
       body: JSON.stringify({ text: text.trim(), languageCode, voiceName, eventId, sessionId, token })
     });
 

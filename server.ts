@@ -20,6 +20,15 @@ import {
   loadSessionFromCosmos
 } from "./src/lib/cosmos-client.js";
 
+// Process exception safety
+process.on("uncaughtException", (err) => {
+  console.error("[FATAL][UNCAUGHT_EXCEPTION]", err);
+  process.exit(1);
+});
+process.on("unhandledRejection", (reason) => {
+  console.warn("[WARN][UNHANDLED_REJECTION]", reason);
+});
+
 // Prevent Windows IPv6 DNS connection timeouts on Node fetch
 try {
   dns.setDefaultResultOrder("ipv4first");
@@ -236,27 +245,45 @@ export function createRateLimiter(maxRequestsPerIp: number, maxRequestsPerSessio
   return (req: express.Request, res: express.Response, next: express.NextFunction) => {
     if (req.path === "/health") return next();
 
-    const ip = ((req.headers["x-forwarded-for"] as string) || req.socket.remoteAddress || "global").split(",")[0].trim();
-    const sessionId = (req.body?.sessionId || req.query?.sessionId || req.headers["x-session-id"] || req.headers["x-host-token"] || "global_session").toString().trim();
+    const trustHops = process.env.TRUST_PROXY ? Number(process.env.TRUST_PROXY) || 1 : 1;
+    const xff = req.headers["x-forwarded-for"];
+    let ip = (req.socket.remoteAddress || "global").toString().trim();
+    if (xff && typeof xff === "string") {
+      const parts = xff.split(",").map(p => p.trim()).filter(Boolean);
+      if (parts.length > 0) {
+        const idx = Math.max(0, parts.length - trustHops);
+        ip = parts[idx];
+      }
+    }
+    const token = (
+      req.headers["x-session-token"] ||
+      req.headers["x-host-token"] ||
+      req.body?.token ||
+      req.body?.sessionToken ||
+      req.body?.hostToken
+    )?.toString().trim();
+
+    const sessionId = (req.body?.sessionId || req.query?.sessionId || req.headers["x-session-id"] || "global_session").toString().trim();
+    const clientKey = token && sessionId !== "global_session" ? `${sessionId}:${token}` : ip;
 
     const now = Date.now();
 
-    // 1. IP-level Rate Limit Check
-    let ipRecord = rateLimitMapByIp.get(ip);
-    if (!ipRecord || now > ipRecord.resetTime) {
-      ipRecord = { count: 1, resetTime: now + windowMs };
-      rateLimitMapByIp.set(ip, ipRecord);
+    // 1. Client-level Rate Limit Check
+    let clientRecord = rateLimitMapByIp.get(clientKey);
+    if (!clientRecord || now > clientRecord.resetTime) {
+      clientRecord = { count: 1, resetTime: now + windowMs };
+      rateLimitMapByIp.set(clientKey, clientRecord);
     } else {
-      ipRecord.count++;
+      clientRecord.count++;
     }
 
-    if (ipRecord.count > maxRequestsPerIp) {
-      res.setHeader("Retry-After", Math.ceil((ipRecord.resetTime - now) / 1000));
-      return res.status(429).json({ error: "Too many requests from this IP address. Please try again later.", status: 429 });
+    if (clientRecord.count > maxRequestsPerIp) {
+      res.setHeader("Retry-After", Math.ceil((clientRecord.resetTime - now) / 1000));
+      return res.status(429).json({ error: "Too many requests. Please try again later.", status: 429 });
     }
 
-    // 2. Session-level Rate Limit Check (Skipped for global_session unassigned endpoints)
-    if (sessionId && sessionId !== "global_session") {
+    // 2. Session-level Rate Limit Check (Skipped for individual token holders)
+    if (sessionId && sessionId !== "global_session" && !token) {
       let sessionRecord = rateLimitMapBySession.get(sessionId);
       if (!sessionRecord || now > sessionRecord.resetTime) {
         sessionRecord = { count: 1, resetTime: now + windowMs };
@@ -277,6 +304,7 @@ export function createRateLimiter(maxRequestsPerIp: number, maxRequestsPerSessio
 
 async function startServer() {
   const app = express();
+  app.set("trust proxy", process.env.TRUST_PROXY ? (Number(process.env.TRUST_PROXY) || process.env.TRUST_PROXY) : 1);
   const server = http.createServer(app);
   const wss = new WebSocketServer({ noServer: true, maxPayload: 1024 * 1024 });
   const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
@@ -311,19 +339,136 @@ async function startServer() {
     });
   });
 
+  // Room management types & session registry
+  type LanguageGroup = {
+    geminiSession: any | null;
+    listeners: Set<WebSocket>;
+    isInitializing?: boolean;
+  };
+
+  type SessionMessage = {
+    originalText: string;
+    translatedText: string;
+    sourceLang: string;
+    targetLang: string;
+    timestamp: number;
+    eventId?: string;
+    speakerId?: string;
+    speakerName?: string;
+    provider?: string;
+    degraded?: boolean;
+    translations?: Record<string, string>;
+  };
+
+  type PanelistItem = {
+    speakerId: string;
+    userId: string;
+    userName: string;
+    gender?: string;
+    ws: WebSocket;
+  };
+
+  type PendingRequestItem = {
+    userId: string;
+    userName: string;
+    ws: WebSocket;
+    requestedAt: number;
+    targetLang?: string;
+  };
+
+  type SessionState = {
+    speaker: WebSocket | null;
+    organizerWs: WebSocket | null;
+    organizerId: string | null;
+    hostToken?: string | null;
+    hostTokenHash?: string | null;
+    sessionToken?: string | null;
+    sessionTokens?: Map<string, number>;
+    ended?: boolean;
+    panelists: Map<string, PanelistItem>;
+    pendingRequests: Map<string, PendingRequestItem>;
+    languageGroups: Map<string, LanguageGroup>;
+    speakerGender: string;
+    topic?: string;
+    isDuoMode?: boolean;
+    messages: SessionMessage[];
+    lastActivity: number;
+  };
+
+  const sessions = new Map<string, SessionState>();
+
+  function verifyHostToken(req: express.Request, session: any): boolean {
+    if (!session || session.ended) return false;
+    const clientToken = (
+      req.headers["x-host-token"] ||
+      req.headers["x-session-token"] ||
+      (req.query?.hostToken as string) ||
+      (req.query?.sessionToken as string) ||
+      req.body?.hostToken ||
+      req.body?.token
+    )?.toString().trim();
+
+    if (!clientToken) return false;
+    if (session.hostToken && timingSafeEqualToken(clientToken, session.hostToken)) return true;
+    if (session.hostTokenHash) {
+      const hash = crypto.createHash("sha256").update(clientToken).digest("hex");
+      if (timingSafeEqualToken(hash, session.hostTokenHash)) return true;
+    }
+    return false;
+  }
+
+  function verifySessionToken(req: express.Request, session: any): boolean {
+    if (!session || session.ended) return false;
+    const clientToken = (
+      req.headers["x-session-token"] ||
+      req.headers["x-host-token"] ||
+      (req.query?.sessionToken as string) ||
+      (req.query?.hostToken as string) ||
+      req.body?.sessionToken ||
+      req.body?.token ||
+      req.body?.hostToken
+    )?.toString().trim();
+
+    if (!clientToken) return false;
+    const now = Date.now();
+    if (session.sessionTokens && session.sessionTokens instanceof Map) {
+      for (const [tok, exp] of session.sessionTokens.entries()) {
+        if (exp > now && timingSafeEqualToken(clientToken, tok)) return true;
+      }
+    }
+    if (session.sessionToken && timingSafeEqualToken(clientToken, session.sessionToken)) return true;
+    if (session.hostToken && timingSafeEqualToken(clientToken, session.hostToken)) return true;
+    if (session.hostTokenHash) {
+      const hash = crypto.createHash("sha256").update(clientToken).digest("hex");
+      if (timingSafeEqualToken(hash, session.hostTokenHash)) return true;
+    }
+    return false;
+  }
+
   // Azure Blob Storage Upload for Captions (Dual-Format JSON + CSV)
   app.post("/api/azure/upload-caption", async (req, res) => {
-    const { sessionId, sessionName, captions } = req.body;
+    const { sessionId, sessionName, captions } = req.body || {};
+    const activeSessionId = (sessionId || req.headers["x-session-id"] || "").toString().trim();
+    if (!activeSessionId || !sessions.has(activeSessionId)) {
+      return res.status(403).json({ error: "Forbidden: Valid active session and hostToken are required", code: "HOST_TOKEN_REQUIRED" });
+    }
+    const sessionObj = sessions.get(activeSessionId);
+    if (!verifyHostToken(req, sessionObj)) {
+      return res.status(403).json({ error: "Forbidden: HostToken required for caption upload", code: "HOST_TOKEN_REQUIRED" });
+    }
+
     const connectionString = process.env.AZURE_STORAGE_CONNECTION_STRING;
     const containerName = process.env.AZURE_STORAGE_CONTAINER_NAME || "ai-audio";
+    const timeStamp = Date.now();
+    const csvBlobName = `captions-${activeSessionId}-${timeStamp}.csv`;
 
     if (!connectionString) {
       return res.status(200).json({
         success: true,
         mock: true,
         message: "Azure Storage keys not set in .env. Captions logged locally.",
-        blobName: `captions-${sessionId || 'session'}.csv`,
-        blobUrl: `local://storage/captions-${sessionId || 'session'}.csv`
+        blobName: csvBlobName,
+        blobUrl: `local://storage/${csvBlobName}`
       });
     }
 
@@ -333,10 +478,9 @@ async function startServer() {
       const containerClient = blobServiceClient.getContainerClient(containerName);
       await containerClient.createIfNotExists();
 
-      const timeStamp = Date.now();
-      const jsonBlobName = `captions-${sessionId}-${timeStamp}.json`;
+      const jsonBlobName = `captions-${activeSessionId}-${timeStamp}.json`;
       const jsonBlockBlobClient = containerClient.getBlockBlobClient(jsonBlobName);
-      const jsonContent = JSON.stringify({ sessionId, sessionName, createdAt: new Date().toISOString(), captions }, null, 2);
+      const jsonContent = JSON.stringify({ sessionId: activeSessionId, sessionName, createdAt: new Date().toISOString(), captions }, null, 2);
 
       await jsonBlockBlobClient.upload(jsonContent, jsonContent.length, {
         blobHTTPHeaders: { blobContentType: "application/json" }
@@ -369,7 +513,15 @@ async function startServer() {
 
   // AI Session Summary Endpoint using Gemini AI + Cloud/Local Storage Persistence
   app.post("/api/session-summary", async (req, res) => {
-    const { sessionId, messages, targetLanguage } = req.body;
+    const { sessionId, messages, targetLanguage } = req.body || {};
+    const activeSessionId = (sessionId || req.headers["x-session-id"] || "").toString().trim();
+    if (!activeSessionId || !sessions.has(activeSessionId)) {
+      return res.status(403).json({ error: "Forbidden: Valid active session and hostToken are required", code: "HOST_TOKEN_REQUIRED" });
+    }
+    const sessionObj = sessions.get(activeSessionId);
+    if (!verifyHostToken(req, sessionObj)) {
+      return res.status(403).json({ error: "Forbidden: HostToken required for session summary", code: "HOST_TOKEN_REQUIRED" });
+    }
 
     if (!messages || !Array.isArray(messages) || messages.length === 0) {
       return res.status(400).json({ error: "No transcript messages provided for summary." });
@@ -476,6 +628,7 @@ Keep the formatting clean with standard Markdown headers and bullet points.`;
         hostToken,
         hostTokenHash,
         sessionToken,
+        sessionTokens: new Map([[sessionToken, Date.now() + 24 * 3600 * 1000]]),
         panelists: new Map(),
         pendingRequests: new Map(),
         languageGroups: new Map(),
@@ -523,27 +676,6 @@ Keep the formatting clean with standard Markdown headers and bullet points.`;
     }
   });
 
-  function verifySessionToken(req: express.Request, session: any): boolean {
-    if (!session) return false;
-    const clientToken = (
-      req.headers["x-session-token"] ||
-      req.headers["x-host-token"] ||
-      (req.query?.sessionToken as string) ||
-      (req.query?.hostToken as string) ||
-      req.body?.sessionToken ||
-      req.body?.token ||
-      req.body?.hostToken
-    )?.toString().trim();
-
-    if (!clientToken) return false;
-    if (session.sessionToken && timingSafeEqualToken(clientToken, session.sessionToken)) return true;
-    if (session.hostToken && timingSafeEqualToken(clientToken, session.hostToken)) return true;
-    if (session.hostTokenHash) {
-      const hash = crypto.createHash("sha256").update(clientToken).digest("hex");
-      if (timingSafeEqualToken(hash, session.hostTokenHash)) return true;
-    }
-    return false;
-  }
 
   // Azure Cognitive Services Translator API Endpoint
   app.post("/api/azure/translate", async (req, res) => {
@@ -621,17 +753,20 @@ Keep the formatting clean with standard Markdown headers and bullet points.`;
   // Resilient Text-to-Speech (TTS) API Endpoint with Azure + Google Neural Fallback
   const ttsRateLimiter = createRateLimiter(60, 120, 60 * 1000);
   app.post(["/api/azure/tts", "/api/tts"], ttsRateLimiter, async (req, res) => {
-    const { text, languageCode, voiceName, gender, eventId: inputEventId, sessionId, token } = req.body;
-    const activeSessionId = (sessionId || req.headers["x-session-id"] || token || "").toString().trim();
+    const { text, languageCode, voiceName, gender, eventId: inputEventId, sessionId, token } = req.body || {};
+    const activeSessionId = (sessionId || req.headers["x-session-id"] || "").toString().trim();
     if (!activeSessionId) {
       return res.status(400).json({ error: "Missing required sessionId", provider: "tts-error", truncated: false });
     }
-    if (!sessions.has(activeSessionId) && activeSessionId !== "test_session" && activeSessionId !== "global_test") {
-      return res.status(400).json({ error: "Invalid or non-existent sessionId", provider: "tts-error", truncated: false });
+    if (activeSessionId === "test_session" || activeSessionId === "global_test") {
+      return res.status(403).json({ error: "Forbidden: Test bypasses are disabled", code: "SESSION_TOKEN_REQUIRED" });
+    }
+    if (!sessions.has(activeSessionId)) {
+      return res.status(403).json({ error: "Forbidden: Invalid or non-existent sessionId", code: "SESSION_TOKEN_REQUIRED" });
     }
 
     const sessionObj = sessions.get(activeSessionId);
-    if (sessionObj && !verifySessionToken(req, sessionObj) && activeSessionId !== "test_session" && activeSessionId !== "global_test") {
+    if (!verifySessionToken(req, sessionObj)) {
       return res.status(403).json({ error: "Forbidden: Valid sessionToken or hostToken is required", code: "SESSION_TOKEN_REQUIRED" });
     }
     if (!text || typeof text !== "string" || !text.trim()) {
@@ -775,61 +910,6 @@ Keep the formatting clean with standard Markdown headers and bullet points.`;
     }
   });
 
-  // Room management
-  type LanguageGroup = {
-    geminiSession: any | null;
-    listeners: Set<WebSocket>;
-    isInitializing?: boolean;
-  };
-
-  type SessionMessage = {
-    originalText: string;
-    translatedText: string;
-    sourceLang: string;
-    targetLang: string;
-    timestamp: number;
-    eventId?: string;
-    speakerId?: string;
-    speakerName?: string;
-    provider?: string;
-    degraded?: boolean;
-    translations?: Record<string, string>;
-  };
-
-  type PanelistItem = {
-    speakerId: string;
-    userId: string;
-    userName: string;
-    gender?: string;
-    ws: WebSocket;
-  };
-
-  type PendingRequestItem = {
-    userId: string;
-    userName: string;
-    ws: WebSocket;
-    requestedAt: number;
-    targetLang?: string;
-  };
-
-  type SessionState = {
-    speaker: WebSocket | null;
-    organizerWs: WebSocket | null;
-    organizerId: string | null;
-    hostToken?: string;
-    hostTokenHash?: string;
-    sessionToken?: string;
-    panelists: Map<string, PanelistItem>;
-    pendingRequests: Map<string, PendingRequestItem>;
-    languageGroups: Map<string, LanguageGroup>;
-    speakerGender: string;
-    topic?: string;
-    isDuoMode?: boolean;
-    messages: SessionMessage[];
-    lastActivity: number;
-  };
-
-  const sessions = new Map<string, SessionState>();
 
   const broadcastRoomState = (session: SessionState) => {
     const activePanelistCount = session.panelists.size;
@@ -1390,45 +1470,47 @@ ${topicPrompt}${genderPrompt}${contextPrompt}STRICT INSTRUCTIONS:
 
 New Sentence: "${cleanText}"`;
 
-    const primaryModel = process.env.GEMINI_MODEL_TRANSLATION || "gemini-3.8-flash";
+    const primaryModel = process.env.GEMINI_MODEL_TRANSLATION || "gemini-2.5-flash";
     const timeoutMs = Number(process.env.TRANSLATION_TIMEOUT_MS) || 3500;
     const startTime = Date.now();
-    try {
-      const geminiPromise = ai.models.generateContent({
-        model: primaryModel,
-        contents: systemPrompt,
-        config: { 
-          temperature: 0.1,
-          maxOutputTokens: 150,
-          thinkingConfig: { thinkingBudget: 0 } as any // Off/minimal thinking for low-latency translation
+    if (process.env.GEMINI_API_KEY) {
+      try {
+        const geminiPromise = ai.models.generateContent({
+          model: primaryModel,
+          contents: systemPrompt,
+          config: { 
+            temperature: 0.1,
+            maxOutputTokens: 150,
+            thinkingConfig: { thinkingBudget: 0 } as any // Off/minimal thinking for low-latency translation
+          }
+        });
+
+        const timeoutPromise = new Promise<never>((_, reject) => 
+          setTimeout(() => reject(new Error(`Gemini ${primaryModel} timed out after ${timeoutMs}ms`)), timeoutMs)
+        );
+
+        const result = await Promise.race([geminiPromise, timeoutPromise]);
+        const latencyMs = Date.now() - startTime;
+        const promptTokens = (result as any).usageMetadata?.promptTokenCount || 0;
+        const candidatesTokens = (result as any).usageMetadata?.candidatesTokenCount || 0;
+        const thoughtsTokens = (result as any).usageMetadata?.thoughtsTokenCount || 0;
+
+        if (result.text && result.text.trim()) {
+          const cleaned = cleanIndianText(result.text.trim().replace(/^["']|["']$/g, ''));
+          if (cleaned) {
+            console.log(`[BHARATBRIDGE][TRANSLATION_SUCCESS] provider='gemini' model='${primaryModel}' latencyMs=${latencyMs}ms promptTokens=${promptTokens} candidatesTokens=${candidatesTokens} thoughtsTokenCount=${thoughtsTokens} fallbackFired=false thinkingBudget=0 text="${cleaned.slice(0, 30)}..."`);
+            return { text: cleaned, provider: "gemini", degraded: false };
+          }
         }
-      });
-
-      const timeoutPromise = new Promise<never>((_, reject) => 
-        setTimeout(() => reject(new Error(`Gemini ${primaryModel} timed out after ${timeoutMs}ms`)), timeoutMs)
-      );
-
-      const result = await Promise.race([geminiPromise, timeoutPromise]);
-      const latencyMs = Date.now() - startTime;
-      const promptTokens = (result as any).usageMetadata?.promptTokenCount || 0;
-      const candidatesTokens = (result as any).usageMetadata?.candidatesTokenCount || 0;
-      const thoughtsTokens = (result as any).usageMetadata?.thoughtsTokenCount || 0;
-
-      if (result.text && result.text.trim()) {
-        const cleaned = cleanIndianText(result.text.trim().replace(/^["']|["']$/g, ''));
-        if (cleaned) {
-          console.log(`[BHARATBRIDGE][TRANSLATION_SUCCESS] provider='gemini' model='${primaryModel}' latencyMs=${latencyMs}ms promptTokens=${promptTokens} candidatesTokens=${candidatesTokens} thoughtsTokenCount=${thoughtsTokens} fallbackFired=false thinkingBudget=0 text="${cleaned.slice(0, 30)}..."`);
-          return { text: cleaned, provider: "gemini", degraded: false };
-        }
+      } catch (err: any) {
+        const errMsg = err?.message || String(err);
+        let reason = "UNKNOWN_ERROR";
+        if (errMsg.includes("timed out")) reason = "TIMEOUT";
+        else if (errMsg.includes("429") || errMsg.includes("Quota") || errMsg.includes("RESOURCE_EXHAUSTED")) reason = "429_RATE_LIMIT";
+        else if (errMsg.includes("503") || errMsg.includes("UNAVAILABLE") || errMsg.includes("Overloaded")) reason = "503_UNAVAILABLE";
+        else if (errMsg.includes("JSON")) reason = "INVALID_JSON";
+        console.warn(`[GEMINI][TRANSLATION_FALLBACK_REASON] Model='${primaryModel}' reason='${reason}' details='${errMsg}'`);
       }
-    } catch (err: any) {
-      const errMsg = err?.message || String(err);
-      let reason = "UNKNOWN_ERROR";
-      if (errMsg.includes("timed out")) reason = "TIMEOUT";
-      else if (errMsg.includes("429") || errMsg.includes("Quota") || errMsg.includes("RESOURCE_EXHAUSTED")) reason = "429_RATE_LIMIT";
-      else if (errMsg.includes("503") || errMsg.includes("UNAVAILABLE") || errMsg.includes("Overloaded")) reason = "503_UNAVAILABLE";
-      else if (errMsg.includes("JSON")) reason = "INVALID_JSON";
-      console.warn(`[GEMINI][TRANSLATION_FALLBACK_REASON] Model='${primaryModel}' reason='${reason}' details='${errMsg}'`);
     }
 
     // 2. Azure Translator API Fallback (Primary fallback for high quality)
@@ -1679,22 +1761,38 @@ New Sentence: "${cleanText}"`;
 
   // API Routes
   app.post("/api/translate", async (req, res) => {
-    const { text, sourceLanguage, targetLanguage, context, eventId: inputEventId, sessionId, token, speakerGender } = req.body;
-    const activeSessionId = (sessionId || req.headers["x-session-id"] || token || "").toString().trim();
+    const { text, sourceLanguage, targetLanguage, context, eventId: inputEventId, sessionId, token, speakerGender } = req.body || {};
+    const activeSessionId = (sessionId || req.headers["x-session-id"] || "").toString().trim();
+
     if (!activeSessionId) {
-      return res.status(400).json({ error: "Missing required sessionId" });
-    }
-    if (!sessions.has(activeSessionId) && activeSessionId !== "test_session" && activeSessionId !== "global_test") {
-      return res.status(400).json({ error: "Invalid or non-existent sessionId" });
+      // Practice mode: no sessionId passed
+      if (!text || typeof text !== "string" || !text.trim() || !targetLanguage) {
+        return res.status(400).json({ error: "Missing text or targetLanguage" });
+      }
+      if (text.length > 500) {
+        return res.status(400).json({ error: "Practice mode text length exceeds maximum allowed limit (500 characters)" });
+      }
+    } else {
+      // In-session mode
+      if (activeSessionId === "test_session" || activeSessionId === "global_test") {
+        return res.status(403).json({ error: "Forbidden: Test bypasses are disabled", code: "SESSION_TOKEN_REQUIRED" });
+      }
+      if (!sessions.has(activeSessionId)) {
+        return res.status(403).json({ error: "Forbidden: Invalid or non-existent sessionId", code: "SESSION_TOKEN_REQUIRED" });
+      }
+      const sessionObj = sessions.get(activeSessionId);
+      if (!verifySessionToken(req, sessionObj)) {
+        return res.status(403).json({ error: "Forbidden: Valid sessionToken or hostToken is required", code: "SESSION_TOKEN_REQUIRED" });
+      }
+      if (!text || typeof text !== "string" || !text.trim() || !targetLanguage) {
+        return res.status(400).json({ error: "Missing text or targetLanguage" });
+      }
+      if (text.length > 2000) {
+        return res.status(400).json({ error: "Text length exceeds maximum allowed limit (2000 characters)" });
+      }
     }
     const eventId = inputEventId || generateEventId();
     const startTime = Date.now();
-    console.log("[BHARATBRIDGE][TRANSLATION_REQUEST] Server /api/translate received body:", { text, sourceLanguage, targetLanguage, eventId, speakerGender });
-
-    if (!text || !targetLanguage) return res.status(400).json({ error: "Missing text or targetLanguage" });
-    if (typeof text === "string" && text.length > 2000) {
-      return res.status(400).json({ error: "Text length exceeds maximum allowed limit (2000 characters)" });
-    }
     try {
       const targetLangCode = (LANGUAGE_NAME_MAP[targetLanguage.toLowerCase()] ? targetLanguage.toLowerCase() : Object.keys(LANGUAGE_NAME_MAP).find(k => LANGUAGE_NAME_MAP[k].toLowerCase() === targetLanguage.toLowerCase())) || targetLanguage || 'hi';
       const cleanSource = (sourceLanguage || "").toString().trim().toLowerCase();
@@ -1905,31 +2003,77 @@ New Sentence: "${cleanText}"`;
 
   const failedJoinMapByIp = new Map<string, { count: number; resetTime: number }>();
 
-  async function applyFailedJoinThrottling(ip: string): Promise<void> {
-    const now = Date.now();
-    const record = failedJoinMapByIp.get(ip);
-    if (!record || now > record.resetTime) return;
-
-    const threshold = process.env.FAILED_JOIN_THRESHOLD ? Number(process.env.FAILED_JOIN_THRESHOLD) : 10;
-    if (record.count >= threshold) {
-      const backoffMs = Math.min(3000, 100 * Math.pow(2, Math.min(5, record.count - threshold)));
-      await new Promise((resolve) => setTimeout(resolve, backoffMs));
+  function getWsClientIp(req: http.IncomingMessage): string {
+    const trustHops = process.env.TRUST_PROXY ? Number(process.env.TRUST_PROXY) || 1 : 1;
+    const xff = req.headers["x-forwarded-for"];
+    if (xff && typeof xff === "string") {
+      const parts = xff.split(",").map(p => p.trim()).filter(Boolean);
+      if (parts.length > 0) {
+        const idx = Math.max(0, parts.length - trustHops);
+        return parts[idx];
+      }
     }
+    return req.socket?.remoteAddress || "global";
   }
 
-  function recordFailedJoinAttempt(ip: string): void {
+  const failedJoinMapBySession = new Map<string, { count: number; resetTime: number }>();
+  let globalFailedJoins = { count: 0, resetTime: Date.now() + 60000 };
+
+  async function applyFailedJoinThrottling(ip: string, sessionId?: string): Promise<boolean> {
     const now = Date.now();
-    const record = failedJoinMapByIp.get(ip);
-    if (!record || now > record.resetTime) {
+    if (now > globalFailedJoins.resetTime) {
+      globalFailedJoins = { count: 0, resetTime: now + 60000 };
+    }
+    if (globalFailedJoins.count >= 100) {
+      return false;
+    }
+
+    if (sessionId) {
+      const sessRecord = failedJoinMapBySession.get(sessionId);
+      if (sessRecord && now <= sessRecord.resetTime && sessRecord.count >= 30) {
+        return false;
+      }
+    }
+
+    const ipRecord = failedJoinMapByIp.get(ip);
+    if (!ipRecord || now > ipRecord.resetTime) return true;
+
+    const threshold = process.env.FAILED_JOIN_THRESHOLD ? Number(process.env.FAILED_JOIN_THRESHOLD) : 10;
+    if (ipRecord.count >= threshold) {
+      const backoffMs = Math.min(3000, 100 * Math.pow(2, Math.min(5, ipRecord.count - threshold)));
+      await new Promise((resolve) => setTimeout(resolve, backoffMs));
+    }
+    return true;
+  }
+
+  function recordFailedJoinAttempt(ip: string, sessionId?: string): void {
+    const now = Date.now();
+    if (now > globalFailedJoins.resetTime) {
+      globalFailedJoins = { count: 1, resetTime: now + 60000 };
+    } else {
+      globalFailedJoins.count++;
+    }
+
+    if (sessionId) {
+      const sessRecord = failedJoinMapBySession.get(sessionId);
+      if (!sessRecord || now > sessRecord.resetTime) {
+        failedJoinMapBySession.set(sessionId, { count: 1, resetTime: now + 60000 });
+      } else {
+        sessRecord.count++;
+      }
+    }
+
+    const ipRecord = failedJoinMapByIp.get(ip);
+    if (!ipRecord || now > ipRecord.resetTime) {
       failedJoinMapByIp.set(ip, { count: 1, resetTime: now + 60 * 1000 });
     } else {
-      record.count++;
+      ipRecord.count++;
     }
   }
 
   wss.on("connection", (ws, req) => {
     (ws as any).isAlive = true;
-    (ws as any).remoteAddress = req.socket?.remoteAddress || "global";
+    (ws as any).remoteAddress = getWsClientIp(req);
     ws.on("pong", () => {
       (ws as any).isAlive = true;
     });
@@ -1966,13 +2110,48 @@ New Sentence: "${cleanText}"`;
         return;
       }
 
+      if (message.type === "end_session") {
+        const targetSid = message.sessionId || currentSessionId;
+        if (targetSid && sessions.has(targetSid)) {
+          const session = sessions.get(targetSid)!;
+          const hostTokenInput = message.token || message.hostToken;
+          const isHost = session.organizerWs === ws || session.speaker === ws || (hostTokenInput && session.hostToken && timingSafeEqualToken(hostTokenInput, session.hostToken));
+          if (isHost) {
+            session.ended = true;
+            session.sessionTokens?.clear();
+            session.sessionToken = null;
+            session.hostToken = null;
+            session.hostTokenHash = null;
+            const endPayload = JSON.stringify({ type: "session_ended", sessionId: targetSid });
+            session.languageGroups.forEach(g => {
+              g.listeners.forEach(l => {
+                if (l.readyState === WebSocket.OPEN) l.send(endPayload);
+              });
+            });
+            console.log(`[SESSION_ENDED] Session '${targetSid}' ended by host.`);
+          }
+        }
+        return;
+      }
+
       if (message.type === "join" || message.type === "join_session") {
         const { sessionId, role, gender, targetLang } = message;
         const inputHostToken = message.hostToken || message.token;
         const clientIp = ((ws as any).remoteAddress || "global").toString().trim();
 
         // Throttling check before any Cosmos DB read
-        await applyFailedJoinThrottling(clientIp);
+        const allowed = await applyFailedJoinThrottling(clientIp, sessionId);
+        if (!allowed) {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+              type: "error",
+              code: "RATE_LIMITED",
+              message: "Too many failed join attempts. Please slow down."
+            }));
+            ws.close();
+          }
+          return;
+        }
 
         currentSessionId = sessionId;
         currentLang = targetLang || "hi";
@@ -1981,7 +2160,7 @@ New Sentence: "${cleanText}"`;
         if (!session && cosmosHealthState.configured) {
           try {
             const loaded = await loadSessionFromCosmos(sessionId);
-            if (loaded) {
+            if (loaded && loaded.sessionDoc && loaded.sessionDoc.status !== "ended") {
               const { sessionDoc, messages } = loaded;
               session = {
                 speaker: null,
@@ -1989,12 +2168,15 @@ New Sentence: "${cleanText}"`;
                 organizerId: null,
                 hostTokenHash: sessionDoc?.hostTokenHash,
                 sessionToken: sessionDoc?.sessionToken,
+                sessionTokens: new Map<string, number>([
+                  [sessionDoc?.sessionToken || crypto.randomBytes(32).toString("hex"), Date.now() + 24 * 3600 * 1000]
+                ]),
                 panelists: new Map(),
                 pendingRequests: new Map(),
                 languageGroups: new Map(),
                 speakerGender: gender || "male",
                 topic: sessionDoc?.topic || message.topic || message.glossary || "",
-                isDuoMode: sessionDoc?.isDuoMode ?? (message.isDuoMode === true || message.mode === 'duo'),
+                isDuoMode: sessionDoc?.isDuoMode ?? false,
                 messages: messages || [],
                 lastActivity: Date.now()
               };
@@ -2006,9 +2188,9 @@ New Sentence: "${cleanText}"`;
           }
         }
 
-        // Reject unknown sessionId
-        if (!session && sessionId !== "test_session" && sessionId !== "global_test") {
-          recordFailedJoinAttempt(clientIp);
+        // Reject unknown or ended sessionId
+        if (!session || session.ended) {
+          recordFailedJoinAttempt(clientIp, sessionId);
           if (ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({
               type: "error",
@@ -2022,12 +2204,9 @@ New Sentence: "${cleanText}"`;
 
         const isNewSession = false;
 
-        session!.lastActivity = Date.now();
-        if (message.isDuoMode !== undefined) {
-          session!.isDuoMode = message.isDuoMode === true || message.mode === 'duo';
-        }
+        session.lastActivity = Date.now();
         if (message.topic || message.glossary) {
-          session!.topic = message.topic || message.glossary;
+          session.topic = message.topic || message.glossary;
         }
         console.log(`[DIAGNOSTIC][STEP1_JOIN] sessionId='${sessionId}' role='${role}' isNewSession=${isNewSession} isDuoMode=${session!.isDuoMode} targetLang='${targetLang}'`);
 
@@ -2056,6 +2235,9 @@ New Sentence: "${cleanText}"`;
           const canClaimHost = isExistingHostSocket || isBrandNewHost || hasValidHostToken;
 
           if (canClaimHost) {
+            if (message.isDuoMode !== undefined) {
+              session!.isDuoMode = message.isDuoMode === true || message.mode === 'duo';
+            }
             if (isBrandNewHost) {
               const generatedHostToken = inputHostToken || crypto.randomBytes(16).toString("hex");
               session!.hostToken = generatedHostToken;
@@ -2121,6 +2303,21 @@ New Sentence: "${cleanText}"`;
         } else {
           currentRole = "listener";
           (ws as any).currentRole = "listener";
+
+          if (!session.sessionTokens) session.sessionTokens = new Map<string, number>();
+          const mintedToken = crypto.randomBytes(32).toString("hex");
+          session.sessionTokens.set(mintedToken, Date.now() + 24 * 3600 * 1000);
+          session.sessionToken = mintedToken;
+
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+              type: "join_ack",
+              sessionId,
+              sessionToken: mintedToken,
+              role: "listener"
+            }));
+          }
+
           // Cleanly remove listener from any previous language groups when switching target language
           session.languageGroups.forEach(g => {
             g.listeners.delete(ws);
@@ -2241,8 +2438,8 @@ New Sentence: "${cleanText}"`;
             return;
           }
 
-          // Auto-approve request ONLY for 1-on-1 duo mode sessions
-          const shouldAutoApprove = session.isDuoMode === true;
+          // Auto-approve request ONLY for 1-on-1 duo mode sessions (max 2 speakers: 1 host + 1 guest)
+          const shouldAutoApprove = session.isDuoMode === true && session.panelists.size < 2;
           if (shouldAutoApprove) {
             let assignedSlot = "";
             for (let i = 1; i <= 10; i++) {
@@ -2800,6 +2997,7 @@ New Sentence: "${cleanText}"`;
 
   server.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running in ${process.env.NODE_ENV || 'development'} mode on http://localhost:${PORT}`);
+    console.log(`[AI_CONFIG] Effective translation model: ${process.env.GEMINI_MODEL_TRANSLATION || "gemini-2.5-flash"}`);
   });
 
   const handleShutdown = async (signal: string) => {

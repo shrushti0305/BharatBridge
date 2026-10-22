@@ -18,7 +18,8 @@ export async function uploadCaptionToAzure(
     originalText: string;
     translatedText: string;
     timestamp?: { seconds: number };
-  }>
+  }>,
+  token?: string
 ): Promise<AzureUploadResult> {
   try {
     const formattedDate = new Date().toISOString();
@@ -27,6 +28,7 @@ export async function uploadCaptionToAzure(
       sessionName,
       exportedAt: formattedDate,
       messageCount: messages.length,
+      token,
       captions: messages.map((m) => ({
         timestamp: m.timestamp ? new Date(m.timestamp.seconds * 1000).toISOString() : formattedDate,
         originalLanguage: m.sourceLang || 'en',
@@ -36,9 +38,15 @@ export async function uploadCaptionToAzure(
       })),
     };
 
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (token) {
+      headers['x-host-token'] = token;
+      headers['x-session-token'] = token;
+    }
+
     const response = await fetch('/api/azure/upload-caption', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers,
       body: JSON.stringify(payload),
     });
 
