@@ -25,12 +25,38 @@ describe("FIX 3: Secrets Scrub & Repo Hygiene Verification", () => {
 
     // Must not contain unscrubbed dummy passwords or real-looking tokens
     assert.ok(!content.includes("change-me-long-random"), ".env.example should not contain change-me-long-random");
-    assert.ok(!content.includes("your-smallest-api-key"), ".env.example should have normalized placeholder YOUR_SMALLEST_API_KEY");
-    
-    // Check that placeholders match standard placeholder conventions
-    assert.ok(content.includes('SMALLEST_API_KEY="YOUR_SMALLEST_API_KEY"'), "SMALLEST_API_KEY placeholder scrubbed");
-    assert.ok(content.includes('ADMIN_METRICS_SALT="YOUR_ADMIN_METRICS_SALT"'), "ADMIN_METRICS_SALT placeholder scrubbed");
-    assert.ok(content.includes('ADMIN_TOKEN="YOUR_ADMIN_TOKEN"'), "ADMIN_TOKEN placeholder scrubbed");
+
+    // Secret pattern checks
+    const highEntropySkKey = /sk_[A-Za-z0-9]{25,}/;
+    const realAzureAccountKey = /AccountKey=[A-Za-z0-9+/]{40,}={1,2}/;
+    const privateKeyBlock = /-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----/;
+    const googleApiKey = /AIza[0-9A-Za-z-_]{35}/;
+
+    assert.ok(!highEntropySkKey.test(content), ".env.example must not contain secret sk_ keys");
+    assert.ok(!realAzureAccountKey.test(content), ".env.example must not contain real Azure AccountKey");
+    assert.ok(!privateKeyBlock.test(content), ".env.example must not contain private key blocks");
+    assert.ok(!googleApiKey.test(content), ".env.example must not contain live Google API keys");
+
+    // Verify all credential variables use safe placeholder patterns (e.g. YOUR_*)
+    const lines = content.split("\n");
+    let credentialCount = 0;
+    for (const rawLine of lines) {
+      const line = rawLine.trim();
+      if (!line || line.startsWith("#")) continue;
+      const match = line.match(/^([A-Z0-9_]+)=(.*)$/);
+      if (match) {
+        const [_, key, val] = match;
+        const cleanVal = val.replace(/^["']|["']$/g, "").trim();
+        if (/(KEY|TOKEN|SALT|SECRET|PASSWORD)$/.test(key)) {
+          credentialCount++;
+          assert.ok(
+            cleanVal.startsWith("YOUR_"),
+            `Credential variable ${key} in .env.example must use a YOUR_* placeholder, found: ${cleanVal}`
+          );
+        }
+      }
+    }
+    assert.ok(credentialCount >= 3, `Expected at least 3 credential placeholder variables in .env.example, found ${credentialCount}`);
   });
 
   test("scans all git-tracked files for potential secret leaks", () => {

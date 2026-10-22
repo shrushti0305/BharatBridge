@@ -7,6 +7,7 @@
     "dev": "tsx server.ts",
     "build": "vite build && esbuild server.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/server.cjs",
     "start": "node dist/server.cjs",
+    "test": "tsx --test tests/fix1_admin_auth.test.ts tests/fix2_host_token_session_binding.test.ts tests/fix3_secrets_scrub.test.ts tests/fix4_tts_stampede.test.ts",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit"
   },
