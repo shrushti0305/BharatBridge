@@ -231,6 +231,12 @@ function getTtsDailyCharLimit(): number | null {
   return null;
 }
 
+let cosmosMetricsContainerGetter: (() => Promise<any>) | null = null;
+
+export function setCosmosMetricsContainerGetter(getter: () => Promise<any>): void {
+  cosmosMetricsContainerGetter = getter;
+}
+
 export class ObservabilityService {
   private instanceId = `${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
   private activeMetrics: Map<string, LatencyMetricRecord> = new Map();
@@ -524,8 +530,8 @@ export class ObservabilityService {
       const dayDoc = this.dayBuckets.get(todayKey);
       if (!dayDoc) return;
 
-      const { getContainer } = await import("../lib/cosmos-client");
-      const container = await getContainer("metrics");
+      if (!cosmosMetricsContainerGetter) return;
+      const container = await cosmosMetricsContainerGetter();
       if (!container) return;
 
       dayDoc.updatedAt = new Date().toISOString();

@@ -63,7 +63,9 @@ STRICT REQUIREMENTS:
 
 Sentence: "${cleanText}"`;
 
-    const models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"];
+    const models = process.env.GEMINI_FALLBACK_MODELS
+      ? process.env.GEMINI_FALLBACK_MODELS.split(",").map((m) => m.trim()).filter(Boolean)
+      : [process.env.GEMINI_MODEL_TRANSLATION || "gemini-3.8-flash"];
     let lastError: any = null;
 
     for (const model of models) {

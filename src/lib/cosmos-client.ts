@@ -1,5 +1,6 @@
 import { CosmosClient, Database, Container } from "@azure/cosmos";
 import crypto from "crypto";
+import fs from "fs";
 import dotenv from "dotenv";
 
 dotenv.config();
@@ -18,18 +19,53 @@ let client: CosmosClient | null = null;
 let dbInstance: Database | null = null;
 const containerCache: Map<string, Container> = new Map();
 
+// Production guard against fake Cosmos DB
+if (process.env.COSMOS_USE_FAKE === "true" && process.env.NODE_ENV === "production") {
+  throw new Error("[SECURITY_FATAL] COSMOS_USE_FAKE cannot be enabled in production environment.");
+}
+
 export const cosmosHealthState = {
-  configured: Boolean(process.env.COSMOS_DB_ENDPOINT && process.env.COSMOS_DB_KEY),
+  configured: Boolean((process.env.COSMOS_DB_ENDPOINT && process.env.COSMOS_DB_KEY) || process.env.COSMOS_USE_FAKE === "true"),
   reachable: false,
   lastWriteOk: false,
   lastError: null as string | null
 };
+
+// Documented in-memory fake container for isolated testing and ghost-session rehydration verification
+export const fakeCosmosDb = {
+  sessions: new Map<string, any>(),
+  messages: new Map<string, any[]>()
+};
+
+export function getFakeCosmosStore(): { sessions: Map<string, any>; messages: Map<string, any[]> } {
+  if (process.env.COSMOS_FAKE_SEED_PATH) {
+    const p = process.env.COSMOS_FAKE_SEED_PATH.replace(/^["']|["']$/g, "");
+    if (fs.existsSync(p)) {
+      try {
+        const data = JSON.parse(fs.readFileSync(p, "utf8"));
+        return {
+          sessions: new Map<string, any>(Object.entries(data.sessions || {})),
+          messages: new Map<string, any[]>(Object.entries(data.messages || {}))
+        };
+      } catch (err) {
+        console.warn("[CosmosDB] Failed to read fake seed file:", err);
+      }
+    } else {
+      console.warn("[CosmosDB] Fake seed file does not exist at:", p);
+    }
+  }
+  return fakeCosmosDb;
+}
 
 /**
  * Initializes and returns the shared Cosmos DB client instance with retries & timeouts.
  */
 export function getCosmosClient(): CosmosClient | null {
   if (client) return client;
+  if (process.env.COSMOS_USE_FAKE === "true") {
+    cosmosHealthState.configured = true;
+    return null;
+  }
   const endpoint = getEndpoint();
   const key = getKey();
   if (!endpoint || !key) {
@@ -136,6 +172,14 @@ export async function initCosmosDB(): Promise<{
   containers?: string[];
   error?: string;
 }> {
+  if (process.env.COSMOS_USE_FAKE === "true") {
+    cosmosHealthState.configured = true;
+    cosmosHealthState.reachable = true;
+    cosmosHealthState.lastError = null;
+    console.log("[Persistence] Cosmos DB Fake Container is ACTIVE for test isolation.");
+    return { success: true, databaseId: "fake_cosmos", containers: ["sessions", "messages"] };
+  }
+
   const endpoint = getEndpoint();
   const key = getKey();
   if (!endpoint || !key) {
@@ -196,6 +240,14 @@ export async function upsertFinalizedThoughtDocument(params: {
   translations?: Record<string, { text: string; provider: string; degraded: boolean }>;
   timestamp?: number;
 }): Promise<{ success: boolean; ru?: number; error?: string }> {
+  if (process.env.COSMOS_USE_FAKE === "true") {
+    const list = fakeCosmosDb.messages.get(params.sessionId) || [];
+    list.push(params);
+    fakeCosmosDb.messages.set(params.sessionId, list);
+    cosmosHealthState.lastWriteOk = true;
+    cosmosHealthState.reachable = true;
+    return { success: true, ru: 1 };
+  }
   try {
     const container = await getContainer("messages");
     if (!container) return { success: false, error: "Messages container unavailable" };
@@ -326,6 +378,20 @@ export async function upsertSessionDocument(params: {
   hostToken?: string;
   hostTokenHash?: string;
 }): Promise<{ success: boolean; ru?: number; error?: string }> {
+  if (process.env.COSMOS_USE_FAKE === "true") {
+    const tokenHash = params.hostTokenHash || (params.hostToken ? crypto.createHash("sha256").update(params.hostToken).digest("hex") : undefined);
+    fakeCosmosDb.sessions.set(params.sessionId, {
+      id: params.sessionId,
+      sessionId: params.sessionId,
+      topic: params.topic || "",
+      isDuoMode: Boolean(params.isDuoMode),
+      createdAt: params.createdAt || Date.now(),
+      hostTokenHash: tokenHash
+    });
+    cosmosHealthState.lastWriteOk = true;
+    cosmosHealthState.reachable = true;
+    return { success: true, ru: 1 };
+  }
   try {
     const container = await getContainer("sessions");
     if (!container) return { success: false, error: "Sessions container unavailable" };
@@ -363,6 +429,13 @@ export async function loadSessionFromCosmos(sessionId: string): Promise<{
   ru?: number;
   error?: string;
 }> {
+  if (process.env.COSMOS_USE_FAKE === "true") {
+    const store = getFakeCosmosStore();
+    const sessionDoc = store.sessions.get(sessionId) || null;
+    const messages: any[] = store.messages.get(sessionId) || [];
+    cosmosHealthState.reachable = true;
+    return { sessionDoc, messages, ru: 1 };
+  }
   try {
     const sessionsContainer = await getContainer("sessions");
     const messagesContainer = await getContainer("messages");

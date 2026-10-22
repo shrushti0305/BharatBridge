@@ -8,17 +8,27 @@ import dotenv from "dotenv";
 import { WebSocketServer, WebSocket } from "ws";
 import http from "http";
 import dns from "dns";
-import { observabilityService, generateEventId } from "./src/services/observability";
+import { observabilityService, generateEventId, setCosmosMetricsContainerGetter } from "./src/services/observability";
 import { getCanonicalLanguageCode } from "./src/registry/languages.js";
 import { getAdminAuth } from "./src/lib/firebase-admin";
 import {
   initCosmosDB,
   cosmosHealthState,
   getCosmosClient,
+  getContainer,
   upsertFinalizedThoughtDocument,
   upsertSessionDocument,
   loadSessionFromCosmos
 } from "./src/lib/cosmos-client.js";
+
+// Hook up server-side metrics container flusher
+setCosmosMetricsContainerGetter(async () => getContainer("metrics"));
+
+// Production guard against fake Cosmos DB
+if (process.env.COSMOS_USE_FAKE === "true" && process.env.NODE_ENV === "production") {
+  console.error("[FATAL][SECURITY] COSMOS_USE_FAKE is strictly forbidden in production mode (NODE_ENV=production). Refusing to boot.");
+  process.exit(1);
+}
 
 // Process exception safety
 process.on("uncaughtException", (err) => {
@@ -417,8 +427,8 @@ async function startServer() {
     return false;
   }
 
-  function verifySessionToken(req: express.Request, session: any): boolean {
-    if (!session || session.ended) return false;
+  function verifySessionToken(req: express.Request, session: any): { valid: boolean; expired?: boolean } {
+    if (!session || session.ended) return { valid: false };
     const clientToken = (
       req.headers["x-session-token"] ||
       req.headers["x-host-token"] ||
@@ -429,20 +439,29 @@ async function startServer() {
       req.body?.hostToken
     )?.toString().trim();
 
-    if (!clientToken) return false;
+    if (!clientToken) return { valid: false };
     const now = Date.now();
+    let tokenExpired = false;
+
     if (session.sessionTokens && session.sessionTokens instanceof Map) {
       for (const [tok, exp] of session.sessionTokens.entries()) {
-        if (exp > now && timingSafeEqualToken(clientToken, tok)) return true;
+        if (timingSafeEqualToken(clientToken, tok)) {
+          if (exp > now) return { valid: true };
+          tokenExpired = true;
+        }
       }
     }
-    if (session.sessionToken && timingSafeEqualToken(clientToken, session.sessionToken)) return true;
-    if (session.hostToken && timingSafeEqualToken(clientToken, session.hostToken)) return true;
+
+    if (session.hostToken && timingSafeEqualToken(clientToken, session.hostToken)) return { valid: true };
     if (session.hostTokenHash) {
       const hash = crypto.createHash("sha256").update(clientToken).digest("hex");
-      if (timingSafeEqualToken(hash, session.hostTokenHash)) return true;
+      if (timingSafeEqualToken(hash, session.hostTokenHash)) return { valid: true };
     }
-    return false;
+
+    if (tokenExpired) {
+      return { valid: false, expired: true };
+    }
+    return { valid: false };
   }
 
   // Azure Blob Storage Upload for Captions (Dual-Format JSON + CSV)
@@ -553,7 +572,7 @@ Keep the formatting clean with standard Markdown headers and bullet points.`;
       if (process.env.GEMINI_API_KEY) {
         try {
           const response = await ai.models.generateContent({
-            model: "gemini-2.5-flash",
+            model: process.env.GEMINI_MODEL_SUMMARY || "gemini-3.8-flash",
             contents: prompt,
           });
           summaryText = response.text || "";
@@ -683,8 +702,14 @@ Keep the formatting clean with standard Markdown headers and bullet points.`;
     const activeSessionId = (sessionId || req.headers["x-session-id"] || "").toString().trim();
     if (activeSessionId && sessions.has(activeSessionId)) {
       const sessionObj = sessions.get(activeSessionId);
-      if (sessionObj && !verifySessionToken(req, sessionObj)) {
-        return res.status(403).json({ error: "Forbidden: Valid sessionToken or hostToken is required", code: "SESSION_TOKEN_REQUIRED" });
+      if (sessionObj) {
+        const auth = verifySessionToken(req, sessionObj);
+        if (!auth.valid) {
+          if (auth.expired) {
+            return res.status(403).json({ error: "Forbidden: Session token has expired. Please rejoin the session.", code: "SESSION_TOKEN_EXPIRED" });
+          }
+          return res.status(403).json({ error: "Forbidden: Valid sessionToken or hostToken is required", code: "SESSION_TOKEN_REQUIRED" });
+        }
       }
     }
     const key = process.env.AZURE_TRANSLATOR_KEY;
@@ -766,7 +791,11 @@ Keep the formatting clean with standard Markdown headers and bullet points.`;
     }
 
     const sessionObj = sessions.get(activeSessionId);
-    if (!verifySessionToken(req, sessionObj)) {
+    const auth = verifySessionToken(req, sessionObj);
+    if (!auth.valid) {
+      if (auth.expired) {
+        return res.status(403).json({ error: "Forbidden: Session token has expired. Please rejoin the session.", code: "SESSION_TOKEN_EXPIRED" });
+      }
       return res.status(403).json({ error: "Forbidden: Valid sessionToken or hostToken is required", code: "SESSION_TOKEN_REQUIRED" });
     }
     if (!text || typeof text !== "string" || !text.trim()) {
@@ -1470,7 +1499,7 @@ ${topicPrompt}${genderPrompt}${contextPrompt}STRICT INSTRUCTIONS:
 
 New Sentence: "${cleanText}"`;
 
-    const primaryModel = process.env.GEMINI_MODEL_TRANSLATION || "gemini-2.5-flash";
+    const primaryModel = process.env.GEMINI_MODEL_TRANSLATION || "gemini-3.8-flash";
     const timeoutMs = Number(process.env.TRANSLATION_TIMEOUT_MS) || 3500;
     const startTime = Date.now();
     if (process.env.GEMINI_API_KEY) {
@@ -1690,7 +1719,7 @@ New Sentence: "${cleanText}"`;
 
     const isAdmin = await verifyAdminAccess(req);
     const targetSession = sessions.get(id);
-    const isSessionHost = targetSession ? verifySessionToken(req, targetSession) : false;
+    const isSessionHost = targetSession ? verifySessionToken(req, targetSession).valid : false;
 
     if (!isAdmin && !isSessionHost) {
       return res.status(403).json({ error: "Forbidden: Admin authorization or valid session host token required" });
@@ -1781,7 +1810,11 @@ New Sentence: "${cleanText}"`;
         return res.status(403).json({ error: "Forbidden: Invalid or non-existent sessionId", code: "SESSION_TOKEN_REQUIRED" });
       }
       const sessionObj = sessions.get(activeSessionId);
-      if (!verifySessionToken(req, sessionObj)) {
+      const auth = verifySessionToken(req, sessionObj);
+      if (!auth.valid) {
+        if (auth.expired) {
+          return res.status(403).json({ error: "Forbidden: Session token has expired. Please rejoin the session.", code: "SESSION_TOKEN_EXPIRED" });
+        }
         return res.status(403).json({ error: "Forbidden: Valid sessionToken or hostToken is required", code: "SESSION_TOKEN_REQUIRED" });
       }
       if (!text || typeof text !== "string" || !text.trim() || !targetLanguage) {
@@ -2019,7 +2052,7 @@ New Sentence: "${cleanText}"`;
   const failedJoinMapBySession = new Map<string, { count: number; resetTime: number }>();
   let globalFailedJoins = { count: 0, resetTime: Date.now() + 60000 };
 
-  async function applyFailedJoinThrottling(ip: string, sessionId?: string): Promise<boolean> {
+  async function applyFailedJoinThrottling(ip: string, sessionId?: string, token?: string): Promise<boolean> {
     const now = Date.now();
     if (now > globalFailedJoins.resetTime) {
       globalFailedJoins = { count: 0, resetTime: now + 60000 };
@@ -2035,8 +2068,26 @@ New Sentence: "${cleanText}"`;
       }
     }
 
+    // Exemption: If the client already possesses a valid sessionToken or hostToken for THIS session, exempt from IP throttling
+    if (sessionId && token && sessions.has(sessionId)) {
+      const existingSession = sessions.get(sessionId)!;
+      if (!existingSession.ended) {
+        const isSessionTokenValid = existingSession.sessionTokens && existingSession.sessionTokens.get(token) && existingSession.sessionTokens.get(token)! > now;
+        const isHostTokenValid = (existingSession.hostToken && timingSafeEqualToken(token, existingSession.hostToken)) ||
+          (existingSession.hostTokenHash && timingSafeEqualToken(crypto.createHash("sha256").update(token).digest("hex"), existingSession.hostTokenHash));
+        if (isSessionTokenValid || isHostTokenValid) {
+          return true;
+        }
+      }
+    }
+
     const ipRecord = failedJoinMapByIp.get(ip);
     if (!ipRecord || now > ipRecord.resetTime) return true;
+
+    const maxIpAttempts = process.env.MAX_FAILED_JOINS_PER_IP ? Number(process.env.MAX_FAILED_JOINS_PER_IP) : 30;
+    if (ipRecord.count >= maxIpAttempts) {
+      return false;
+    }
 
     const threshold = process.env.FAILED_JOIN_THRESHOLD ? Number(process.env.FAILED_JOIN_THRESHOLD) : 10;
     if (ipRecord.count >= threshold) {
@@ -2129,6 +2180,15 @@ New Sentence: "${cleanText}"`;
               });
             });
             console.log(`[SESSION_ENDED] Session '${targetSid}' ended by host.`);
+          } else {
+            console.warn(`[SECURITY] Unauthorized end_session attempt by non-host socket on session '${targetSid}'.`);
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({
+                type: "error",
+                code: "FORBIDDEN",
+                message: "Only the session host can end the session."
+              }));
+            }
           }
         }
         return;
@@ -2140,7 +2200,7 @@ New Sentence: "${cleanText}"`;
         const clientIp = ((ws as any).remoteAddress || "global").toString().trim();
 
         // Throttling check before any Cosmos DB read
-        const allowed = await applyFailedJoinThrottling(clientIp, sessionId);
+        const allowed = await applyFailedJoinThrottling(clientIp, sessionId, inputHostToken);
         if (!allowed) {
           if (ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({
@@ -2997,7 +3057,7 @@ New Sentence: "${cleanText}"`;
 
   server.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running in ${process.env.NODE_ENV || 'development'} mode on http://localhost:${PORT}`);
-    console.log(`[AI_CONFIG] Effective translation model: ${process.env.GEMINI_MODEL_TRANSLATION || "gemini-2.5-flash"}`);
+    console.log(`[AI_CONFIG] Effective translation model: ${process.env.GEMINI_MODEL_TRANSLATION || "gemini-3.8-flash"}`);
   });
 
   const handleShutdown = async (signal: string) => {
