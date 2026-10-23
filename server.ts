@@ -2111,6 +2111,14 @@ New Sentence: "${cleanText}"`;
       return false;
     }
 
+    // Legitimate room join check: if the target session exists and is active, genuine attendees with the correct PIN are never blocked by shared IP limits
+    if (sessionId && sessions.has(sessionId)) {
+      const targetSession = sessions.get(sessionId)!;
+      if (!targetSession.ended) {
+        return true;
+      }
+    }
+
     if (sessionId) {
       const sessRecord = failedJoinMapBySession.get(sessionId);
       if (sessRecord && now <= sessRecord.resetTime && sessRecord.count >= 30) {
@@ -2172,15 +2180,16 @@ New Sentence: "${cleanText}"`;
     }
   }
 
+  const tokenBucketMap = new Map<string, { tokens: number; lastRefill: number }>();
+
   wss.on("connection", (ws, req) => {
     (ws as any).isAlive = true;
     (ws as any).remoteAddress = getWsClientIp(req);
+    (ws as any).socketId = crypto.randomUUID();
 
-    // Per-socket token bucket rate limiter (refillRate: 20 msgs/s, burstCapacity: 40 msgs)
+    // Per-socket/token rate limiter config (refillRate: 20 msgs/s, burstCapacity: 40 msgs)
     const burstCapacity = process.env.WS_RATE_LIMIT_BURST_CAPACITY ? Number(process.env.WS_RATE_LIMIT_BURST_CAPACITY) : 40;
     const refillRate = process.env.WS_RATE_LIMIT_REFILL_PER_SEC ? Number(process.env.WS_RATE_LIMIT_REFILL_PER_SEC) : 20;
-    (ws as any).bucketTokens = burstCapacity;
-    (ws as any).lastBucketRefill = Date.now();
 
     ws.on("pong", () => {
       (ws as any).isAlive = true;
@@ -2195,28 +2204,6 @@ New Sentence: "${cleanText}"`;
     let currentLang: string | null = null;
 
     ws.on("message", async (data) => {
-      // Token bucket check
-      const now = Date.now();
-      const elapsedMs = now - ((ws as any).lastBucketRefill || now);
-      (ws as any).bucketTokens = Math.min(burstCapacity, ((ws as any).bucketTokens ?? burstCapacity) + elapsedMs * (refillRate / 1000));
-      (ws as any).lastBucketRefill = now;
-
-      if ((ws as any).bucketTokens < 1) {
-        (ws as any).bucketTokens -= 1;
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({
-            type: "error",
-            code: "RATE_LIMITED",
-            message: "Message rate limit exceeded. Please slow down."
-          }));
-        }
-        if ((ws as any).bucketTokens < -10) {
-          ws.close(1008, "Rate limit exceeded");
-        }
-        return;
-      }
-      (ws as any).bucketTokens -= 1;
-
       let message: any;
       try {
         message = JSON.parse(data.toString());
@@ -2231,6 +2218,34 @@ New Sentence: "${cleanText}"`;
         }
         return;
       }
+
+      // Token-keyed token bucket rate limiter (isolated per attendee token on shared venue IPs/NAT)
+      const now = Date.now();
+      const bucketKey = message?.token || message?.hostToken || message?.sessionToken || (ws as any).sessionToken || (ws as any).hostToken || (ws as any).socketId;
+      let bucket = tokenBucketMap.get(bucketKey);
+      if (!bucket) {
+        bucket = { tokens: burstCapacity, lastRefill: now };
+        tokenBucketMap.set(bucketKey, bucket);
+      }
+      const elapsedMs = now - bucket.lastRefill;
+      bucket.tokens = Math.min(burstCapacity, bucket.tokens + elapsedMs * (refillRate / 1000));
+      bucket.lastRefill = now;
+
+      if (bucket.tokens < 1) {
+        bucket.tokens -= 1;
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({
+            type: "error",
+            code: "RATE_LIMITED",
+            message: "Message rate limit exceeded. Please slow down."
+          }));
+        }
+        if (bucket.tokens < -10) {
+          ws.close(1008, "Rate limit exceeded");
+        }
+        return;
+      }
+      bucket.tokens -= 1;
 
       if (message.type === "ping") {
         (ws as any).isAlive = true;
@@ -2409,22 +2424,47 @@ New Sentence: "${cleanText}"`;
               session!.hostToken = inputHostToken;
             }
 
+            // Step 4: Gracefully supersede any previous organizer/speaker socket (multi-tab or immediate reconnect)
+            if (session!.organizerWs && session!.organizerWs !== ws && session!.organizerWs.readyState === WebSocket.OPEN) {
+              try {
+                session!.organizerWs.send(JSON.stringify({
+                  type: "role_changed",
+                  role: "SUPERSEDED",
+                  status: "superseded_by_new_host",
+                  message: "Host session was reclaimed by a new connection or tab."
+                }));
+                session!.organizerWs.close(1000, "Superseded by new host connection");
+              } catch (_) {}
+            }
+            if (session!.speaker && session!.speaker !== ws && session!.speaker !== session!.organizerWs && session!.speaker.readyState === WebSocket.OPEN) {
+              try {
+                session!.speaker.close(1000, "Superseded by new host connection");
+              } catch (_) {}
+            }
+
             session!.speaker = ws;
             session!.organizerWs = ws;
             session!.organizerId = message.userId || session!.organizerId;
             session!.speakerGender = gender || "male";
             currentRole = role;
             (ws as any).currentRole = role;
+            (ws as any).hostToken = session!.hostToken;
 
-            if (!session!.panelists.has("speaker-01")) {
-              session!.panelists.set("speaker-01", {
-                speakerId: "speaker-01",
-                userId: message.userId || "host",
-                userName: message.userName || "Host Speaker",
-                ws
-              });
-            }
+            // Step 4: Ensure speaker-01 is actively bound to this reconnecting host socket
+            session!.panelists.set("speaker-01", {
+              speakerId: "speaker-01",
+              userId: message.userId || session!.organizerId || "host",
+              userName: message.userName || "Host Speaker",
+              ws
+            });
+
             if (ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({
+                type: "join_ack",
+                sessionId,
+                role: "organizer",
+                hostToken: session!.hostToken
+              }));
               ws.send(JSON.stringify({
                 type: "host_token",
                 sessionId,
@@ -2432,6 +2472,38 @@ New Sentence: "${cleanText}"`;
                 role: "organizer"
               }));
             }
+
+            // Step 4: Immediately send message history to reconnecting host if messages exist
+            if (session!.messages && session!.messages.length > 0) {
+              const hostLang = currentLang || session!.defaultTargetLang || "en";
+              const historyPayloads = session!.messages.map((m: SessionMessage) => {
+                let translatedText = m.translations?.[hostLang] || m.translatedText || m.originalText;
+                if (typeof translatedText === "object") translatedText = (translatedText as any).text;
+                return {
+                  originalText: m.originalText,
+                  translatedText,
+                  sourceLang: m.sourceLang || "en",
+                  targetLang: hostLang,
+                  timestamp: m.timestamp,
+                  eventId: m.eventId || (m as any).id,
+                  speakerId: m.speakerId || "speaker-01",
+                  speakerName: m.speakerName || "Speaker",
+                  provider: m.provider || "cosmos",
+                  translation_degraded: m.degraded || false
+                };
+              });
+              if (ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({
+                  type: "history",
+                  sessionId,
+                  topic: session!.topic || "",
+                  name: session!.topic || `Live Session #${sessionId}`,
+                  sourceLang: "en",
+                  messages: historyPayloads
+                }));
+              }
+            }
+
             const group = getOrCreateLanguageGroup(sessionId, currentLang!, session!.speakerGender);
             if (group) {
               group.listeners.add(ws);
@@ -2461,6 +2533,7 @@ New Sentence: "${cleanText}"`;
           const mintedToken = crypto.randomBytes(32).toString("hex");
           session.sessionTokens.set(mintedToken, Date.now() + 24 * 3600 * 1000);
           session.sessionToken = mintedToken;
+          (ws as any).sessionToken = mintedToken;
 
           if (ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({

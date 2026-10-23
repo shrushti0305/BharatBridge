@@ -1446,7 +1446,9 @@ export default function App() {
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
-    const sessionId = params.get('session') || params.get('room') || params.get('pin');
+    const urlSessionId = params.get('session') || params.get('room') || params.get('pin');
+    const savedActiveSessionId = sessionStorage.getItem("bharat_bridge_active_session_id");
+    const sessionId = urlSessionId || savedActiveSessionId;
     if (sessionId && !isLive) {
       joinLiveSession(sessionId);
     }
@@ -1856,7 +1858,15 @@ export default function App() {
           setSpeakerRequestStatus(msg.status || "pending");
         }
         if (msg.type === "role_changed") {
-          if (msg.status === "takeover_prevented") {
+          if (msg.status === "superseded_by_new_host" || msg.role === "SUPERSEDED") {
+            console.warn(`[SECURITY][SUPERSEDED] Host session was superseded by a new connection or tab.`);
+            setUserRole("LISTENER");
+            setSessionRole("listener");
+            sessionRoleRef.current = "listener";
+            setSpeakerSlot("");
+            setSpeakerRequestStatus("idle");
+            setIsListening(false);
+          } else if (msg.status === "takeover_prevented") {
             console.warn(`[SECURITY][TAKEOVER_PREVENTED] Host takeover prevented by server: ${msg.message}`);
             setUserRole("LISTENER");
             setSessionRole("listener");
@@ -2074,6 +2084,8 @@ export default function App() {
         sessionTokenRef.current = sessionTok;
         sessionStorage.setItem(`bharat_bridge_host_token_${pinCode}`, hostTok);
         sessionStorage.setItem(`bharat_bridge_session_token_${pinCode}`, sessionTok);
+        sessionStorage.setItem("bharat_bridge_active_session_id", pinCode);
+        sessionStorage.setItem("bharat_bridge_active_role", "organizer");
       }
     } catch (createErr) {
       console.warn("[SESSION_CREATE_FALLBACK]", createErr);
@@ -2222,6 +2234,8 @@ export default function App() {
       resetHoldBackBuffer();
       setIsLive(false);
       isLiveRef.current = false;
+      sessionStorage.removeItem("bharat_bridge_active_session_id");
+      sessionStorage.removeItem("bharat_bridge_active_role");
       setSessionRole(null);
       sessionRoleRef.current = null;
       setUserRole('LISTENER');
@@ -2265,6 +2279,8 @@ export default function App() {
 
   const joinLiveSession = async (rawSessionId: string) => {
     const sessionId = rawSessionId.trim();
+    const storedHostToken = (sessionId ? sessionStorage.getItem(`bharat_bridge_host_token_${sessionId}`) : "") || "";
+    const isHost = Boolean(storedHostToken);
     const sessionData = {
       id: sessionId,
       sourceLang: sourceLang.code,
@@ -2277,16 +2293,24 @@ export default function App() {
     setCurrentSession(sessionData as Session);
     isLiveRef.current = true;
     setIsLive(true);
-    setSessionRole('listener');
-    sessionRoleRef.current = 'listener';
-    setUserRole('LISTENER');
-    setModalOpen({ open: true, type: "target" });
+    setSessionRole(isHost ? 'speaker' : 'listener');
+    sessionRoleRef.current = isHost ? 'speaker' : 'listener';
+    setUserRole(isHost ? 'ORGANIZER' : 'LISTENER');
+    if (isHost) {
+      setSpeakerSlot('speaker-01');
+      setHostToken(storedHostToken);
+      hostTokenRef.current = storedHostToken;
+      sessionStorage.setItem("bharat_bridge_active_session_id", sessionId);
+      sessionStorage.setItem("bharat_bridge_active_role", "organizer");
+    }
+    setModalOpen({ open: true, type: isHost ? "qr" : "target" });
 
     // Synchronously unlock audio on user gesture
     unmuteAudio();
+    if (isHost) toggleListening(true);
 
     // Setup WebSocket immediately with auto-reconnect resilience
-    initWebSocket(sessionId, "listener");
+    initWebSocket(sessionId, isHost ? "organizer" : "listener");
   };
 
   const pushMessageToLive = async (original: string, translated: string) => {
