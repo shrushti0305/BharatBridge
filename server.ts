@@ -2536,39 +2536,32 @@ New Sentence: "${cleanText}"`;
     const activeSessionId = (sessionId || req.headers["x-session-id"] || "").toString().trim();
 
     if (!activeSessionId) {
-      // Practice mode: no sessionId passed
-      if (!text || typeof text !== "string" || !text.trim() || !targetLanguage) {
-        return res.status(400).json({ error: "Missing text or targetLanguage" });
+      return res.status(400).json({ error: "Missing required sessionId", code: "SESSION_ID_REQUIRED" });
+    }
+
+    if (activeSessionId === "test_session" || activeSessionId === "global_test") {
+      return res.status(403).json({ error: "Forbidden: Test bypasses are disabled", code: "SESSION_TOKEN_REQUIRED" });
+    }
+    if (!sessions.has(activeSessionId)) {
+      return res.status(403).json({ error: "Forbidden: Invalid or non-existent sessionId", code: "SESSION_TOKEN_REQUIRED" });
+    }
+    const sessionObj = sessions.get(activeSessionId);
+    const auth = verifySessionToken(req, sessionObj);
+    if (!auth.valid) {
+      if (auth.expired) {
+        return res.status(403).json({ error: "Forbidden: Session token has expired. Please rejoin the session.", code: "SESSION_TOKEN_EXPIRED" });
       }
-      if (text.length > 500) {
-        return res.status(400).json({ error: "Practice mode text length exceeds maximum allowed limit (500 characters)" });
-      }
-    } else {
-      // In-session mode
-      if (activeSessionId === "test_session" || activeSessionId === "global_test") {
-        return res.status(403).json({ error: "Forbidden: Test bypasses are disabled", code: "SESSION_TOKEN_REQUIRED" });
-      }
-      if (!sessions.has(activeSessionId)) {
-        return res.status(403).json({ error: "Forbidden: Invalid or non-existent sessionId", code: "SESSION_TOKEN_REQUIRED" });
-      }
-      const sessionObj = sessions.get(activeSessionId);
-      const auth = verifySessionToken(req, sessionObj);
-      if (!auth.valid) {
-        if (auth.expired) {
-          return res.status(403).json({ error: "Forbidden: Session token has expired. Please rejoin the session.", code: "SESSION_TOKEN_EXPIRED" });
-        }
-        return res.status(403).json({ error: "Forbidden: Valid sessionToken or hostToken is required", code: "SESSION_TOKEN_REQUIRED" });
-      }
-      const budgetCheck = checkSessionCostBudget(sessionObj, 0.0003);
-      if (!budgetCheck.allowed) {
-        return res.status(429).json({ error: budgetCheck.message, code: budgetCheck.code });
-      }
-      if (!text || typeof text !== "string" || !text.trim() || !targetLanguage) {
-        return res.status(400).json({ error: "Missing text or targetLanguage" });
-      }
-      if (text.length > 2000) {
-        return res.status(400).json({ error: "Text length exceeds maximum allowed limit (2000 characters)" });
-      }
+      return res.status(403).json({ error: "Forbidden: Valid sessionToken or hostToken is required", code: "SESSION_TOKEN_REQUIRED" });
+    }
+    const budgetCheck = checkSessionCostBudget(sessionObj, 0.0003);
+    if (!budgetCheck.allowed) {
+      return res.status(429).json({ error: budgetCheck.message, code: budgetCheck.code });
+    }
+    if (!text || typeof text !== "string" || !text.trim() || !targetLanguage) {
+      return res.status(400).json({ error: "Missing text or targetLanguage" });
+    }
+    if (text.length > 2000) {
+      return res.status(400).json({ error: "Text length exceeds maximum allowed limit (2000 characters)" });
     }
     const eventId = inputEventId || generateEventId();
     const startTime = Date.now();

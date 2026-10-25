@@ -255,7 +255,7 @@ describe("F1: Session-Bound Authentication & Route Protection", () => {
       assert.equal(res.status, 200, "Matching sessionToken must return 200");
     });
 
-    test("allows practice mode (no sessionId) up to 500 characters", async () => {
+    test("rejects request without sessionId with 400 SESSION_ID_REQUIRED", async () => {
       const res = await fetch(`${BASE_URL}/api/translate`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -264,20 +264,9 @@ describe("F1: Session-Bound Authentication & Route Protection", () => {
           targetLanguage: "hi"
         })
       });
-      assert.equal(res.status, 200, "Practice mode translation must return 200");
-    });
-
-    test("rejects practice mode text exceeding 500 characters with 400", async () => {
-      const longText = "a".repeat(501);
-      const res = await fetch(`${BASE_URL}/api/translate`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          text: longText,
-          targetLanguage: "hi"
-        })
-      });
-      assert.equal(res.status, 400, "Practice mode text > 500 chars must return 400");
+      assert.equal(res.status, 400, "Translation without sessionId must return 400");
+      const json = await res.json() as any;
+      assert.equal(json.code, "SESSION_ID_REQUIRED");
     });
   });
 
