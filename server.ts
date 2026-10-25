@@ -916,10 +916,10 @@ Keep the formatting clean with standard Markdown headers and bullet points.`;
         return res.status(404).json({ error: "Session not found" });
       }
 
-      if (session.hostToken && req.body?.hostToken) {
-        if (!verifyHostToken(req, session)) {
-          return res.status(403).json({ error: "Invalid hostToken" });
-        }
+      const isHost = verifyHostToken(req, session);
+      const isAdmin = await verifyAdminAccess(req);
+      if (!isHost && !isAdmin) {
+        return res.status(403).json({ error: "Forbidden: Session host token or admin authorization required", code: "HOST_TOKEN_REQUIRED" });
       }
 
       const languages: string[] = Array.isArray(req.body?.languages) && req.body.languages.length > 0
@@ -1018,12 +1018,18 @@ Keep the formatting clean with standard Markdown headers and bullet points.`;
     }
   });
 
-  app.get("/api/sessions/:id/probes/status", (req, res) => {
+  app.get("/api/sessions/:id/probes/status", async (req, res) => {
     try {
       const sessionId = req.params.id;
       const session = sessions.get(sessionId);
       if (!session) {
         return res.status(404).json({ error: "Session not found" });
+      }
+
+      const isHost = verifyHostToken(req, session);
+      const isAdmin = await verifyAdminAccess(req);
+      if (!isHost && !isAdmin) {
+        return res.status(403).json({ error: "Forbidden: Session host token or admin authorization required", code: "HOST_TOKEN_REQUIRED" });
       }
 
       const probes = sessionProbes.get(sessionId);
@@ -1067,12 +1073,18 @@ Keep the formatting clean with standard Markdown headers and bullet points.`;
     }
   });
 
-  app.post("/api/sessions/:id/probes/stop", (req, res) => {
+  app.post("/api/sessions/:id/probes/stop", async (req, res) => {
     try {
       const sessionId = req.params.id;
       const session = sessions.get(sessionId);
       if (!session) {
         return res.status(404).json({ error: "Session not found" });
+      }
+
+      const isHost = verifyHostToken(req, session);
+      const isAdmin = await verifyAdminAccess(req);
+      if (!isHost && !isAdmin) {
+        return res.status(403).json({ error: "Forbidden: Session host token or admin authorization required", code: "HOST_TOKEN_REQUIRED" });
       }
 
       const probes = sessionProbes.get(sessionId);
