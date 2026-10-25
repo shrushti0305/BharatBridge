@@ -73,6 +73,7 @@ describe("FIX 3: Secrets Scrub & Repo Hygiene Verification", () => {
     const highEntropySkKey = /sk_[A-Za-z0-9]{25,}/;
     const realAzureAccountKey = /AccountKey=[A-Za-z0-9+/]{40,}={1,2}/;
     const privateKeyBlock = /-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----/;
+    const googleApiKey = /AIza[0-9A-Za-z-_]{35}/;
 
     for (const relPath of trackedFiles) {
       const fullPath = path.join(repoRoot, relPath);
@@ -102,6 +103,9 @@ describe("FIX 3: Secrets Scrub & Repo Hygiene Verification", () => {
         }
         if (privateKeyBlock.test(line)) {
           issues.push({ file: relPath, line: i + 1, type: "Private Key PEM block" });
+        }
+        if (googleApiKey.test(line)) {
+          issues.push({ file: relPath, line: i + 1, type: "Google API Key (AIza...)" });
         }
       }
     }

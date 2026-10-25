@@ -883,7 +883,6 @@ Keep the formatting clean with standard Markdown headers and bullet points.`;
         sessionId: pinCode,
         payload: {
           sessionId: pinCode,
-          hostToken,
           hostTokenHash,
           sessionToken,
           sourceLang: sourceLang || "en",
@@ -1217,7 +1216,7 @@ Keep the formatting clean with standard Markdown headers and bullet points.`;
       const providedSecret = (req.headers["x-cluster-secret"] || req.body?.clusterSecret || "").toString().trim();
       const expectedSecret = (process.env.CLUSTER_SECRET || "").trim();
 
-      if (expectedSecret && (!providedSecret || !timingSafeEqualToken(providedSecret, expectedSecret))) {
+      if (!expectedSecret || !providedSecret || !timingSafeEqualToken(providedSecret, expectedSecret)) {
         return res.status(403).json({ error: "Forbidden: Invalid cluster secret" });
       }
 
@@ -1232,7 +1231,7 @@ Keep the formatting clean with standard Markdown headers and bullet points.`;
             speaker: null,
             organizerWs: null,
             organizerId: payload.userId || null,
-            hostToken: payload.hostToken,
+            hostToken: null,
             hostTokenHash: payload.hostTokenHash,
             sessionToken: payload.sessionToken,
             sessionTokens: new Map([[payload.sessionToken, Date.now() + 24 * 3600 * 1000]]),
@@ -1338,7 +1337,7 @@ Keep the formatting clean with standard Markdown headers and bullet points.`;
       const providedSecret = (req.headers["x-cluster-secret"] || req.query?.clusterSecret || "").toString().trim();
       const expectedSecret = (process.env.CLUSTER_SECRET || "").trim();
 
-      if (expectedSecret && (!providedSecret || !timingSafeEqualToken(providedSecret, expectedSecret))) {
+      if (!expectedSecret || !providedSecret || !timingSafeEqualToken(providedSecret, expectedSecret)) {
         return res.status(403).json({ error: "Forbidden: Invalid cluster secret" });
       }
 
@@ -1352,7 +1351,6 @@ Keep the formatting clean with standard Markdown headers and bullet points.`;
         ok: true,
         session: {
           sessionId,
-          hostToken: session.hostToken,
           hostTokenHash: session.hostTokenHash,
           sessionToken: session.sessionToken,
           targetLang: session.defaultTargetLang,
@@ -3010,10 +3008,27 @@ New Sentence: "${cleanText}"`;
         }
 
         const session = sessions.get(targetSid)!;
-        const inputToken = message.token || message.hostToken;
-        const isAuthorized = (inputToken && session.hostToken && timingSafeEqualToken(inputToken, session.hostToken)) ||
-                             (session.organizerWs === ws) ||
-                             (message.role === "operator");
+        const inputToken = (message.token || message.hostToken || message.adminToken || "").toString().trim();
+        const envAdminToken = (process.env.ADMIN_TOKEN || "").trim();
+
+        let isAuthorized = false;
+        if (session.organizerWs === ws) {
+          isAuthorized = true;
+        } else if (inputToken && session.hostToken && timingSafeEqualToken(inputToken, session.hostToken)) {
+          isAuthorized = true;
+        } else if (inputToken && envAdminToken && timingSafeEqualToken(inputToken, envAdminToken)) {
+          isAuthorized = true;
+        } else if (inputToken) {
+          const adminAuth = getAdminAuth();
+          if (adminAuth) {
+            try {
+              const decoded = await adminAuth.verifyIdToken(inputToken);
+              if (decoded && (decoded.admin === true || decoded.role === "admin" || decoded.role === "operator")) {
+                isAuthorized = true;
+              }
+            } catch (_) {}
+          }
+        }
 
         if (!isAuthorized) {
           if (ws.readyState === WebSocket.OPEN) {
@@ -3110,7 +3125,7 @@ New Sentence: "${cleanText}"`;
                     speaker: null,
                     organizerWs: null,
                     organizerId: null,
-                    hostToken: sDoc.hostToken,
+                    hostToken: null,
                     hostTokenHash: sDoc.hostTokenHash,
                     sessionToken: sDoc.sessionToken,
                     sessionTokens: new Map([[sDoc.sessionToken, Date.now() + 24 * 3600 * 1000]]),
