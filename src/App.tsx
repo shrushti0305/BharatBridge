@@ -455,11 +455,6 @@ const AdminModal = ({ isOpen, onClose }: { isOpen: boolean; onClose: () => void 
           Authorization: `Bearer ${token}`
         };
 
-        const adminToken = localStorage.getItem("bharat_bridge_admin_token") || (import.meta as any).env?.VITE_ADMIN_TOKEN || "";
-        if (adminToken) {
-          headers["x-admin-token"] = adminToken;
-        }
-
         const res = await fetch("/api/admin/sessions", { headers });
         if (!res.ok) {
           throw new Error(`HTTP ${res.status}: Admin access denied`);
@@ -503,10 +498,6 @@ const AdminModal = ({ isOpen, onClose }: { isOpen: boolean; onClose: () => void 
         if (token) {
           headers["Authorization"] = `Bearer ${token}`;
         }
-        const adminToken = localStorage.getItem("bharat_bridge_admin_token") || (import.meta as any).env?.VITE_ADMIN_TOKEN || "";
-        if (adminToken) {
-          headers["x-admin-token"] = adminToken;
-        }
 
         const res = await fetch(`/api/admin/sessions/${selectedSession.id}/messages`, { headers });
         if (res.ok) {
@@ -545,7 +536,7 @@ const AdminModal = ({ isOpen, onClose }: { isOpen: boolean; onClose: () => void 
     setAdminSummary("");
     setActiveTab("summary");
     try {
-      const hostTok = (selectedSession?.id ? sessionStorage.getItem(`bharat_bridge_host_token_${selectedSession.id}`) : null) || localStorage.getItem("bharat_bridge_admin_token");
+      const hostTok = selectedSession?.id ? sessionStorage.getItem(`bharat_bridge_host_token_${selectedSession.id}`) : null;
       const res = await fetch("/api/session-summary", {
         method: "POST",
         headers: { 
@@ -1472,7 +1463,7 @@ export default function App() {
 
   const [userRoleState, setUserRoleState] = useState<string | null>(null);
   const adminEmails = (import.meta.env.VITE_ADMIN_EMAILS || "admin@bharatbridge.com").split(",").map((e: string) => e.trim().toLowerCase());
-  const isAdminUser = userRoleState === 'admin' || (user?.email && adminEmails.includes(user.email.toLowerCase())) || !!localStorage.getItem("bharat_bridge_admin_token") || Boolean(import.meta.env.DEV);
+  const isAdminUser = userRoleState === 'admin' || (user?.email && adminEmails.includes(user.email.toLowerCase())) || Boolean(import.meta.env.DEV);
 
   useEffect(() => {
     localStorage.setItem("bharat_bridge_profile", JSON.stringify(profile));
