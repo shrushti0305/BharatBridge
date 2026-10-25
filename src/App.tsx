@@ -1288,6 +1288,7 @@ export default function App() {
   const sessionTopicRef = useRef<string>("");
   const activeSessionIdRef = useRef<string>("");
   const sttBackoffMsRef = useRef<number>(200);
+  const lastSeenSequenceNumberRef = useRef<number>(0);
 
   useEffect(() => {
     sessionTopicRef.current = sessionTopic;
@@ -1332,6 +1333,7 @@ export default function App() {
   const [autoDetect, setAutoDetect] = useState(true);
   const [copied, setCopied] = useState(false);
   const [audioUnmuted, setAudioUnmuted] = useState(false);
+  const [isDataSaverMode, setIsDataSaverMode] = useState(false);
   const [summaryContent, setSummaryContent] = useState<string>('');
   const [isGeneratingSummary, setIsGeneratingSummary] = useState<boolean>(false);
 
@@ -1829,7 +1831,8 @@ export default function App() {
         userName: user?.displayName || (joinRole === 'organizer' ? "Host Speaker" : "Guest Listener"),
         gender: profile.gender,
         targetLang: targetLang.code,
-        topic: sessionTopicRef.current
+        topic: sessionTopicRef.current,
+        lastSequenceNumber: isReconnect && lastSeenSequenceNumberRef.current > 0 ? lastSeenSequenceNumberRef.current : undefined
       }));
 
       if (wsPingIntervalRef.current) clearInterval(wsPingIntervalRef.current);
@@ -1946,6 +1949,9 @@ export default function App() {
           }
         }
         if (msg.type === "transcription") {
+          if (typeof msg.sequenceNumber === "number" && msg.sequenceNumber > lastSeenSequenceNumberRef.current) {
+            lastSeenSequenceNumberRef.current = msg.sequenceNumber;
+          }
           const eventId = msg.eventId || generateEventId();
           observabilityService.recordEvent({
             eventId,
@@ -1998,7 +2004,7 @@ export default function App() {
                 updated[existingIdx] = newMsgRecord;
                 return updated;
               }
-              return [newMsgRecord, ...prev];
+              return [newMsgRecord, ...prev].slice(0, 200);
             });
 
             const now = Date.now();
@@ -2040,9 +2046,11 @@ export default function App() {
       setConnectionStatus('reconnecting');
       wsReconnectAttemptsRef.current += 1;
       const attempts = wsReconnectAttemptsRef.current;
-      const delay = Math.min(1000 * Math.pow(1.5, attempts - 1), 10000);
+      const baseDelay = Math.min(1000 * Math.pow(1.5, attempts - 1), 10000);
+      const jitter = Math.random() * 0.4 * baseDelay; // 0-40% randomized jitter prevents thundering herd
+      const delay = baseDelay + jitter;
 
-      console.log(`[BHARATBRIDGE][WS_RESILIENCE] Auto-reconnecting in ${Math.round(delay)}ms (attempt #${attempts})...`);
+      console.log(`[BHARATBRIDGE][WS_RESILIENCE] Auto-reconnecting with jitter in ${Math.round(delay)}ms (attempt #${attempts})...`);
       setTimeout(() => {
         if (isLiveRef.current) {
           initWebSocket(sessionId, initialRole, true);
@@ -2762,6 +2770,10 @@ export default function App() {
 
   const speak = async (text: string, lang: LanguageConfig, inputEventId?: string, sequenceNumber?: number, sessionOverrideId?: string) => {
     if (!text || typeof window === "undefined") return;
+    if (isDataSaverMode) {
+      console.log("[DATA_SAVER] Audio playback suppressed to save mobile data and battery.");
+      return;
+    }
     const cleanedText = cleanIndianText(text);
     const eventId = inputEventId || generateEventId();
     const effectiveSessionId = sessionOverrideId || currentSession?.id || activeSessionIdRef.current;
@@ -3059,15 +3071,30 @@ export default function App() {
               )}
 
               {sessionRole === 'listener' && (
-                <button
-                  onClick={unmuteAudio}
-                  className={`px-2.5 py-0.5 border rounded-md text-[10px] font-bold uppercase flex items-center gap-1 ${
-                    audioUnmuted ? 'bg-emerald-500/15 border-emerald-500/30 text-emerald-400' : 'bg-blue-500/15 border-blue-500/30 text-blue-400 animate-pulse'
-                  }`}
-                >
-                  <Volume2 size={12} />
-                  {audioUnmuted ? 'Audio On' : 'Unmute Audio'}
-                </button>
+                <>
+                  <button
+                    onClick={unmuteAudio}
+                    className={`px-2.5 py-0.5 border rounded-md text-[10px] font-bold uppercase flex items-center gap-1 ${
+                      audioUnmuted ? 'bg-emerald-500/15 border-emerald-500/30 text-emerald-400' : 'bg-blue-500/15 border-blue-500/30 text-blue-400 animate-pulse'
+                    }`}
+                  >
+                    <Volume2 size={12} />
+                    {audioUnmuted ? 'Audio On' : 'Unmute Audio'}
+                  </button>
+
+                  {/* Step 12: Data Saver / Captions Only Toggle */}
+                  <button
+                    onClick={() => setIsDataSaverMode(prev => !prev)}
+                    className={`px-2.5 py-0.5 border rounded-md text-[10px] font-bold uppercase flex items-center gap-1 transition-all ${
+                      isDataSaverMode
+                        ? 'bg-amber-500/20 border-amber-500/40 text-amber-300'
+                        : 'bg-white/5 border-white/10 text-slate-400 hover:text-slate-200'
+                    }`}
+                    title="Toggle Data Saver mode (pauses audio streaming, retains live captions)"
+                  >
+                    📶 {isDataSaverMode ? 'Data Saver: ON' : 'Data Saver: OFF'}
+                  </button>
+                </>
               )}
 
               {/* Voice Speed Setting Selector */}

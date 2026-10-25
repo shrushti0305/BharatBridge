@@ -95,6 +95,45 @@ export function applyGenderAgreementFallback(text: string, targetLang: string, g
   return text;
 }
 
+export function safeSendToListener(
+  ws: any,
+  payload: string,
+  group?: { listeners: Set<any> },
+  sessionId?: string,
+  maxBufferedAmount: number = (process.env.MAX_WS_BUFFERED_AMOUNT ? Number(process.env.MAX_WS_BUFFERED_AMOUNT) : 256 * 1024)
+): boolean {
+  if (!ws || ws.readyState !== 1 /* WebSocket.OPEN */) {
+    if (group) group.listeners.delete(ws);
+    return false;
+  }
+
+  if (ws.bufferedAmount > maxBufferedAmount) {
+    console.warn(`[BACKPRESSURE][SLOW_LISTENER_EVICTED] Evicting slow listener on session '${sessionId || "unknown"}' (bufferedAmount=${ws.bufferedAmount} exceeds ${maxBufferedAmount} cap)`);
+    if (group) group.listeners.delete(ws);
+    try {
+      ws.terminate();
+    } catch (_) {}
+    return false;
+  }
+
+  try {
+    ws.send(payload);
+    if (ws.bufferedAmount > maxBufferedAmount) {
+      console.warn(`[BACKPRESSURE][SLOW_LISTENER_EVICTED] Evicting slow listener on session '${sessionId || "unknown"}' (bufferedAmount=${ws.bufferedAmount} exceeds ${maxBufferedAmount} cap)`);
+      if (group) group.listeners.delete(ws);
+      try {
+        ws.terminate();
+      } catch (_) {}
+      return false;
+    }
+    return true;
+  } catch (err) {
+    console.warn("[BACKPRESSURE] Error sending to listener:", err);
+    if (group) group.listeners.delete(ws);
+    return false;
+  }
+}
+
 dotenv.config();
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -369,6 +408,7 @@ async function startServer() {
     provider?: string;
     degraded?: boolean;
     translations?: Record<string, string>;
+    sequenceNumber?: number;
   };
 
   type PanelistItem = {
@@ -377,6 +417,7 @@ async function startServer() {
     userName: string;
     gender?: string;
     ws: WebSocket;
+    isMuted?: boolean;
   };
 
   type PendingRequestItem = {
@@ -388,6 +429,8 @@ async function startServer() {
   };
 
   type SessionState = {
+    id?: string;
+    sessionId?: string;
     speaker: WebSocket | null;
     organizerWs: WebSocket | null;
     organizerId: string | null;
@@ -409,7 +452,120 @@ async function startServer() {
     lastActivity: number;
   };
 
+  interface ProbeChannelState {
+    language: string;
+    status: "WAITING" | "HEALTHY" | "CRITICAL" | "FAILED" | "DEGRADED";
+    startedAt: number;
+    lastEventReceivedAt: number | null;
+    lastLatencyMs: number | null;
+    eventsReceived: number;
+    ws?: WebSocket;
+  }
+
   const sessions = new Map<string, SessionState>();
+  const sessionProbes = new Map<string, Map<string, ProbeChannelState>>();
+  const sessionSseClients = new Map<string, Map<string, Set<express.Response>>>();
+  const operatorMetricsSubscribers = new Map<string, Set<WebSocket>>();
+
+  // Step 10: Cluster Pub/Sub Peer Propagation
+  const clusterPeerUrls = (process.env.CLUSTER_PEER_URLS || "")
+    .split(",")
+    .map(u => u.trim())
+    .filter(Boolean);
+
+  const clusterSecret = process.env.CLUSTER_SECRET || "";
+
+  function publishToCluster(message: { type: string; sessionId: string; targetLang?: string; payload: any }) {
+    if (clusterPeerUrls.length === 0) return;
+    const body = JSON.stringify({
+      ...message,
+      clusterSecret
+    });
+
+    for (const peerUrl of clusterPeerUrls) {
+      fetch(`${peerUrl}/api/cluster/broadcast`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-cluster-secret": clusterSecret
+        },
+        body
+      }).catch(err => {
+        console.warn(`[CLUSTER_PUB] Failed to publish event to peer '${peerUrl}':`, err?.message || err);
+      });
+    }
+  }
+
+  function sendOperatorTelemetry(targetWs: WebSocket, sessionId: string, session: SessionState) {
+    let totalListeners = 0;
+    const channels: Record<string, any> = {};
+
+    if (session.languageGroups) {
+      for (const [lang, group] of session.languageGroups.entries()) {
+        const count = group.listeners ? group.listeners.size : 0;
+        totalListeners += count;
+        channels[lang] = {
+          language: lang,
+          listeners: count,
+          status: count > 0 ? "ACTIVE" : "IDLE"
+        };
+      }
+    }
+
+    const probes = sessionProbes.get(sessionId);
+    if (probes) {
+      const failTimeoutMs = Number(process.env.PROBE_FAIL_TIMEOUT_MS) || 15000;
+      const now = Date.now();
+      for (const [lang, p] of probes.entries()) {
+        let pStatus = p.status;
+        if (p.eventsReceived === 0) {
+          if (now - p.startedAt >= failTimeoutMs) pStatus = "CRITICAL";
+        } else if (p.lastEventReceivedAt && now - p.lastEventReceivedAt >= failTimeoutMs) {
+          pStatus = "CRITICAL";
+        }
+        p.status = pStatus;
+
+        if (!channels[lang]) {
+          channels[lang] = {
+            language: lang,
+            listeners: 0,
+            status: pStatus,
+            probeStatus: pStatus
+          };
+        } else {
+          channels[lang].probeStatus = pStatus;
+        }
+      }
+    }
+
+    const sysMetrics = observabilityService.getSystemMetricsSummary();
+
+    const payload = JSON.stringify({
+      type: "operator_telemetry",
+      sessionId,
+      timestamp: Date.now(),
+      totalListeners,
+      totalPanelists: session.panelists ? session.panelists.size : 0,
+      activeLanguages: Object.keys(channels).length,
+      latencies: {
+        stt: sysMetrics.latencies.stt,
+        translation: sysMetrics.latencies.translation,
+        websocket: sysMetrics.latencies.websocket,
+        tts: sysMetrics.latencies.tts,
+        totalPipeline: sysMetrics.latencies.totalPipeline,
+        p50: sysMetrics.latencies.totalPipeline?.p50 || 0,
+        p95: sysMetrics.latencies.totalPipeline?.p95 || 0,
+        avg: sysMetrics.latencies.totalPipeline?.p50 || 0
+      },
+      channels
+    });
+
+    try {
+      if (targetWs.readyState === WebSocket.OPEN) {
+        targetWs.send(payload);
+      }
+    } catch (_) {}
+  }
 
   function verifyHostToken(req: express.Request, session: any): boolean {
     if (!session || session.ended) return false;
@@ -721,6 +877,24 @@ Keep the formatting clean with standard Markdown headers and bullet points.`;
         }
       }
 
+      // Step 10: Sync newly created session across cluster peers
+      publishToCluster({
+        type: "session_created",
+        sessionId: pinCode,
+        payload: {
+          sessionId: pinCode,
+          hostToken,
+          hostTokenHash,
+          sessionToken,
+          sourceLang: sourceLang || "en",
+          targetLang: targetLang || "hi",
+          topic: topic || "",
+          isDuoMode: isDuoMode === true,
+          speakerGender: speakerGender || "female",
+          costBudgetUsd: newSession.costBudgetUsd
+        }
+      });
+
       res.json({
         success: true,
         sessionId: pinCode,
@@ -731,6 +905,466 @@ Keep the formatting clean with standard Markdown headers and bullet points.`;
     } catch (err: any) {
       console.error("[SESSION_CREATE] Error creating session:", err);
       res.status(500).json({ error: "Failed to create session", message: err?.message || String(err) });
+    }
+  });
+
+  // Step 7: Synthetic Probe Bot Endpoints for Live Event Monitoring
+  app.post("/api/sessions/:id/probes/start", async (req, res) => {
+    try {
+      const sessionId = req.params.id;
+      const session = sessions.get(sessionId);
+      if (!session) {
+        return res.status(404).json({ error: "Session not found" });
+      }
+
+      if (session.hostToken && req.body?.hostToken) {
+        if (!verifyHostToken(req, session)) {
+          return res.status(403).json({ error: "Invalid hostToken" });
+        }
+      }
+
+      const languages: string[] = Array.isArray(req.body?.languages) && req.body.languages.length > 0
+        ? req.body.languages
+        : ["hi"];
+
+      let probes = sessionProbes.get(sessionId);
+      if (!probes) {
+        probes = new Map<string, ProbeChannelState>();
+        sessionProbes.set(sessionId, probes);
+      }
+
+      const started: string[] = [];
+
+      for (const rawLang of languages) {
+        const lang = getCanonicalLanguageCode(rawLang);
+        const existing = probes.get(lang);
+        if (existing && existing.ws) {
+          try { existing.ws.close(); } catch (_) {}
+        }
+
+        const state: ProbeChannelState = {
+          language: lang,
+          status: "WAITING",
+          startedAt: Date.now(),
+          lastEventReceivedAt: null,
+          lastLatencyMs: null,
+          eventsReceived: 0
+        };
+
+        const probeWs = new WebSocket(`ws://127.0.0.1:${PORT}`);
+        state.ws = probeWs;
+
+        probeWs.on("message", (raw) => {
+          try {
+            const data = JSON.parse(raw.toString());
+            if (data.type === "transcription" || data.type === "speech_translated") {
+              const now = Date.now();
+              const slaMs = Number(process.env.PROBE_SLA_MS) || 2000;
+              const latency = typeof data.latencyMs === "number" ? data.latencyMs : (now - (data.timestamp || now));
+              state.eventsReceived += 1;
+              state.lastEventReceivedAt = now;
+              state.lastLatencyMs = latency;
+              if (data.provider === "untranslated") {
+                state.status = "DEGRADED";
+              } else if (latency > slaMs) {
+                state.status = "DEGRADED";
+              } else {
+                state.status = "HEALTHY";
+              }
+            }
+          } catch (_) {}
+        });
+
+        probeWs.on("error", (err) => {
+          console.warn(`[PROBE] WebSocket error for probe on lang '${lang}':`, err);
+        });
+
+        // Wait for connection to open and join session as listener
+        await new Promise<void>((resolve) => {
+          let resolved = false;
+          const finish = () => {
+            if (!resolved) {
+              resolved = true;
+              resolve();
+            }
+          };
+
+          probeWs.on("open", () => {
+            probeWs.send(JSON.stringify({
+              type: "join",
+              sessionId,
+              role: "listener",
+              targetLang: lang,
+              userId: `probe_bot_${lang}_${Date.now()}`
+            }));
+            finish();
+          });
+          probeWs.on("error", finish);
+          probeWs.on("close", finish);
+          setTimeout(finish, 1500);
+        });
+
+        probes.set(lang, state);
+        started.push(lang);
+      }
+
+      res.json({
+        ok: true,
+        sessionId,
+        started
+      });
+    } catch (err: any) {
+      console.error("[PROBE_START] Error starting probes:", err);
+      res.status(500).json({ error: "Failed to start probes", message: err?.message || String(err) });
+    }
+  });
+
+  app.get("/api/sessions/:id/probes/status", (req, res) => {
+    try {
+      const sessionId = req.params.id;
+      const session = sessions.get(sessionId);
+      if (!session) {
+        return res.status(404).json({ error: "Session not found" });
+      }
+
+      const probes = sessionProbes.get(sessionId);
+      const failTimeoutMs = Number(process.env.PROBE_FAIL_TIMEOUT_MS) || 15000;
+      const now = Date.now();
+      const channels: Record<string, any> = {};
+
+      if (probes) {
+        for (const [lang, p] of probes.entries()) {
+          let status = p.status;
+          if (p.eventsReceived === 0) {
+            if (now - p.startedAt >= failTimeoutMs) {
+              status = "CRITICAL";
+            } else {
+              status = "WAITING";
+            }
+          } else if (p.lastEventReceivedAt && now - p.lastEventReceivedAt >= failTimeoutMs) {
+            status = "CRITICAL";
+          }
+          p.status = status;
+
+          channels[lang] = {
+            language: lang,
+            status,
+            eventsReceived: p.eventsReceived,
+            lastEventReceivedAt: p.lastEventReceivedAt,
+            lastLatencyMs: p.lastLatencyMs,
+            startedAt: p.startedAt
+          };
+        }
+      }
+
+      res.json({
+        ok: true,
+        sessionId,
+        channels
+      });
+    } catch (err: any) {
+      console.error("[PROBE_STATUS] Error getting probe status:", err);
+      res.status(500).json({ error: "Failed to get probe status", message: err?.message || String(err) });
+    }
+  });
+
+  app.post("/api/sessions/:id/probes/stop", (req, res) => {
+    try {
+      const sessionId = req.params.id;
+      const session = sessions.get(sessionId);
+      if (!session) {
+        return res.status(404).json({ error: "Session not found" });
+      }
+
+      const probes = sessionProbes.get(sessionId);
+      if (probes) {
+        for (const p of probes.values()) {
+          try {
+            if (p.ws) p.ws.close();
+          } catch (_) {}
+        }
+        sessionProbes.delete(sessionId);
+      }
+
+      res.json({
+        ok: true,
+        sessionId,
+        message: "All synthetic probes stopped"
+      });
+    } catch (err: any) {
+      console.error("[PROBE_STOP] Error stopping probes:", err);
+      res.status(500).json({ error: "Failed to stop probes", message: err?.message || String(err) });
+    }
+  });
+
+  // Step 9: Server-Sent Events (SSE) Fallback Stream for Captions
+  app.get("/api/sessions/:id/captions/stream", (req, res) => {
+    try {
+      const sessionId = req.params.id;
+      const session = sessions.get(sessionId);
+      if (!session) {
+        return res.status(404).json({ error: "Session not found" });
+      }
+
+      const targetLang = getCanonicalLanguageCode((req.query.lang as string) || session.defaultTargetLang || "hi");
+
+      res.setHeader("Content-Type", "text/event-stream");
+      res.setHeader("Cache-Control", "no-cache, no-transform");
+      res.setHeader("Connection", "keep-alive");
+      res.setHeader("X-Accel-Buffering", "no");
+      res.flushHeaders?.();
+
+      // Register client into sessionSseClients
+      let sessionMap = sessionSseClients.get(sessionId);
+      if (!sessionMap) {
+        sessionMap = new Map<string, Set<express.Response>>();
+        sessionSseClients.set(sessionId, sessionMap);
+      }
+      let langSet = sessionMap.get(targetLang);
+      if (!langSet) {
+        langSet = new Set<express.Response>();
+        sessionMap.set(targetLang, langSet);
+      }
+      langSet.add(res);
+
+      // Send initial connected frame
+      res.write(`event: connected\ndata: ${JSON.stringify({ sessionId, targetLang, status: "connected" })}\n\n`);
+
+      // Catch up missed events if lastSeq is supplied
+      const lastSeq = req.query.lastSeq !== undefined ? Number(req.query.lastSeq) : undefined;
+      if (lastSeq !== undefined && session.messages && session.messages.length > 0) {
+        const missed = session.messages.filter(m => m.sequenceNumber !== undefined && m.sequenceNumber > lastSeq);
+        for (const m of missed) {
+          const translated = m.translations?.[targetLang] || m.translatedText || m.originalText;
+          res.write(`event: caption\ndata: ${JSON.stringify({
+            type: "transcription",
+            eventId: m.eventId,
+            sequenceNumber: m.sequenceNumber,
+            sourceLang: m.sourceLang,
+            targetLang,
+            originalText: m.originalText,
+            translatedText: translated
+          })}\n\n`);
+        }
+      }
+
+      // Keep-alive ping interval to prevent mobile carrier timeout
+      const keepAliveInterval = setInterval(() => {
+        try {
+          res.write(": keep-alive\n\n");
+        } catch (_) {
+          clearInterval(keepAliveInterval);
+        }
+      }, 15000);
+
+      req.on("close", () => {
+        clearInterval(keepAliveInterval);
+        langSet?.delete(res);
+        if (langSet?.size === 0) sessionMap?.delete(targetLang);
+      });
+    } catch (err: any) {
+      console.error("[SSE_STREAM] Error initializing SSE stream:", err);
+      res.status(500).json({ error: "Failed to establish SSE stream", message: err?.message || String(err) });
+    }
+  });
+
+  // Step 9: Long-Lived Auth: Silent Session Token Refresh
+  app.post("/api/sessions/:id/refresh-token", (req, res) => {
+    try {
+      const sessionId = req.params.id;
+      const session = sessions.get(sessionId);
+      if (!session) {
+        return res.status(404).json({ error: "Session not found" });
+      }
+
+      const authResult = verifySessionToken(req, session);
+      if (!authResult.valid && !authResult.expired) {
+        return res.status(403).json({ error: "Invalid session token for refresh" });
+      }
+
+      // Mint or renew token
+      const clientToken = (
+        req.headers["x-session-token"] ||
+        req.headers["x-host-token"] ||
+        req.body?.token ||
+        req.body?.sessionToken
+      )?.toString().trim();
+
+      if (!session.sessionTokens) {
+        session.sessionTokens = new Map<string, number>();
+      }
+
+      const newExpiry = Date.now() + 24 * 3600 * 1000;
+      const refreshedToken = clientToken || crypto.randomBytes(32).toString("hex");
+      session.sessionTokens.set(refreshedToken, newExpiry);
+      session.sessionToken = refreshedToken;
+
+      res.json({
+        ok: true,
+        sessionId,
+        sessionToken: refreshedToken,
+        expiresAt: newExpiry
+      });
+    } catch (err: any) {
+      console.error("[REFRESH_TOKEN] Error refreshing session token:", err);
+      res.status(500).json({ error: "Failed to refresh token", message: err?.message || String(err) });
+    }
+  });
+
+  // Step 10: Multi-Instance Cluster Backplane & Broadcast Endpoint
+  app.post("/api/cluster/broadcast", async (req, res) => {
+    try {
+      const providedSecret = (req.headers["x-cluster-secret"] || req.body?.clusterSecret || "").toString().trim();
+      const expectedSecret = (process.env.CLUSTER_SECRET || "").trim();
+
+      if (expectedSecret && (!providedSecret || !timingSafeEqualToken(providedSecret, expectedSecret))) {
+        return res.status(403).json({ error: "Forbidden: Invalid cluster secret" });
+      }
+
+      const { type, sessionId, targetLang, payload } = req.body;
+      if (!sessionId) {
+        return res.status(400).json({ error: "Missing sessionId" });
+      }
+
+      if (type === "session_created" && payload) {
+        if (!sessions.has(sessionId)) {
+          const newSession: any = {
+            speaker: null,
+            organizerWs: null,
+            organizerId: payload.userId || null,
+            hostToken: payload.hostToken,
+            hostTokenHash: payload.hostTokenHash,
+            sessionToken: payload.sessionToken,
+            sessionTokens: new Map([[payload.sessionToken, Date.now() + 24 * 3600 * 1000]]),
+            panelists: new Map(),
+            pendingRequests: new Map(),
+            languageGroups: new Map(),
+            speakerGender: payload.speakerGender || "female",
+            defaultTargetLang: payload.targetLang || "hi",
+            costBudgetUsd: payload.costBudgetUsd || 5.0,
+            estimatedCostUsd: 0,
+            topic: payload.topic || "",
+            isDuoMode: payload.isDuoMode === true,
+            messages: [],
+            lastActivity: Date.now()
+          };
+          sessions.set(sessionId, newSession);
+          console.log(`[CLUSTER_SYNC] Synchronized session '${sessionId}' from peer.`);
+        }
+        return res.json({ ok: true, synced: true });
+      }
+
+      if (type === "transcription" && payload && targetLang) {
+        let session = sessions.get(sessionId);
+        if (!session && cosmosHealthState.configured) {
+          try {
+            const loaded = await loadSessionFromCosmos(sessionId);
+            if (loaded?.sessionDoc) {
+              session = {
+                speaker: null,
+                organizerWs: null,
+                organizerId: null,
+                hostToken: loaded.sessionDoc.hostToken,
+                hostTokenHash: loaded.sessionDoc.hostTokenHash,
+                sessionToken: loaded.sessionDoc.sessionToken,
+                sessionTokens: new Map([[loaded.sessionDoc.sessionToken, Date.now() + 24 * 3600 * 1000]]),
+                panelists: new Map(),
+                pendingRequests: new Map(),
+                languageGroups: new Map(),
+                speakerGender: "female",
+                defaultTargetLang: loaded.sessionDoc.targetLang || "hi",
+                topic: loaded.sessionDoc.topic || "",
+                isDuoMode: loaded.sessionDoc.isDuoMode || false,
+                messages: loaded.messages || [],
+                lastActivity: Date.now()
+              };
+              sessions.set(sessionId, session);
+            }
+          } catch (_) {}
+        }
+
+        if (session) {
+          const canonicalTarget = getCanonicalLanguageCode(targetLang);
+          const group = session.languageGroups.get(canonicalTarget);
+          const payloadStr = JSON.stringify(payload);
+
+          if (group && group.listeners.size > 0) {
+            group.listeners.forEach((listenerWs) => {
+              safeSendToListener(listenerWs, payloadStr, group, sessionId);
+            });
+          }
+
+          // Forward to local SSE stream if any
+          const sseClients = sessionSseClients.get(sessionId)?.get(canonicalTarget);
+          if (sseClients && sseClients.size > 0) {
+            const sseChunk = `event: caption\ndata: ${payloadStr}\n\n`;
+            sseClients.forEach((cRes) => {
+              try { cRes.write(sseChunk); } catch (_) { sseClients.delete(cRes); }
+            });
+          }
+
+          // Store in messages history on this instance
+          const msgIdx = (session.messages || []).findIndex(m => m.eventId === payload.eventId);
+          if (msgIdx < 0) {
+            session.messages.push({
+              originalText: payload.originalText,
+              translatedText: payload.translatedText,
+              sourceLang: payload.sourceLang,
+              targetLang: canonicalTarget,
+              timestamp: payload.timestamp || Date.now(),
+              speakerId: payload.speakerId,
+              speakerName: payload.speakerName,
+              eventId: payload.eventId,
+              sequenceNumber: payload.sequenceNumber,
+              translations: { [canonicalTarget]: payload.translatedText }
+            });
+            if (session.messages.length > 100) session.messages.shift();
+          }
+        }
+
+        return res.json({ ok: true, delivered: true });
+      }
+
+      res.json({ ok: true, message: "Unhandled cluster message type" });
+    } catch (err: any) {
+      console.error("[CLUSTER_BROADCAST] Error handling cluster broadcast:", err);
+      res.status(500).json({ error: "Failed to process cluster broadcast", message: err?.message || String(err) });
+    }
+  });
+
+  // Step 10: Cluster Session Retrieval Endpoint
+  app.get("/api/cluster/sessions/:id", (req, res) => {
+    try {
+      const providedSecret = (req.headers["x-cluster-secret"] || req.query?.clusterSecret || "").toString().trim();
+      const expectedSecret = (process.env.CLUSTER_SECRET || "").trim();
+
+      if (expectedSecret && (!providedSecret || !timingSafeEqualToken(providedSecret, expectedSecret))) {
+        return res.status(403).json({ error: "Forbidden: Invalid cluster secret" });
+      }
+
+      const sessionId = req.params.id;
+      const session = sessions.get(sessionId);
+      if (!session) {
+        return res.status(404).json({ error: "Session not found" });
+      }
+
+      res.json({
+        ok: true,
+        session: {
+          sessionId,
+          hostToken: session.hostToken,
+          hostTokenHash: session.hostTokenHash,
+          sessionToken: session.sessionToken,
+          targetLang: session.defaultTargetLang,
+          topic: session.topic,
+          isDuoMode: session.isDuoMode,
+          speakerGender: session.speakerGender,
+          messages: session.messages
+        }
+      });
+    } catch (err: any) {
+      console.error("[CLUSTER_GET_SESSION] Error getting cluster session:", err);
+      res.status(500).json({ error: "Failed to get cluster session", message: err?.message || String(err) });
     }
   });
 
@@ -986,6 +1620,8 @@ Keep the formatting clean with standard Markdown headers and bullet points.`;
   });
 
 
+
+
   const broadcastRoomState = (session: SessionState) => {
     const activePanelistCount = session.panelists.size;
     const pendingList = Array.from(session.pendingRequests.values()).map(r => ({
@@ -998,7 +1634,8 @@ Keep the formatting clean with standard Markdown headers and bullet points.`;
       speakerId: p.speakerId,
       userId: p.userId,
       userName: p.userName,
-      active: p.ws.readyState === WebSocket.OPEN
+      active: p.ws.readyState === WebSocket.OPEN,
+      isMuted: p.isMuted === true
     }));
 
     const payload = JSON.stringify({
@@ -1026,7 +1663,36 @@ Keep the formatting clean with standard Markdown headers and bullet points.`;
     });
     session.languageGroups.forEach(g => {
       g.listeners.forEach(l => {
-        if (l.readyState === WebSocket.OPEN) l.send(payload);
+        safeSendToListener(l, payload, g, session.sessionId || session.id);
+      });
+    });
+  };
+
+  const broadcastActiveSpeaker = (session: SessionState, speakerId: string, userId: string, userName: string) => {
+    const now = Date.now();
+    if ((session as any).lastActiveSpeakerBroadcast && now - (session as any).lastActiveSpeakerBroadcast < 400) {
+      return;
+    }
+    (session as any).lastActiveSpeakerBroadcast = now;
+    const payload = JSON.stringify({
+      type: "active_speaker",
+      speakerId,
+      userId,
+      userName,
+      timestamp: now
+    });
+    if (session.organizerWs && session.organizerWs.readyState === WebSocket.OPEN) {
+      session.organizerWs.send(payload);
+    }
+    if (session.speaker && session.speaker.readyState === WebSocket.OPEN) {
+      session.speaker.send(payload);
+    }
+    session.panelists.forEach(p => {
+      if (p.ws.readyState === WebSocket.OPEN) p.ws.send(payload);
+    });
+    session.languageGroups.forEach(g => {
+      g.listeners.forEach(l => {
+        safeSendToListener(l, payload, g, session.sessionId || session.id);
       });
     });
   };
@@ -1221,6 +1887,7 @@ Keep the formatting clean with standard Markdown headers and bullet points.`;
       speakerId,
       speakerName: buffer.speakerName,
       eventId: buffer.latestEventId,
+      sequenceNumber: buffer.latestSequenceNumber,
       translations: {}
     };
     const existingIdx = (session.messages || []).findIndex(m => (m as any).eventId === buffer.latestEventId || (m as any).id === buffer.latestEventId);
@@ -1287,41 +1954,61 @@ Keep the formatting clean with standard Markdown headers and bullet points.`;
           degraded: isDegradedResult
         };
 
+        const listenerObj = {
+          type: "transcription",
+          eventId: buffer.latestEventId,
+          originalText: accumulatedText,
+          translatedText,
+          sourceLang: canonicalSource,
+          targetLang: canonicalTarget,
+          isFinal: true,
+          speakerId,
+          speakerName: buffer.speakerName,
+          sequenceNumber: buffer.latestSequenceNumber,
+          provider: result ? result.provider : "same-language",
+          translation_degraded: isDegradedResult
+        };
+        const listenerPayload = JSON.stringify(listenerObj);
+
+        // Step 10: Publish to cluster peers for cross-instance fan-out
+        publishToCluster({
+          type: "transcription",
+          sessionId,
+          targetLang: canonicalTarget,
+          payload: listenerObj
+        });
+
         const group = session.languageGroups.get(canonicalTarget);
         if (group && group.listeners.size > 0) {
-          const listenerPayload = JSON.stringify({
-            type: "transcription",
-            eventId: buffer.latestEventId,
-            originalText: accumulatedText,
-            translatedText,
-            sourceLang: canonicalSource,
-            targetLang: canonicalTarget,
-            isFinal: true,
-            speakerId,
-            speakerName: buffer.speakerName,
-            sequenceNumber: buffer.latestSequenceNumber,
-            provider: result ? result.provider : "same-language",
-            translation_degraded: isDegradedResult
-          });
-
           group.listeners.forEach((listenerWs) => {
-            if (listenerWs.readyState === WebSocket.OPEN) {
-              listenerWs.send(listenerPayload);
-            }
-          });
-
-          observabilityService.recordEvent({
-            eventId: buffer.latestEventId,
-            sessionId,
-            speakerId,
-            sourceLanguage: canonicalSource,
-            targetLanguage: canonicalTarget,
-            stage: "WEBSOCKET",
-            eventType: "WS_BROADCAST",
-            status: "SUCCESS",
-            latencyMs
+            safeSendToListener(listenerWs, listenerPayload, group, sessionId);
           });
         }
+
+        // Step 9: Broadcast live caption to connected SSE clients
+        const sseClients = sessionSseClients.get(sessionId)?.get(canonicalTarget);
+        if (sseClients && sseClients.size > 0) {
+          const sseChunk = `event: caption\ndata: ${listenerPayload}\n\n`;
+          sseClients.forEach((clientRes) => {
+            try {
+              clientRes.write(sseChunk);
+            } catch (_) {
+              sseClients.delete(clientRes);
+            }
+          });
+        }
+
+        observabilityService.recordEvent({
+          eventId: buffer.latestEventId,
+          sessionId,
+          speakerId,
+          sourceLanguage: canonicalSource,
+          targetLanguage: canonicalTarget,
+          stage: "WEBSOCKET",
+          eventType: "WS_BROADCAST",
+          status: "SUCCESS",
+          latencyMs
+        });
 
         // Store target translation into in-memory session.messages
         const msgIdx = (session.messages || []).findIndex(m => (m as any).eventId === buffer.latestEventId || (m as any).id === buffer.latestEventId);
@@ -1333,6 +2020,7 @@ Keep the formatting clean with standard Markdown headers and bullet points.`;
             ...currentMsg,
             translatedText,
             targetLang: canonicalTarget,
+            sequenceNumber: buffer.latestSequenceNumber,
             degraded: currentMsg.degraded || isDegradedResult,
             translations: currentTranslations
           };
@@ -2273,6 +2961,26 @@ New Sentence: "${cleanText}"`;
                 if (l.readyState === WebSocket.OPEN) l.send(endPayload);
               });
             });
+            if (sessionProbes.has(targetSid)) {
+              const probes = sessionProbes.get(targetSid);
+              if (probes) {
+                for (const p of probes.values()) {
+                  try { p.ws?.close(); } catch (_) {}
+                }
+              }
+              sessionProbes.delete(targetSid);
+            }
+            if (operatorMetricsSubscribers.has(targetSid)) {
+              const subs = operatorMetricsSubscribers.get(targetSid);
+              if (subs) {
+                for (const opWs of subs) {
+                  if (opWs.readyState === WebSocket.OPEN) {
+                    opWs.send(JSON.stringify({ type: "session_ended", sessionId: targetSid }));
+                  }
+                }
+              }
+              operatorMetricsSubscribers.delete(targetSid);
+            }
             console.log(`[SESSION_ENDED] Session '${targetSid}' ended by host.`);
           } else {
             console.warn(`[SECURITY] Unauthorized end_session attempt by non-host socket on session '${targetSid}'.`);
@@ -2285,6 +2993,51 @@ New Sentence: "${cleanText}"`;
             }
           }
         }
+        return;
+      }
+
+      if (message.type === "subscribe_operator_metrics") {
+        const targetSid = message.sessionId || currentSessionId;
+        if (!targetSid || !sessions.has(targetSid)) {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+              type: "error",
+              code: "SESSION_NOT_FOUND",
+              message: "Session not found"
+            }));
+          }
+          return;
+        }
+
+        const session = sessions.get(targetSid)!;
+        const inputToken = message.token || message.hostToken;
+        const isAuthorized = (inputToken && session.hostToken && timingSafeEqualToken(inputToken, session.hostToken)) ||
+                             (session.organizerWs === ws) ||
+                             (message.role === "operator");
+
+        if (!isAuthorized) {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+              type: "error",
+              code: "UNAUTHORIZED",
+              message: "Invalid operator credentials"
+            }));
+          }
+          return;
+        }
+
+        (ws as any).isOperatorSubscriber = true;
+        (ws as any).subscribedSessionId = targetSid;
+
+        let subSet = operatorMetricsSubscribers.get(targetSid);
+        if (!subSet) {
+          subSet = new Set<WebSocket>();
+          operatorMetricsSubscribers.set(targetSid, subSet);
+        }
+        subSet.add(ws);
+
+        // Immediate push on subscription
+        sendOperatorTelemetry(ws, targetSid, session);
         return;
       }
 
@@ -2339,6 +3092,44 @@ New Sentence: "${cleanText}"`;
             }
           } catch (cosmosLoadErr) {
             console.warn(`[CosmosDB] Failed to load session '${sessionId}' from Cosmos DB:`, cosmosLoadErr);
+          }
+        }
+
+        // Step 10: Fallback cluster peer query if session was created on another cluster node
+        if (!session && clusterPeerUrls.length > 0) {
+          for (const peerUrl of clusterPeerUrls) {
+            try {
+              const pRes = await fetch(`${peerUrl}/api/cluster/sessions/${sessionId}`, {
+                headers: { "x-cluster-secret": clusterSecret }
+              });
+              if (pRes.ok) {
+                const pData = await pRes.json();
+                if (pData.session) {
+                  const sDoc = pData.session;
+                  session = {
+                    speaker: null,
+                    organizerWs: null,
+                    organizerId: null,
+                    hostToken: sDoc.hostToken,
+                    hostTokenHash: sDoc.hostTokenHash,
+                    sessionToken: sDoc.sessionToken,
+                    sessionTokens: new Map([[sDoc.sessionToken, Date.now() + 24 * 3600 * 1000]]),
+                    panelists: new Map(),
+                    pendingRequests: new Map(),
+                    languageGroups: new Map(),
+                    speakerGender: sDoc.speakerGender || "female",
+                    defaultTargetLang: sDoc.targetLang || "hi",
+                    topic: sDoc.topic || "",
+                    isDuoMode: sDoc.isDuoMode ?? false,
+                    messages: sDoc.messages || [],
+                    lastActivity: Date.now()
+                  };
+                  sessions.set(sessionId, session);
+                  console.log(`[CLUSTER_DISCOVERY] Hydrated session '${sessionId}' from peer '${peerUrl}'.`);
+                  break;
+                }
+              }
+            } catch (_) {}
           }
         }
 
@@ -2489,7 +3280,8 @@ New Sentence: "${cleanText}"`;
                   speakerId: m.speakerId || "speaker-01",
                   speakerName: m.speakerName || "Speaker",
                   provider: m.provider || "cosmos",
-                  translation_degraded: m.degraded || false
+                  translation_degraded: m.degraded || false,
+                  sequenceNumber: m.sequenceNumber
                 };
               });
               if (ws.readyState === WebSocket.OPEN) {
@@ -2553,12 +3345,17 @@ New Sentence: "${cleanText}"`;
             group.listeners.add(ws);
           }
 
-          // Instantly send full message history (translated into listener's target language) over WebSocket
-          if (session.messages && session.messages.length > 0) {
+          // Instantly send message history (filtered by client's lastSequenceNumber if reconnecting)
+          const clientLastSeq = typeof message.lastSequenceNumber === "number" ? message.lastSequenceNumber : undefined;
+          const eligibleMessages = clientLastSeq !== undefined
+            ? session.messages.filter(m => (m.sequenceNumber !== undefined ? m.sequenceNumber > clientLastSeq : false))
+            : session.messages;
+
+          if (eligibleMessages && eligibleMessages.length > 0) {
             (async () => {
               try {
                 const historyPayloads = await Promise.all(
-                  session.messages.map(async (m: SessionMessage) => {
+                  eligibleMessages.map(async (m: SessionMessage) => {
                     if (!m.translations) m.translations = {};
                     let translatedText = m.translations[currentLang!];
                     let provider = m.provider || "cosmos";
@@ -2601,7 +3398,8 @@ New Sentence: "${cleanText}"`;
                       speakerId: m.speakerId || "speaker-01",
                       speakerName: m.speakerName || "Speaker",
                       provider,
-                      translation_degraded: degraded
+                      translation_degraded: degraded,
+                      sequenceNumber: m.sequenceNumber
                     };
                   })
                 );
@@ -2629,7 +3427,7 @@ New Sentence: "${cleanText}"`;
         if (session.speaker?.readyState === WebSocket.OPEN) session.speaker.send(statsPayload);
         session.languageGroups.forEach(g => {
           g.listeners.forEach(l => {
-            if (l.readyState === WebSocket.OPEN) l.send(statsPayload);
+            safeSendToListener(l, statsPayload, g, currentSessionId);
           });
         });
         broadcastRoomState(session);
@@ -2782,6 +3580,45 @@ New Sentence: "${cleanText}"`;
         }
       }
 
+      if (message.type === "mic_state" && currentSessionId) {
+        const session = sessions.get(currentSessionId);
+        if (session) {
+          const panelist = Array.from(session.panelists.values()).find(p => p.ws === ws);
+          if (panelist) {
+            panelist.isMuted = message.isMuted === true;
+            broadcastRoomState(session);
+          }
+        }
+      }
+
+      if (message.type === "mute_panelist" && currentSessionId) {
+        const session = sessions.get(currentSessionId);
+        if (session) {
+          const isHost = ws === session.organizerWs || (session.hostToken && message.token === session.hostToken);
+          if (!isHost) {
+            ws.send(JSON.stringify({
+              type: "error",
+              code: "UNAUTHORIZED",
+              message: "Only the session host can remotely mute panelists"
+            }));
+            return;
+          }
+          const { targetUserId, isMuted } = message;
+          const targetPanelist = Array.from(session.panelists.values()).find(p => p.userId === targetUserId);
+          if (targetPanelist) {
+            targetPanelist.isMuted = isMuted === true;
+            if (targetPanelist.ws && targetPanelist.ws.readyState === WebSocket.OPEN) {
+              targetPanelist.ws.send(JSON.stringify({
+                type: "mic_control",
+                action: isMuted ? "mute" : "unmute",
+                isMuted: isMuted === true
+              }));
+            }
+            broadcastRoomState(session);
+          }
+        }
+      }
+
       if (message.type === "switch_to_listener" && currentSessionId) {
         const session = sessions.get(currentSessionId);
         if (session) {
@@ -2806,9 +3643,18 @@ New Sentence: "${cleanText}"`;
         const session = sessions.get(currentSessionId);
         if (session) {
           session.lastActivity = Date.now();
+          const panelist = Array.from(session.panelists.values()).find(p => p.ws === ws);
+          if (panelist?.isMuted) {
+            return; // Server-side mic gate: silently drop audio frames from muted panelists
+          }
           const socketRole = (ws as any).currentRole || currentRole;
-          const isAuthorized = Array.from(session.panelists.values()).some(p => p.ws === ws) || socketRole === "speaker" || socketRole === "organizer" || socketRole === "PANELIST" || socketRole === "panelist";
+          const isAuthorized = !!panelist || socketRole === "speaker" || socketRole === "organizer" || socketRole === "PANELIST" || socketRole === "panelist";
           if (isAuthorized) {
+            const speakerId = panelist?.speakerId || "speaker-01";
+            const speakerName = panelist?.userName || "Speaker";
+            const userId = panelist?.userId || (ws as any).socketId || "speaker";
+            broadcastActiveSpeaker(session, speakerId, userId, speakerName);
+
             // Pipe audio frame to ALL active language sessions with structured logging & error protection
             session.languageGroups.forEach((group, lang) => {
               if (group.geminiSession) {
@@ -2834,6 +3680,15 @@ New Sentence: "${cleanText}"`;
         }
 
         const panelist = Array.from(session.panelists.values()).find(p => p.ws === ws);
+        if (panelist?.isMuted) {
+          ws.send(JSON.stringify({
+            type: "error",
+            code: "MIC_MUTED",
+            message: "Speech event ignored because microphone is muted"
+          }));
+          return;
+        }
+
         const socketRole = (ws as any).currentRole || currentRole;
         const isAuthorizedSpeaker = !!panelist || socketRole === "speaker" || socketRole === "organizer" || socketRole === "PANELIST" || socketRole === "panelist";
 
@@ -2857,6 +3712,8 @@ New Sentence: "${cleanText}"`;
 
         const speakerId = message.speakerId || panelist?.speakerId || "speaker-01";
         const speakerName = message.speakerName || panelist?.userName || "Speaker";
+        const userId = panelist?.userId || message.userId || (ws as any).socketId || "speaker";
+        broadcastActiveSpeaker(session, speakerId, userId, speakerName);
 
         // Monotonic Sequence Validation per (sessionId + speakerId)
         const lastSeq = getLastSequenceNumber(currentSessionId, speakerId);
@@ -3082,7 +3939,7 @@ New Sentence: "${cleanText}"`;
               });
 
               group.listeners.forEach(l => {
-                if (l.readyState === WebSocket.OPEN) l.send(listenerPayload);
+                safeSendToListener(l, listenerPayload, group, currentSessionId);
               });
             } else {
               // Asynchronous background translation for listeners in each active target language group
@@ -3120,7 +3977,7 @@ New Sentence: "${cleanText}"`;
                 });
 
                 group.listeners.forEach(l => {
-                  if (l.readyState === WebSocket.OPEN) l.send(secondaryPayload);
+                  safeSendToListener(l, secondaryPayload, group, currentSessionId);
                 });
 
                 observabilityService.recordEvent({
@@ -3141,6 +3998,15 @@ New Sentence: "${cleanText}"`;
     });
 
     ws.on("close", () => {
+      const subSid = (ws as any).subscribedSessionId;
+      if (subSid && operatorMetricsSubscribers.has(subSid)) {
+        const subSet = operatorMetricsSubscribers.get(subSid);
+        if (subSet) {
+          subSet.delete(ws);
+          if (subSet.size === 0) operatorMetricsSubscribers.delete(subSid);
+        }
+      }
+
       if (currentSessionId && sessions.has(currentSessionId)) {
         const session = sessions.get(currentSessionId)!;
         const socketRole = (ws as any).currentRole || currentRole;
@@ -3177,13 +4043,34 @@ New Sentence: "${cleanText}"`;
         if (session.speaker?.readyState === WebSocket.OPEN) session.speaker.send(statsPayload);
         session.languageGroups.forEach(g => {
           g.listeners.forEach(l => {
-            if (l.readyState === WebSocket.OPEN) l.send(statsPayload);
+            safeSendToListener(l, statsPayload, g, currentSessionId);
           });
         });
         broadcastRoomState(session);
       }
     });
   });
+
+  // Periodic Telemetry Pusher for Operator Dashboard
+  const operatorPushIntervalMs = process.env.OPERATOR_METRICS_PUSH_INTERVAL_MS
+    ? Number(process.env.OPERATOR_METRICS_PUSH_INTERVAL_MS)
+    : 1000;
+
+  const operatorPushTimer = setInterval(() => {
+    for (const [sid, subscribers] of operatorMetricsSubscribers.entries()) {
+      if (subscribers.size === 0) continue;
+      const sess = sessions.get(sid);
+      if (!sess) continue;
+      for (const opWs of subscribers) {
+        if (opWs.readyState === WebSocket.OPEN) {
+          sendOperatorTelemetry(opWs, sid, sess);
+        } else {
+          subscribers.delete(opWs);
+        }
+      }
+    }
+  }, operatorPushIntervalMs);
+  operatorPushTimer.unref();
 
   // Vite middleware for development
   if (process.env.NODE_ENV !== "production") {
@@ -3222,6 +4109,7 @@ New Sentence: "${cleanText}"`;
   });
 
   const handleShutdown = async (signal: string) => {
+    clearInterval(operatorPushTimer);
     console.log(`[SERVER_SHUTDOWN] Signal '${signal}' received. Flushing metrics to Cosmos DB (3s timeout)...`);
     const timeoutPromise = new Promise((resolve) => setTimeout(resolve, 3000));
     await Promise.race([
